@@ -2,14 +2,11 @@ import type { Env } from "../../worker-configuration.d.ts";
 import type { Auth } from "../types";
 import {
   billingMeterPaths,
-  buildHeaders,
-  basesFor,
-  getConfigCached,
   packageRemainUsed,
+  postBillingResource,
   resourceAccounts,
   resourceBody,
   resourceTotalDosage,
-  withTimeout,
 } from "./upstream";
 
 // WorkBuddy 积分日报聚合（替代 cmd/credit + internal/upstream 的余额聚合）。
@@ -132,32 +129,12 @@ export async function fetchUserResource(
   env: Env,
   auth: Auth,
 ): Promise<{ remain: number; used: number; size: number; packs: number }> {
-  const base = basesFor(auth.realm, env);
-  const now = Date.now();
-  const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
-  const body = resourceBody(now);
+  const body = resourceBody(Date.now());
   const paths = billingMeterPaths(auth.realm);
 
   const once = async () => {
-    let env_: any = null;
-    for (const p of paths) {
-      const res = await withTimeout(
-        new Request(base.billing + p, {
-          method: "POST",
-          headers: buildHeaders(auth, env, { Accept: "application/json" }),
-          body,
-        }),
-        timeout,
-      );
-      if (res.status === 404 && p !== paths[paths.length - 1]) continue;
-      if (!res.ok) {
-        const err: any = new Error(`http ${res.status}`);
-        err.status = res.status;
-        throw err;
-      }
-      env_ = await res.json().catch(() => ({}));
-      break;
-    }
+    // 与 getCreditsDetailed 共用同一条探测链路：非 2xx 抛带 status/detail 的错误
+    const env_ = await postBillingResource(env, auth, paths, body, "credit");
     const accounts = resourceAccounts(env_);
     let remain = 0;
     let used = 0;
@@ -202,7 +179,9 @@ export async function fetchUserResourceSafe(env: Env, auth: Auth): Promise<Credi
       ok: true,
     };
   } catch (e: any) {
-    return { ...row, error: String(e?.message ?? e) };
+    // 带上上游响应片段：日报里要能一眼看出是 401（token/请求头问题）
+    // 还是 5xx（上游抽风），光一个 "http 401" 有时不够定位。
+    return { ...row, error: String(e?.message ?? e) + (e?.detail ? ` | ${e.detail}` : "") };
   }
 }
 

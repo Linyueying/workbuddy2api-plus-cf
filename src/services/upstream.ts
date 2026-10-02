@@ -505,27 +505,76 @@ export function isAlreadyCheckin(j: any): boolean {
 }
 
 /**
+ * 余额接口统一入口：按候选路径依次 POST，返回解包前的原始信封。
+ *
+ * 为什么非 2xx 必须抛错、而不是像早期实现那样返回空信封：
+ *   上游网关（APISIX）在 token 无效或请求头不齐时返回 401 且 body 是 HTML，
+ *   旧实现把它当成「空响应」——Accounts 为空 → credits=0，调用方完全看不出
+ *   是「接口拒绝」还是「这个号真的没额度」，面板只会显示 0，日志一行没有。
+ *   而池内 credits 是成本台账内插扣减、选号权重、积分保底三处的唯一数据源，
+ *   静默 0 会让三者基于错误数据运行（典型症状：明明有额度却被判触底）。
+ *   现在失败显性化：抛带 status/detail 的错误，由调用方决定降级还是上报。
+ */
+export async function postBillingResource(
+  env: Env,
+  auth: Auth,
+  paths: string[],
+  body: string,
+  tag: string,
+): Promise<any> {
+  const base = basesFor(auth.realm, env);
+  const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
+    const res = await withTimeout(
+      new Request(base.billing + p, {
+        method: "POST",
+        headers: buildHeaders(auth, env, { Accept: "application/json" }),
+        body,
+      }),
+      timeout,
+    );
+    if (res.ok) {
+      const j: any = await res.json().catch(() => ({}));
+      const packs = resourceAccounts(j).length;
+      // 成功也记一行：packs=0 时能区分「接口通了但确实没积分包」与「接口拒绝」
+      console.log(
+        `[${tag}] uid=${auth.uid} realm=${auth.realm} path=${p} packs=${packs}` +
+          (packs ? "" : ` code=${String(j?.code ?? "")} msg=${String(j?.msg ?? "").slice(0, 120)}`),
+      );
+      return j;
+    }
+    if (i < paths.length - 1) continue; // 还有候选路径，换一条再试
+    const detail = (await res.text().catch(() => "")).slice(0, 200);
+    const err: any = new Error(`http ${res.status}`);
+    err.status = res.status;
+    err.detail = detail;
+    console.error(
+      `[${tag}] 上游拒绝 uid=${auth.uid} realm=${auth.realm} base=${base.billing} ` +
+        `path=${p} status=${res.status} body=${detail}`,
+    );
+    throw err;
+  }
+  return {};
+}
+
+/**
  * getCreditsDetailed 查余额聚合（对齐 Go UserResourceDetailedWithExpiry）。
  * soonMs > 0 时把「到期时间落在窗口内」的余额计入 expiring（优先消耗，
  * 避免赠送积分到期作废）；同时返回最早未来到期批次供最早到期优先路由。
  * soonMs ≤ 0 时 expiring 恒 0（禁用该路由门槛）。
+ *
+ * 上游非 2xx 时**抛错**（见 postBillingResource），不返回空的 0 聚合。
  */
 export async function getCreditsDetailed(env: Env, auth: Auth, soonMs: number): Promise<Credits> {
-  const base = basesFor(auth.realm, env);
   const now = Date.now();
-  const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
-  let env_: any = null;
-  const paths = billingMeterPaths(auth.realm);
-  for (const p of paths) {
-    const res = await withTimeout(
-      new Request(base.billing + p, { method: "POST", headers: buildHeaders(auth, env), body: resourceBody(now) }),
-      timeout,
-    );
-    // 仅 404 换路径（路径不存在才值得 fallback），其他错误直接返回空聚合。
-    if (res.status === 404 && p !== paths[paths.length - 1]) continue;
-    env_ = await res.json().catch(() => ({}));
-    break;
-  }
+  const env_ = await postBillingResource(
+    env,
+    auth,
+    billingMeterPaths(auth.realm),
+    resourceBody(now),
+    "credit",
+  );
   let remain = 0;
   let total = 0;
   let expiring = 0;
@@ -560,20 +609,13 @@ export async function getCredits(env: Env, auth: Auth): Promise<Credits> {
  * remain/size 为各包求和；按面额降序。
  */
 export async function creditPackages(env: Env, auth: Auth): Promise<CreditPackage[]> {
-  const base = basesFor(auth.realm, env);
-  const now = Date.now();
-  const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
-  let env_: any = null;
-  const paths = billingMeterPaths(auth.realm);
-  for (const p of paths) {
-    const res = await withTimeout(
-      new Request(base.billing + p, { method: "POST", headers: buildHeaders(auth, env), body: resourceBody(now) }),
-      timeout,
-    );
-    if (res.status === 404 && p !== paths[paths.length - 1]) continue;
-    env_ = await res.json().catch(() => ({}));
-    break;
-  }
+  const env_ = await postBillingResource(
+    env,
+    auth,
+    billingMeterPaths(auth.realm),
+    resourceBody(Date.now()),
+    "packages",
+  );
   const out: CreditPackage[] = [];
   for (const p of resourceAccounts(env_)) {
     const r = packageRemainUsed(p);

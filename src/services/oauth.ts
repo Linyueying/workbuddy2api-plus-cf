@@ -67,7 +67,14 @@ export async function pollLogin(env: Env, state: string): Promise<PollResult> {
     checkinMessage = ci.message;
     const cr = await refreshCredits(env, auth);
     credits = cr.credits; creditsTotal = cr.creditsTotal;
-  } catch { /* 不影响登录成功 */ }
+  } catch (e: any) {
+    // 不影响登录成功，但必须留痕：早期这里是空的 catch，新号入池时余额查不到
+    // 就彻底静默，面板只显示 0，日志一行没有，完全无从下手。
+    console.error(
+      `[oauth] 新号入池后签到/余额失败 uid=${auth.uid} realm=${auth.realm}: ` +
+        `${String(e?.message ?? e)}${e?.detail ? " | " + e.detail : ""}`,
+    );
+  }
 
   await kvDelete(cacheKV(env), "login:" + state);
   return { done: true, uid: auth.uid, nickname: auth.nickname, realm: auth.realm, credits, credits_total: creditsTotal, checkin_message: checkinMessage };

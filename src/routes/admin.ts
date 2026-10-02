@@ -19,13 +19,35 @@ import {
   autoTasks,
   forEachAccount,
 } from "../services/tasks";
-import type { CtxVars } from "../types";
+import type { Auth, CtxVars } from "../types";
+import type { Credits } from "../services/upstream";
 
 function wait(c: any, p: Promise<any>) {
   try {
     c.executionCtx?.waitUntil?.(p);
   } catch {
     /* 无 ctx 时忽略 */
+  }
+}
+
+/**
+ * creditsOrReason 查余额并带上失败原因。
+ *
+ * 存在的理由：refreshCredits 上游非 2xx 时会抛错（见 postBillingResource），
+ * 早期实现在这里 catch 掉后统一返回 "user resource failed"，面板显示这句
+ * 等于什么都没说。这里把 status 与上游响应片段一起带出去，
+ * 用户（或日志）一眼能分辨 401 / 403 / 5xx。
+ */
+async function creditsOrReason(
+  env: Env,
+  a: Auth,
+): Promise<{ cr: Credits | null; why: string }> {
+  try {
+    return { cr: await refreshCredits(env, a), why: "" };
+  } catch (e: any) {
+    const why = String(e?.message ?? e) + (e?.detail ? ` | ${e.detail}` : "");
+    console.error(`[admin] 余额查询失败 uid=${a?.uid ?? ""} realm=${a?.realm ?? ""} ${why}`);
+    return { cr: null, why };
   }
 }
 
@@ -45,8 +67,10 @@ export function registerAdmin(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     if (!a?.accessToken) return c.json({ ok: false, error: "no account" }, 404);
     const ci: any = await dailyCheckin(c.env, a).catch(() => ({ done: false, already: false, message: "checkin failed" }));
     // 签到后查余额并回写池（对齐 Go panel.accountCheckin：先签到再 SetCreditsDetailed）。
-    const cr = await refreshCredits(c.env, a).catch(() => null);
-    if (!cr) return c.json({ ok: ci.done, checkin_done: ci.done, checkin_message: ci.message, balance_error: "user resource failed" });
+    // 失败原因要原样带出去：面板只显示一句 "user resource failed" 的话，
+    // 用户没法区分是 401（token/请求头）还是 5xx（上游抽风）。
+    const { cr, why } = await creditsOrReason(c.env, a);
+    if (!cr) return c.json({ ok: ci.done, checkin_done: ci.done, checkin_message: ci.message, balance_error: why });
     return c.json({
       ok: true,
       checkin_done: ci.done,
@@ -59,8 +83,8 @@ export function registerAdmin(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const uid = c.req.param("uid");
     const a = await poolRPC(c.env, "/internal/auth/" + encodeURIComponent(uid)).catch(() => null);
     if (!a?.accessToken) return c.json({ ok: false, error: "no account" }, 404);
-    const cr = await refreshCredits(c.env, a).catch(() => null);
-    if (!cr) return c.json({ ok: false, error: "user resource failed" }, 502);
+    const { cr, why } = await creditsOrReason(c.env, a);
+    if (!cr) return c.json({ ok: false, error: why || "user resource failed" }, 502);
     return c.json({ ok: true, credits: cr.credits, credits_total: cr.creditsTotal });
   });
   app.get("/panel/api/accounts/:uid/packages", async (c) => {

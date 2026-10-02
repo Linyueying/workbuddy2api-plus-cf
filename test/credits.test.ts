@@ -159,6 +159,38 @@ describe("余额聚合（对齐 Go UserResourceDetailedWithExpiry）", () => {
     expect(seen).toEqual(["/v2/billing/meter/get-user-resource"]);
   });
 
+  it("上游 401 不再被当成「空余额」：必须抛错并带 status 与响应片段", async () => {
+    stubFetch(() => new Response("<html>401 Authorization Required</html>", { status: 401 }));
+    await primeConfig(fakeEnv());
+    let err: any = null;
+    try {
+      await getCredits(fakeEnv(), auth());
+    } catch (e) {
+      err = e;
+    }
+    // 旧实现在这里返回 credits=0（静默），调用方无从区分「接口拒绝」与「真没额度」
+    expect(err).toBeTruthy();
+    expect(String(err?.message)).toContain("401");
+    expect(err?.status).toBe(401);
+    expect(String(err?.detail ?? "")).toContain("401");
+  });
+
+  it("global 域非 2xx 时两条候选路径都试一遍再报错", async () => {
+    const seen = stubFetch(() => new Response("nope", { status: 403 }));
+    await primeConfig(fakeEnv());
+    await expect(getCredits(fakeEnv(), auth("global"))).rejects.toThrow(/403/);
+    expect(seen).toEqual(["/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"]);
+  });
+
+  it("确实没有积分包（Accounts 为空）不是错误：返回 0 聚合且不抛", async () => {
+    stubFetch(() => json(envelope([])));
+    await primeConfig(fakeEnv());
+    const r = await getCredits(fakeEnv(), auth());
+    expect(r.credits).toBe(0);
+    expect(r.creditsTotal).toBe(0);
+    expect(r.earliestExpiry).toBe(0);
+  });
+
   it("请求体带 ProductCode 与到期时间范围（上游按此过滤有效包）", async () => {
     let body: any = null;
     vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
