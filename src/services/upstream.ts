@@ -566,13 +566,15 @@ export async function postBillingResource(
     const rh: string[] = [];
     res.headers.forEach((v, k) => rh.push(`${k}=${v}`.slice(0, 60)));
     const tok = String(auth.accessToken ?? "");
+    err.respHeaders = rh.slice(0, 8);
+    err.diag =
+      `token=${tok.length}位/${tok.slice(0, 6)}… ` +
+      `ua=${String(getConfigCached(env).upstream.user_agent ?? "").slice(0, 40)} ` +
+      `hasDeviceToken=${Boolean(auth.device_token || getConfigCached(env).upstream.device_token)} ` +
+      `respHeaders=[${rh.slice(0, 8).join("; ")}]`;
     console.error(
       `[${tag}] 上游拒绝 uid=${auth.uid} realm=${auth.realm} base=${base.billing} ` +
-        `path=${p} status=${res.status} ` +
-        `token=${tok.length}位/${tok.slice(0, 6)}… ` +
-        `ua=${String(getConfigCached(env).upstream.user_agent ?? "").slice(0, 40)} ` +
-        `hasDeviceToken=${Boolean(auth.device_token || getConfigCached(env).upstream.device_token)} ` +
-        `respHeaders=[${rh.slice(0, 8).join("; ")}] body=${detail.slice(0, 120)}`,
+        `path=${p} status=${res.status} ${err.diag} body=${detail.slice(0, 120)}`,
     );
     throw err;
   }
