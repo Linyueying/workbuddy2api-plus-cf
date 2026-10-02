@@ -13,7 +13,7 @@
 
 ```
    ┌──────────────────────────┐
-   │ ① workbuddy2api-pool      │  ← 后台支撑，你不直接访问它
+   │ ① workbuddy2api-engine      │  ← 后台支撑，你不直接访问它
    │   （Worker）              │
    │   · 管账号（内部锁，防抢号）│
    │   · 定时干活（签到、保活…） │
@@ -132,11 +132,11 @@ Pages 网址          ：_________________________________
 
 | 字段 | 填什么 |
 |---|---|
-| Worker name | `workbuddy2api-pool` |
+| Worker name | `workbuddy2api-engine` |
 | Branch（分支） | `main` |
 | Root directory | 留空 |
-| **Build command** | `npm install && npm run build:pool && node scripts/fill-ids.mjs` |
-| **Deploy command** | `npx wrangler deploy --config pool-worker/wrangler.toml` |
+| **Build command** | `npm install && npm run build:engine && node scripts/fill-ids.mjs` |
+| **Deploy command** | `npx wrangler deploy --config engine-worker/wrangler.toml` |
 
 5. 保存
 
@@ -164,7 +164,7 @@ Pages 网址          ：_________________________________
 - 点开日志，往下翻应该能看到一行：
 
 ```
-[fill-ids] pool-worker/wrangler.toml: 已写入
+[fill-ids] engine-worker/wrangler.toml: 已写入
 ```
 
 ### 3.4 确认定时任务挂上了
@@ -267,7 +267,7 @@ Pages 网址          ：_________________________________
 
 ### 7.2 Worker ①（再来一遍）
 
-**`workbuddy2api-pool` → Settings → Variables and Secrets → Add**
+**`workbuddy2api-engine` → Settings → Variables and Secrets → Add**
 同样的 `WB2A_API_KEY` 和同样的值。
 
 > ⚠️ **Secret 是每个 Worker 独立存的**，Pages 设了不会同步过来，两边都要设。
@@ -418,7 +418,7 @@ Workers & Pages → 概览 能看到请求数和资源消耗。
 Linyueying/workbuddy2api-plus-cf
 
 # 两个项目名
-workbuddy2api-pool
+workbuddy2api-engine
 workbuddy2api-pages
 
 # 资源名
@@ -447,10 +447,10 @@ nodejs_compat
 
 # Build command
 npm run build                                                 (Pages)
-npm install && npm run build:pool && node scripts/fill-ids.mjs (Worker ①)
+npm install && npm run build:engine && node scripts/fill-ids.mjs (Worker ①)
 
 # Deploy command（Pages 没有这个字段）
-npx wrangler deploy --config pool-worker/wrangler.toml
+npx wrangler deploy --config engine-worker/wrangler.toml
 
 # cron（Worker ① 自带，不用你配，只用来核对）
 0 * * * *

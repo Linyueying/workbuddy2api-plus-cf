@@ -29,7 +29,7 @@
           │      └─ 模型缓存/登录态 ──→ KV
           └─ /panel/*（静态） ──→ env.ASSETS.fetch
 
-② Worker workbuddy2api-pool        —— 干两件事：
+② Worker workbuddy2api-engine        —— 干两件事：
    a. 承载 PoolDO（单实例，顺序单线程 = 天然锁）+ alarm 自调度（兜底）
    b. 定时作业（Pages 无 Cron Triggers）
       cron 整点 → runScheduledJobs（签到/旅行/活跃/保活/夜猫子/成长）
@@ -77,7 +77,7 @@ workbuddy2api-pages/
 ├── scripts/{import-config,import-auths,copy-frontend}.mjs
 ├── vendor/frontend/           # 原面板 index.html + app.js（零改动）
 ├── dist/                      # 构建输出（_worker.js + panel/）
-├── pool-worker/               # ② 独立 Worker：PoolDO 宿主 + 定时作业
+├── engine-worker/               # ② 独立 Worker：PoolDO 宿主 + 定时作业
 │   ├── wrangler.toml          #   含 [[migrations]]（Pages 里禁止，这里必需）
 │   │                          #   含 [triggers] crons（Pages 里根本没有）
 │   └── src/index.ts           #   export { PoolDO } + scheduled()
@@ -132,7 +132,7 @@ wrangler r2 bucket create workbuddy2api-logs
 Dashboard 里的绑定变成只读、只能靠改文件填 ID。留空之后 5 个绑定全在
 Dashboard 的 Settings → Functions 里点（详见 [DEPLOY-WEB.md](./DEPLOY-WEB.md)）。
 
-**Worker 侧需要填**：`pool-worker/wrangler.toml` 里的占位符用 `npm run fill:ids`
+**Worker 侧需要填**：`engine-worker/wrangler.toml` 里的占位符用 `npm run fill:ids`
 注入，它从环境变量读 ID 替换，幂等，适合接进 CI：
 
 ```bash
@@ -150,10 +150,10 @@ CF_KV_CONFIG_ID=xxx CF_KV_CACHE_ID=yyy CF_D1_ID=zzz npm run fill:ids
 | **没有** Cron Triggers | 定时作业无处安放 |
 
 ```bash
-npm run deploy:pool     # 构建 + wrangler deploy
+npm run deploy:engine     # 构建 + wrangler deploy
 ```
 
-两条 cron（见 `pool-worker/wrangler.toml`）：
+两条 cron（见 `engine-worker/wrangler.toml`）：
 
 | cron (UTC) | 作用 |
 |---|---|
@@ -172,15 +172,15 @@ npm run deploy:pool     # 构建 + wrangler deploy
 | Pages 的 DO binding **强制**要求 `script_name` | 云端构建直接报 `should specify a "script_name"` |
 | 官方：*"You cannot create and deploy a Durable Object within a Pages project"* | Pages 文档 |
 
-所以 PoolDO 放在 `pool-worker/`，Pages 侧用 `script_name = "workbuddy2api-pool"`
+所以 PoolDO 放在 `engine-worker/`，Pages 侧用 `script_name = "workbuddy2api-engine"`
 远程引用。Pages 代码不用改，`env.POOL` 照旧可用。
-而在 `pool-worker/` 内部，POOL 绑定**不写 `script_name`**——类和绑定同属一个
+而在 `engine-worker/` 内部，POOL 绑定**不写 `script_name`**——类和绑定同属一个
 script，默认就指向自己。
 
 > ⚠️ Secret 是按 Worker 独立存储的，Pages 项目设的不会带过来。
 > 这个 Worker 要单独设一遍（至少 `WB2A_API_KEY`）：
 > ```bash
-> npx wrangler secret put WB2A_API_KEY --config pool-worker/wrangler.toml
+> npx wrangler secret put WB2A_API_KEY --config engine-worker/wrangler.toml
 > ```
 
 ### 4.2 配置 Secrets（敏感，不进仓库/代码）
@@ -255,7 +255,7 @@ WB2A_URL=https://xxx.pages.dev WB2A_API_KEY=xxx npm run smoke
 
 | 部署单元 | Build command | Deploy command | 绑定怎么配 |
 |---|---|---|---|
-| `workbuddy2api-pool` | `npm install && npm run build:pool && node scripts/fill-ids.mjs` | `npx wrangler deploy --config pool-worker/wrangler.toml` | 构建环境变量注入 |
+| `workbuddy2api-engine` | `npm install && npm run build:engine && node scripts/fill-ids.mjs` | `npx wrangler deploy --config engine-worker/wrangler.toml` | 构建环境变量注入 |
 | `workbuddy2api-pages` | `npm run build` | ——（Pages 无此字段，产物目录 `dist`） | **Dashboard 点 5 个绑定** |
 
 Worker 侧配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个构建变量

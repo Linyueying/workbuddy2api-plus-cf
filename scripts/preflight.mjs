@@ -45,7 +45,7 @@ const PAGES_DASHBOARD_BINDINGS = [
   ["KV namespace bindings", "WB2A_CACHE", "模型目录缓存"],
   ["D1 database bindings", "WB2A_DB", "用量 / 请求日志 / 子密钥"],
   ["R2 bucket bindings", "WB2A_LOGS", "请求 JSONL 归档"],
-  ["Durable Object bindings", "POOL", "PoolDO（指向 workbuddy2api-pool）"],
+  ["Durable Object bindings", "POOL", "PoolDO（指向 workbuddy2api-engine）"],
 ];
 const toml = readFileSync(resolve(root, "wrangler.toml"), "utf8");
 const declaresBindings = /^\s*\[\[(kv_namespaces|d1_databases|r2_buckets|durable_objects\.bindings)\]\]/m.test(toml);
@@ -90,7 +90,7 @@ if (reportPlaceholders("wrangler.toml", toml, "wrangler.toml")) {
   ok("Pages 的 wrangler.toml 无待填占位符");
 }
 if (hasFillIds) {
-  ok("scripts/fill-ids.mjs 可用（pool / scheduler 两个 Worker 走这条路）");
+  ok("scripts/fill-ids.mjs 可用（引擎 Worker 走这条路）");
   console.log("     Worker 的 Build command 末尾加 && node scripts/fill-ids.mjs");
   console.log("     并配环境变量 CF_KV_CONFIG_ID / CF_KV_CACHE_ID / CF_D1_ID");
 }
@@ -163,57 +163,57 @@ function readFileSyncSafe(dir) {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. 账号池 Worker（Pages 无法自带 DO，PoolDO 必须独立部署且先于 Pages）
+// 2b. 引擎 Worker（Pages 无法自带 DO，PoolDO 必须独立部署且先于 Pages）
 // ---------------------------------------------------------------------------
-console.log("\n[2b] 账号池 Worker（PoolDO 独立部署）");
-const poolTomlPath = resolve(root, "pool-worker/wrangler.toml");
-if (!existsSync(poolTomlPath)) {
-  bad("缺 pool-worker/wrangler.toml —— PoolDO 无处可部署");
+console.log("\n[2b] 引擎 Worker（PoolDO 独立部署 + 定时任务）");
+const engineTomlPath = resolve(root, "engine-worker/wrangler.toml");
+if (!existsSync(engineTomlPath)) {
+  bad("缺 engine-worker/wrangler.toml —— PoolDO 无处可部署");
 } else {
-  const poolToml = readFileSync(poolTomlPath, "utf8");
-  const poolName = poolToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
-  const hasMigrations = /\[\[migrations\]\]/.test(poolToml);
+  const engineToml = readFileSync(engineTomlPath, "utf8");
+  const engineName = engineToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
+  const hasMigrations = /\[\[migrations\]\]/.test(engineToml);
   // Pages 侧 script_name 必须指向这个 Worker 的名字，否则运行时找不到 DO。
   // 走 Dashboard 绑定时 wrangler.toml 里没有这一行（只有注释），改由下拉选择
-  // pool worker 注册出来的 namespace，所以这里只在显式声明时才做一致性校验。
+  // engine worker 注册出来的 namespace，所以这里只在显式声明时才做一致性校验。
   const activePages = toml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
   const scriptName = activePages.match(/script_name\s*=\s*"([^"]+)"/)?.[1] ?? "";
   if (!hasMigrations) {
-    bad("pool-worker/wrangler.toml 缺 [[migrations]]：DO 类不会被注册");
-  } else if (!poolName) {
-    bad("pool-worker/wrangler.toml 未声明 name");
+    bad("engine-worker/wrangler.toml 缺 [[migrations]]：DO 类不会被注册");
+  } else if (!engineName) {
+    bad("engine-worker/wrangler.toml 未声明 name");
   } else if (!scriptName) {
-    ok(`PoolDO 由 ${poolName} 注册；Pages 的 DO 绑定在 Dashboard 选这个 namespace`);
-    console.log(`     注意：必须先部署 ${poolName}，Dashboard 的下拉里才会出现 PoolDO`);
-  } else if (scriptName !== poolName) {
+    ok(`PoolDO 由 ${engineName} 注册；Pages 的 DO 绑定在 Dashboard 选这个 namespace`);
+    console.log(`     注意：必须先部署 ${engineName}，Dashboard 的下拉里才会出现 PoolDO`);
+  } else if (scriptName !== engineName) {
     bad(
-      `Pages 的 script_name="${scriptName}" 与 pool worker 的 name="${poolName}" 不一致` +
+      `Pages 的 script_name="${scriptName}" 与 engine worker 的 name="${engineName}" 不一致` +
         ` → 运行时找不到 DO。改 wrangler.toml 的 script_name`,
     );
   } else {
-    ok(`script_name 与 pool worker 名一致：${poolName}`);
+    ok(`script_name 与 engine worker 名一致：${engineName}`);
   }
   // 产物是否已构建
-  if (!existsSync(resolve(root, "pool-worker/dist/index.js"))) {
-    warn("pool-worker 未构建 → 部署前跑 npm run build:pool");
-    console.log("     部署顺序：npm run deploy:pool（先）→ Pages 部署（后）");
+  if (!existsSync(resolve(root, "engine-worker/dist/index.js"))) {
+    warn("engine-worker 未构建 → 部署前跑 npm run build:engine");
+    console.log("     部署顺序：npm run deploy:engine（先）→ Pages 部署（后）");
   } else {
-    ok("pool-worker/dist/index.js 已构建");
+    ok("engine-worker/dist/index.js 已构建");
   }
-  reportPlaceholders("pool-worker/wrangler.toml", poolToml, "pool-worker/wrangler.toml");
+  reportPlaceholders("engine-worker/wrangler.toml", engineToml, "engine-worker/wrangler.toml");
 }
 
 // ---------------------------------------------------------------------------
 // 2c. 定时作业（Pages 无 Cron Triggers；已与 PoolDO 合并在同一个 Worker 里）
 // ---------------------------------------------------------------------------
 console.log("\n[2c] 定时作业（Cron，与 PoolDO 同一个 Worker）");
-if (!existsSync(poolTomlPath)) {
-  bad("缺 pool-worker/wrangler.toml —— PoolDO 与定时作业都无处部署");
+if (!existsSync(engineTomlPath)) {
+  bad("缺 engine-worker/wrangler.toml —— PoolDO 与定时作业都无处部署");
 } else {
-  const pt = readFileSync(poolTomlPath, "utf8");
+  const pt = readFileSync(engineTomlPath, "utf8");
   const crons = pt.match(/crons\s*=\s*\[([^\]]*)\]/)?.[1] ?? "";
   if (!/crons\s*=/.test(pt)) {
-    bad("pool-worker 未配置 [triggers] crons —— 不会有任何定时触发");
+    bad("engine-worker 未配置 [triggers] crons —— 不会有任何定时触发");
   } else {
     ok(`crons: ${crons.replace(/\s+/g, " ").trim()}`);
     console.log("     0 * * * *    整点作业（代码按北京时间判断跑哪些）");
@@ -221,14 +221,14 @@ if (!existsSync(poolTomlPath)) {
   }
   // 合并后这个 Worker 必须同时具备 DO 与定时两套能力
   if (!/\[\[migrations\]\]/.test(pt)) {
-    bad("pool-worker 缺 [[migrations]]：DO 类不会被注册");
+    bad("engine-worker 缺 [[migrations]]：DO 类不会被注册");
   }
   // 定时作业要读 D1 日志、写 R2 归档，这两个绑定缺了归档会静默失败
   if (!/\[\[d1_databases\]\]/.test(pt)) {
-    warn("pool-worker 未绑 D1 —— 日志归档读不到数据");
+    warn("engine-worker 未绑 D1 —— 日志归档读不到数据");
   }
   if (!/\[\[r2_buckets\]\]/.test(pt)) {
-    warn("pool-worker 未绑 R2 —— 日志归档无处可写");
+    warn("engine-worker 未绑 R2 —— 日志归档无处可写");
   }
 }
 

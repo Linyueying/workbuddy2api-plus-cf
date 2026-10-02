@@ -29,7 +29,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 ## 部署顺序
 
 ```
-① workbuddy2api-pool    ← 必须先有它，Pages 的 DO 下拉才选得到 PoolDO
+① workbuddy2api-engine    ← 必须先有它，Pages 的 DO 下拉才选得到 PoolDO
 ② workbuddy2api-pages   ← 引用 ①
 ```
 
@@ -59,12 +59,12 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 
 | 字段 | 值 |
 |---|---|
-| Worker name | `workbuddy2api-pool` |
+| Worker name | `workbuddy2api-engine` |
 | Repository | `Linyueying/workbuddy2api-plus-cf` |
 | Branch | `main` |
 | Root directory | 留空 |
-| **Build command** | `npm install && npm run build:pool && node scripts/fill-ids.mjs` |
-| **Deploy command** | `npx wrangler deploy --config pool-worker/wrangler.toml` |
+| **Build command** | `npm install && npm run build:engine && node scripts/fill-ids.mjs` |
+| **Deploy command** | `npx wrangler deploy --config engine-worker/wrangler.toml` |
 
 然后 **Settings → Build → Build variables and secrets** 加 3 个：
 
@@ -123,7 +123,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 ⚠️ 四个坑：
 
 1. **变量名一字不差**，写错不报错、只是功能静默失效
-2. **第 5 项依赖第 2 步**——pool worker 没部署成功，下拉里就没有 `PoolDO`
+2. **第 5 项依赖第 2 步**——引擎 Worker 没部署成功，下拉里就没有 `PoolDO`
 3. **Production 与 Preview 两套环境各配一遍**
 4. **改完必须 Retry deployment**
 
@@ -145,7 +145,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 **Pages 项目 → Settings → Variables and Secrets → Add**：Type 选 **Secret**，
 变量名 `WB2A_API_KEY`，值自己想一个强密码。
 
-**`workbuddy2api-pool` → Settings → Variables and Secrets → Add**，同名同值**再设一遍**。
+**`workbuddy2api-engine` → Settings → Variables and Secrets → Add**，同名同值**再设一遍**。
 
 > ⚠️ Secret 按 Worker 独立存储，Pages 设了不会同步过来，两边都要设。
 > 设完两边都要 Retry deployment。
@@ -170,7 +170,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 
 | 单元 | 类型 | 职责 |
 |---|---|---|
-| `workbuddy2api-pool` | Worker | ① 承载 `PoolDO`（Pages 不能自带 DO）② 跑定时作业（Pages 没有 Cron） |
+| `workbuddy2api-engine` | Worker | ① 承载 `PoolDO`（Pages 不能自带 DO）② 跑定时作业（Pages 没有 Cron） |
 | `workbuddy2api-pages` | Pages | 前端 + 全部 API |
 
 两者合在一个 Worker 里是合法的：一个 Worker 可以同时导出 DO 类与 `scheduled()`，
@@ -183,7 +183,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| DO 下拉里没有 `PoolDO` | pool worker 没部署成功 | 先修好第 2 步 |
+| DO 下拉里没有 `PoolDO` | 引擎 Worker 没部署成功 | 先修好第 2 步 |
 | 面板能开但操作「未授权」 | `WB2A_API_KEY` 没设 / 设完没重新部署 | 第 6 步 + Retry |
 | `/status` 里 `pool` 失败 | DO 绑定名不是 `POOL` 或选错 namespace | 第 4 步第 5 项 |
 | `d1_schema` 报 error | D1 绑定没配或选错库 | 第 4 步第 3 项 |

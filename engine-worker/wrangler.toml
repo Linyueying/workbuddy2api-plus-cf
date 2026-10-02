@@ -1,4 +1,4 @@
-name = "workbuddy2api-pool"
+name = "workbuddy2api-engine"
 main = "dist/index.js"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
@@ -11,8 +11,8 @@ compatibility_flags = ["nodejs_compat"]
 # 两者可以共存：一个 Worker 同时导出 DO 类与 scheduled()，同时声明
 # [[migrations]] 与 [triggers] crons，Worker 原生支持，没有冲突。
 #
-# 部署：npm run deploy:pool
-# 之后 Pages 项目用 script_name = "workbuddy2api-pool" 引用这里的 PoolDO。
+# 部署：npm run deploy:engine
+# 之后 Pages 项目用 script_name = "workbuddy2api-engine" 引用这里的 PoolDO。
 # ===========================================================================
 
 # 定时触发：
@@ -61,8 +61,8 @@ class_name = "PoolDO"
 
 # ---------------------------------------------------------------------------
 # Secret（敏感，不进仓库）：
-#   npx wrangler secret put WB2A_API_KEY --config pool-worker/wrangler.toml
-#   npx wrangler secret put WB2A_DEVICE_TOKEN --config pool-worker/wrangler.toml
+#   npx wrangler secret put WB2A_API_KEY --config engine-worker/wrangler.toml
+#   npx wrangler secret put WB2A_DEVICE_TOKEN --config engine-worker/wrangler.toml
 # 注意：Secret 是按 Worker 独立存储的，Pages 项目设的那些不会自动带过来，
 # 这里要单独设一遍（至少 WB2A_API_KEY）。
 # ---------------------------------------------------------------------------

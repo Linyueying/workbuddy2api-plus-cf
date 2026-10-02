@@ -24,7 +24,7 @@
 //   - PoolDO 与调度逻辑同生命周期，不存在「DO 在、调度器没部署上」的错位。
 //
 // 注意：POOL 绑定在这里指向**自己**（不写 script_name），Pages 侧才需要
-// script_name = "workbuddy2api-pool" 做远程引用。
+// script_name = "workbuddy2api-engine" 做远程引用。
 
 import type { Env } from "../../worker-configuration.d.ts";
 import { getConfig } from "../../src/config";
@@ -59,7 +59,7 @@ export default {
 
   async fetch(): Promise<Response> {
     return new Response(
-      "workbuddy2api-pool: Durable Object host + cron scheduler. " +
+      "workbuddy2api-engine: Durable Object host + cron scheduler. " +
         "No HTTP API here; reach the pool via the POOL binding from the Pages project.",
       { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } },
     );

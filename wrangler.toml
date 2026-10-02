@@ -52,7 +52,7 @@ compatibility_flags = ["nodejs_compat"]
 # [[durable_objects.bindings]]
 # name = "POOL"
 # class_name = "PoolDO"
-# script_name = "workbuddy2api-pool"
+# script_name = "workbuddy2api-engine"
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ compatibility_flags = ["nodejs_compat"]
 #
 # 1. 不能自带 Durable Object。DO 类必须靠 [[migrations]] 注册，而 Pages 的
 #    wrangler.toml 不支持该字段（写了构建直接报错）。所以 PoolDO 单独部署为
-#    Worker `workbuddy2api-pool`（见 pool-worker/），Pages 只做远程引用。
+#    Worker `workbuddy2api-engine`（见 engine-worker/），Pages 只做远程引用。
 # 2. 没有 Cron Triggers。定时任务（签到/旅行/活跃/保活/夜猫子/成长/余额）
 #    由独立的 `workbuddy2api-scheduler` Worker 用原生 cron 触发（见
 #    scheduler-worker/），不再依赖外部 cron 服务或 DO alarm 自调度。

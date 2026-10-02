@@ -44,7 +44,7 @@ const R2_BUCKET = process.env.CF_R2_BUCKET || process.env.WB2A_R2_BUCKET || "";
 
 const TARGETS = [
   "wrangler.toml",
-  "pool-worker/wrangler.toml",
+  "engine-worker/wrangler.toml",
 ];
 
 // 解析每个占位符的实际取值；取不到返回 null
