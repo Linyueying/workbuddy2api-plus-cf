@@ -111,15 +111,30 @@ wrangler pages secret put WB2A_DEVICE_TOKEN --project-name workbuddy2api-pages  
 
 ### 4.3 初始化 D1 + 构建部署
 
-```bash
-# 建表（Pages 不自动跑迁移，必须显式执行；幂等，可重复跑）
-npm run db:init:remote       # 等价 node scripts/db-init.mjs --remote
+**建表已自动化**：Worker 在首个请求时自检并建表（见 `src/storage/migrate.ts`），
+部署后无需任何手工步骤。空库 → 首次访问 `/healthz` 即完成 4 表 5 索引 19 列的搭建。
 
+```bash
 npm run build                # esbuild 生成 dist/_worker.js + 拷贝前端
 wrangler pages deploy dist
 ```
 
 > 也可在 Cloudflare Pages 控制台连接 Git 仓库：构建命令 `npm run build`，输出目录 `dist`。
+> Git 集成同样会自动建表——迁移跑在 Worker 进程内，与谁触发部署无关。
+
+自动迁移的三条设计约束（改动 `migrations/*.sql` 时必须同步 `src/storage/migrate.ts`）：
+
+| 约束 | 原因 |
+|---|---|
+| 一条语句一次 `prepare()` | D1 不支持多语句批处理 |
+| 加列前先 `PRAGMA table_info` 探测 | SQLite 的 `ADD COLUMN` **没有** `IF NOT EXISTS` |
+| 吞掉 `duplicate column name` | 多个 isolate 并发首触发时的正常竞态 |
+
+`scripts/db-init.mjs` 仍保留，用作手工兜底（例如想先看 DDL 再执行）：
+
+```bash
+npm run db:init:remote       # 等价 node scripts/db-init.mjs --remote，幂等
+```
 
 ### 4.4 部署前后验证（别跳过）
 
@@ -128,7 +143,7 @@ wrangler pages deploy dist
 | 故障 | 症状 | 何时才发现 |
 |---|---|---|
 | `wrangler.toml` 占位符没换 | 绑到错误/不存在的资源 | 部署时或首次请求 |
-| D1 没建表 | 部署成功 | 首个写请求 500，错误点在深处 |
+| ~~D1 没建表~~ | —— | **已由自动迁移消除**（4.3） |
 | `WB2A_API_KEY` Secret 没设 | 部署成功 | **面板全锁**（所有接口 401），日志无线索 |
 
 所以配套两个脚本：

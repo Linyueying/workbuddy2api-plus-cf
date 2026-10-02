@@ -1,5 +1,6 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import { getConfigFresh } from "../config";
+import { ensureSchema } from "../storage/migrate";
 
 // 部署自检（启动期一次性告警）。
 //
@@ -75,10 +76,16 @@ export async function runHealthChecks(env: Env): Promise<{ ready: boolean; check
       "SELECT name FROM sqlite_master WHERE type='table' AND name='apikeys'",
     ).first<{ name: string }>();
     if (!row?.name) {
+      // 自动迁移本应在首个请求就建好表。走到这里说明它失败了
+      // ——把原因带上，别让人对着"缺表"干瞪眼。
+      const m = await ensureSchema(env).catch(() => null);
       checks.push({
         name: "d1_schema",
         ok: false,
-        hint: "D1 里没有 apikeys 表，API 写操作会 500。修复：node scripts/db-init.mjs --remote",
+        hint:
+          `D1 里没有 apikeys 表，API 写操作会 500。` +
+          (m?.status === "error" ? `自动迁移失败：${m.error}。` : "") +
+          `修复：核对 wrangler.toml 的 database_id，或手工跑 node scripts/db-init.mjs --remote`,
       });
     } else {
       checks.push({ name: "d1_schema", ok: true });
