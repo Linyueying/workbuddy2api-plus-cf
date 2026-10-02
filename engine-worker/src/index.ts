@@ -90,6 +90,11 @@ async function runHourlyJobs(env: Env): Promise<void> {
  * 刻意**不删 D1 源数据**：归档是只读副本，误删无法恢复。清理留给人工。
  */
 async function archiveRequestLogs(env: Env): Promise<void> {
+  // R2 是可选绑定：没桶就不绑，这里直接跳过，别白查一次 D1
+  if (!env.WB2A_LOGS) {
+    console.log("[scheduler] 未绑定 R2（WB2A_LOGS），跳过日志归档");
+    return;
+  }
   try {
     const cutoff = Date.now() - ARCHIVE_OLDER_THAN_DAYS * 86400_000;
     const raw = await env.WB2A_CONFIG.get(WATERMARK_KEY).catch(() => null);

@@ -47,14 +47,16 @@
 | Cloudflare | 托管全部服务 | 免费额度够用 |
 | GitHub | 代码仓库（已经有了） | 免费 |
 
-### 1.2 ⚠️ 一个可能卡住你的点：R2 要绑支付方式
+### 1.2 R2 是**可选**的（不想开就直接跳过）
 
 Cloudflare 的 R2 存储（用来归档请求日志）**通常要求账号绑定信用卡或 PayPal** 才能创建桶。
 免费额度内不扣钱，但验证身份这一步跳不过。
 
-- **愿意绑** → 正常走第 2.3 节
-- **不想绑** → 跳过 R2。后果只是「请求日志归档」用不了，**其他功能全部正常**。
-  后面第 5 章的 `WB2A_LOGS` 绑定也一并跳过即可。
+**好消息：不开也能正常部署。** 本项目把 R2 做成了可选资源——
+不配置就不绑定，代价只是「请求日志归档」用不了，**其他功能全部正常**。
+
+- **不想绑支付方式** → 直接跳过第 2.3 节，后面也不用配 `CF_R2_BUCKET`
+- **愿意绑** → 走第 2.3 节建桶，然后在第 3.2 节多配一个 `CF_R2_BUCKET`
 
 ### 1.3 先建一张抄写表
 
@@ -98,22 +100,24 @@ Pages 网址          ：_________________________________
 
 > 这两个不能合并，config 存配置、cache 存模型缓存，代码里各读各的。
 
-### 2.3 R2 桶（日志归档，可选）
+### 2.3 R2 桶（可选，不开就跳过）
+
+**只在你想要「请求日志归档」时才做。** 跳过不影响任何其他功能。
 
 1. **Workers & Pages → R2**
 2. **Create bucket**（创建存储桶）
-3. 名称填 `workbuddy2api-logs` —— **必须一字不差**，代码里写死了
+3. 名称填 `workbuddy2api-logs`
 4. Create
 
-> 名字写错了怎么办？删掉重建一个对的。这桶是空的，删了没损失。
+> 用了别的桶名也行，第 3.2 节把 `CF_R2_BUCKET` 填成实际桶名即可。
 
 ### 2.4 完成检查
 
 ```
-✅ D1 数据库 ID 已抄
-✅ wb2api-config 的 ID 已抄
-✅ wb2api-cache 的 ID 已抄
-⬜ R2 桶（可选，跳过也行）
+✅ D1 数据库 ID 已抄          ← 必做
+✅ wb2api-config 的 ID 已抄    ← 必做
+✅ wb2api-cache 的 ID 已抄     ← 必做
+⬜ R2 桶                      ← 可选
 ```
 
 ---
@@ -143,16 +147,25 @@ Pages 网址          ：_________________________________
 > ⚠️ **Deploy command 一定不能留默认**。默认的 `npx wrangler deploy` 会去读仓库根目录
 > 的配置文件，而那是 Pages 用的，Worker 部署会直接失败。
 
-### 3.2 填 3 个构建变量
+### 3.2 填构建变量
 
 1. 进这个 Worker → **Settings（设置） → Build**
-2. 找到 **Build variables and secrets** → 加 3 个：
+2. 找到 **Build variables and secrets** → 加 3 个（**必填**）：
 
 | 变量名 | 值 |
 |---|---|
 | `CF_KV_CONFIG_ID` | 抄写表里的 wb2api-config ID |
 | `CF_KV_CACHE_ID` | 抄写表里的 wb2api-cache ID |
 | `CF_D1_ID` | 抄写表里的 D1 ID |
+
+再**可选**加 1 个（只在第 2.3 节建了 R2 桶时才加）：
+
+| 变量名 | 值 |
+|---|---|
+| `CF_R2_BUCKET` | `workbuddy2api-logs`（或你实际用的桶名） |
+
+> **不加 `CF_R2_BUCKET` 也能部署成功**——构建脚本会自动把 R2 绑定摘掉。
+> 加了但桶不存在的话，部署会失败并报 `R2 bucket 'xxx' not found`。
 
 > ⚠️ 是 **Settings → Build** 这一页，不是 **Settings → Variables and Secrets**。
 > 填错页面构建脚本读不到，会报「缺少 3 个资源 ID」。
@@ -161,10 +174,16 @@ Pages 网址          ：_________________________________
 
 - 到 **Deployments**（部署）标签，点 **Retry deployment**（重试部署）或 **Create deployment**
 - 等 2–4 分钟，状态变绿 ✅
-- 点开日志，往下翻应该能看到一行：
+- 点开日志，往下翻应该能看到：
 
 ```
 [fill-ids] engine-worker/wrangler.toml: 已写入
+```
+
+如果没配 R2，还会多看到一行（这是**正常**的，不是错误）：
+
+```
+[fill-ids] R2 未配置（无 CF_R2_BUCKET）→ 已摘掉 [[r2_buckets]] 绑定段
 ```
 
 ### 3.4 确认定时任务挂上了
@@ -221,7 +240,7 @@ Pages 网址          ：_________________________________
 | 1 | KV namespace bindings | `WB2A_CONFIG` | `wb2api-config` |
 | 2 | KV namespace bindings | `WB2A_CACHE` | `wb2api-cache` |
 | 3 | D1 database bindings | `WB2A_DB` | `workbuddy2api` |
-| 4 | R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs`（跳过 R2 的话这行也跳过） |
+| 4 | R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs`（**可选**，跳过 R2 的话这行也跳过） |
 | 5 | **Durable Object bindings** | `POOL` | 下拉选 `PoolDO` |
 
 ⚠️ **四个容易翻车的点**：
@@ -378,7 +397,8 @@ Pages 网址          ：_________________________________
 | 定时任务从不执行 | Triggers 里没有那两条 cron | 第 3.4 节 |
 | 页面 404 | Build output directory 不是 `dist` | 第 4 章 |
 | 页面一直转圈 | 缺 `nodejs_compat` | 第 6 章 |
-| 日志归档不工作 | 跳过了 R2 | 第 2.3 节 |
+| 日志归档不工作 | 跳过了 R2（预期行为，不是故障） | 第 2.3 节 |
+| 部署报 `R2 bucket 'xxx' not found` | 配了 `CF_R2_BUCKET` 但桶没建/名字错 | 第 2.3 节建桶，或删掉 `CF_R2_BUCKET` 这个变量 |
 
 ### 终极排查手段
 
@@ -431,6 +451,7 @@ workbuddy2api-logs      (R2)
 CF_KV_CONFIG_ID
 CF_KV_CACHE_ID
 CF_D1_ID
+CF_R2_BUCKET        ← 可选，不配则不绑 R2
 
 # Pages 绑定变量名（一字不差）
 WB2A_CONFIG

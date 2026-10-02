@@ -123,7 +123,8 @@ wrangler kv namespace create WB2A_CACHE
 # D1
 wrangler d1 create workbuddy2api
 
-# R2
+# R2 —— **可选**：只在需要「请求日志归档」时才建
+# （建 R2 桶通常要绑支付方式；不建也能部署，构建机会自动摘掉这个绑定）
 wrangler r2 bucket create workbuddy2api-logs
 ```
 
@@ -259,10 +260,17 @@ WB2A_URL=https://xxx.pages.dev WB2A_API_KEY=xxx npm run smoke
 | `workbuddy2api-pages` | `npm run build` | ——（Pages 无此字段，产物目录 `dist`） | **Dashboard 点 5 个绑定** |
 
 Worker 侧配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个构建变量
-（**Settings → Build → Build variables and secrets**，不是运行时那栏）。
+（**Settings → Build → Build variables and secrets**，不是运行时那栏），
+**外加一个可选的 `CF_R2_BUCKET`**。
+
+> **R2 是可选资源。** 桶不存在时 `wrangler deploy` 会硬失败
+> （`R2 bucket 'xxx' not found [code: 10085]`），而建桶通常要绑支付方式。
+> 所以 `fill-ids.mjs` 的行为是：配了 `CF_R2_BUCKET` 才保留 `[[r2_buckets]]`，
+> 没配就自动把整段注释掉。代价是日志归档关闭，其余功能照常
+> （`archiveLogs` / `listLogDays` 都对未绑定做了降级）。
 
 Pages 侧一个变量都不用配，只在 **Settings → Functions** 里加 5 个绑定：
-`WB2A_CONFIG`、`WB2A_CACHE`（KV）、`WB2A_DB`（D1）、`WB2A_LOGS`（R2）、`POOL`（DO）。
+`WB2A_CONFIG`、`WB2A_CACHE`（KV）、`WB2A_DB`（D1）、`WB2A_LOGS`（R2，**可选**）、`POOL`（DO）。
 变量名必须一字不差；Production 与 Preview 两套环境各配一遍；改完要 Retry deployment。
 
 > 这套做法参照了同类项目 [K-Vault-Next](https://github.com/Linyueying/K-Vault-Next)：

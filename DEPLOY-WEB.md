@@ -46,10 +46,12 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 | D1 | Workers & Pages → D1 → Create | `workbuddy2api` | Database ID |
 | KV | Workers & Pages → KV → Create | `wb2api-config` | Namespace ID |
 | KV | Workers & Pages → KV → Create | `wb2api-cache` | Namespace ID |
-| R2 | Workers & Pages → R2 → Create bucket | `workbuddy2api-logs` | ——（名字固定） |
+| R2 **（可选）** | Workers & Pages → R2 → Create bucket | `workbuddy2api-logs` | —— |
 
 > 表不用你建。Worker 第一次收到请求会**自动建表**（4 表 + 5 索引），幂等。
-> R2 通常要求账号绑支付方式；不想绑就跳过，只影响日志归档。
+>
+> **R2 可以不开。** 它要绑支付方式才能建桶，所以做成了可选资源：不配置就不绑定，
+> 代价只是「请求日志归档」关闭，其余功能照常。想开启就建桶 + 配 `CF_R2_BUCKET`。
 
 ---
 
@@ -68,12 +70,16 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 
 然后 **Settings → Build → Build variables and secrets** 加 3 个：
 
-| 变量名 | 值 |
-|---|---|
-| `CF_KV_CONFIG_ID` | `wb2api-config` 的 ID |
-| `CF_KV_CACHE_ID` | `wb2api-cache` 的 ID |
-| `CF_D1_ID` | D1 的 Database ID |
+| 变量名 | 值 | 必填 |
+|---|---|---|
+| `CF_KV_CONFIG_ID` | `wb2api-config` 的 ID | ✅ |
+| `CF_KV_CACHE_ID` | `wb2api-cache` 的 ID | ✅ |
+| `CF_D1_ID` | D1 的 Database ID | ✅ |
+| `CF_R2_BUCKET` | `workbuddy2api-logs` | ⬜ 可选 |
 
+> **不配 `CF_R2_BUCKET` 也能部署成功**——构建脚本会自动摘掉 `[[r2_buckets]]` 绑定段，
+> 日志里会看到 `R2 未配置 → 已摘掉 [[r2_buckets]] 绑定段`，这是正常的。
+>
 > ⚠️ 是 **Settings → Build** 里的构建变量，**不是** Settings → Variables and Secrets
 > （那是运行时）。`fill-ids.mjs` 在构建阶段跑，只认构建变量。
 
@@ -117,7 +123,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 | 1 | KV namespace bindings | `WB2A_CONFIG` | `wb2api-config` |
 | 2 | KV namespace bindings | `WB2A_CACHE` | `wb2api-cache` |
 | 3 | D1 database bindings | `WB2A_DB` | `workbuddy2api` |
-| 4 | R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs` |
+| 4 | R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs`（**可选**，没开 R2 就跳过） |
 | 5 | **Durable Object bindings** | `POOL` | 下拉选 `PoolDO` |
 
 ⚠️ 四个坑：
@@ -189,6 +195,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 | `d1_schema` 报 error | D1 绑定没配或选错库 | 第 4 步第 3 项 |
 | 构建报「缺少 3 个资源 ID」 | 变量填到了 Variables and Secrets 而不是 Build | 第 2 步 |
 | Worker 部署报 Pages 相关错误 | Deploy command 用了默认值 | 第 2 步 |
+| 报 `R2 bucket 'xxx' not found` [code: 10085] | 配了 `CF_R2_BUCKET` 但桶不存在 | 删掉该变量，或去把桶建出来 |
 | 定时任务从不执行 | Triggers 里没有那两条 cron | 第 2 步 |
 | 页面 404 | Build output directory 不是 `dist` | 第 3 步 |
 | 页面一直转圈 | 缺 `nodejs_compat` | 第 5 步 |

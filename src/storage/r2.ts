@@ -11,6 +11,9 @@ import type { RequestLogEntry } from "../types";
  */
 export async function archiveLogs(env: Env, entries: RequestLogEntry[], day?: string): Promise<void> {
   if (!entries.length) return;
+  // R2 是可选绑定：没绑就静默跳过，不能让「没开日志归档」拖垮主流程。
+  // （桶不存在时 wrangler 部署会直接失败，所以绑定段可能被构建机摘掉）
+  if (!env.WB2A_LOGS) return;
   const d = day && /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : new Date().toISOString().slice(0, 10);
   const key = "logs/" + d + ".jsonl";
   let existing = "";
@@ -26,6 +29,11 @@ export async function archiveLogs(env: Env, entries: RequestLogEntry[], day?: st
 }
 
 export async function listLogDays(env: Env): Promise<string[]> {
-  const listed = await env.WB2A_LOGS.list({ prefix: "logs/" });
-  return listed.objects.map((o) => o.key);
+  if (!env.WB2A_LOGS) return [];
+  try {
+    const listed = await env.WB2A_LOGS.list({ prefix: "logs/" });
+    return listed.objects.map((o) => o.key);
+  } catch {
+    return [];
+  }
 }

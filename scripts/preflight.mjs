@@ -228,7 +228,8 @@ if (!existsSync(engineTomlPath)) {
     warn("engine-worker 未绑 D1 —— 日志归档读不到数据");
   }
   if (!/\[\[r2_buckets\]\]/.test(pt)) {
-    warn("engine-worker 未绑 R2 —— 日志归档无处可写");
+    // 不是错误：R2 是可选资源，没绑只是关掉日志归档，构建机默认就会摘掉
+    warn("engine-worker 未绑 R2（可选）—— 日志归档关闭，其余功能正常");
   }
 }
 
