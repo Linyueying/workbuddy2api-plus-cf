@@ -95,7 +95,33 @@ wrangler d1 create workbuddy2api
 wrangler r2 bucket create workbuddy2api-logs
 ```
 
-把上面返回的 **id** 填进 `wrangler.toml` 对应位置（`REPLACE_WITH_*_ID`）。
+把上面返回的 **id** 填进 `wrangler.toml` 与 `pool-worker/wrangler.toml`
+（后者只需要 `WB2A_CONFIG` 的 KV id）。
+
+### 4.1b 部署账号池 Worker（**必须，且要先于 Pages**）
+
+账号池 `PoolDO` 必须独立部署。**Pages 项目无法承载 Durable Object**，这是
+Cloudflare 的硬约束，两条规则互相锁死：
+
+| 规则 | 来源 |
+|---|---|
+| DO 类必须靠 `[[migrations]]` 才能注册 | Workers 运行时（删掉则 DO 调用挂起） |
+| Pages 的 wrangler.toml **不支持** `migrations` | 云端构建直接报 `does not support "migrations"` |
+| Pages 的 DO binding **强制**要求 `script_name` | 云端构建直接报 `should specify a "script_name"` |
+| 官方：*"You cannot create and deploy a Durable Object within a Pages project"* | Pages 文档 |
+
+所以 PoolDO 拆到 `pool-worker/`，Pages 侧用 `script_name = "workbuddy2api-pool"`
+远程引用。Pages 代码不用改，`env.POOL` 照旧可用。
+
+```bash
+npm run deploy:pool     # 构建 + wrangler deploy（独立 Worker）
+```
+
+> ⚠️ Secret 是按 Worker 独立存储的，Pages 项目设的不会带过来。
+> 这个 Worker 要单独设一遍（至少 `WB2A_API_KEY`）：
+> ```bash
+> npx wrangler secret put WB2A_API_KEY --config pool-worker/wrangler.toml
+> ```
 
 ### 4.2 配置 Secrets（敏感，不进仓库/代码）
 

@@ -1,0 +1,36 @@
+name = "workbuddy2api-pool"
+main = "dist/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# 这是**独立 Worker**（不是 Pages 项目），所以这里可以、也必须写 [[migrations]]：
+# Durable Object 类靠它注册。Pages 项目的 wrangler.toml 反而不允许该字段。
+#
+# 部署：npm run deploy:pool
+# 之后 Pages 项目用 script_name = "workbuddy2api-pool" 引用这里的 PoolDO。
+# ---------------------------------------------------------------------------
+
+# 非敏感配置（PoolDO 通过 getConfig 读取）
+[[kv_namespaces]]
+binding = "WB2A_CONFIG"
+id = "REPLACE_WITH_CONFIG_KV_ID"
+
+# 本 Worker 自身对 PoolDO 的绑定。PoolDO 类内部不依赖它（env.POOL 只在
+# Pages 侧的 RPC 客户端里用），保留是为了让 DO 命名空间可见、便于运维。
+[[durable_objects.bindings]]
+name = "POOL"
+class_name = "PoolDO"
+# 独立 Worker 里 script_name 可省略（默认就是自己），Pages 里才必填。
+
+[[migrations]]
+tag = "v1"
+new_classes = ["PoolDO"]
+
+# ---------------------------------------------------------------------------
+# Secret（敏感，不进仓库）：
+#   npx wrangler secret put WB2A_API_KEY      --config pool-worker/wrangler.toml
+#   npx wrangler secret put WB2A_DEVICE_TOKEN --config pool-worker/wrangler.toml
+# 注意：Secret 是按 Worker 独立存储的，Pages 项目设的那些不会自动带过来，
+# 这个 Worker 要单独设一遍（至少 WB2A_API_KEY）。
+# ---------------------------------------------------------------------------

@@ -32,14 +32,25 @@ binding = "WB2A_LOGS"
 bucket_name = "workbuddy2api-logs"
 
 # 账号池 Durable Object（单实例顺序单线程，替代原 Go 全局锁）
+#
+# script_name 对 Pages 是**必填**（Workers 里才可选）：Pages 要求显式指出
+# DO 定义在哪个 Worker。而 Pages 项目自身不能承载 DO（原因见下），
+# 所以这里指向独立部署的 pool-worker（见 pool-worker/ 目录）。
+# 缺这个字段构建会直接失败：
+#   "Durable Objects bindings should specify a script_name"
 [[durable_objects.bindings]]
 name = "POOL"
 class_name = "PoolDO"
+script_name = "workbuddy2api-pool"
 
-# Pages 在 Pages 项目中启用 DO 需要 migrations 声明
-[[migrations]]
-tag = "v1"
-new_classes = ["PoolDO"]
+# 注意：这里**不能**写 [[migrations]]。Pages 的 wrangler.toml 不支持该字段，
+# 写了构建直接报错：
+#   "Configuration file for Pages projects does not support \"migrations\""
+#
+# 但 Durable Object 类又必须靠 migrations 才能注册（实测：删掉该字段后
+# 本地 DO 调用会挂起）。两条约束合起来 = Pages 项目无法自带 DO，
+# 因此 PoolDO 单独部署为 Worker `workbuddy2api-pool`（见 pool-worker/），
+# 这里只做远程引用。Pages 侧代码无需改动，env.POOL 照旧可用。
 
 # ---------------------------------------------------------------------------
 # Pages 不支持 Cron Triggers。

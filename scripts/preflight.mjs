@@ -114,6 +114,44 @@ function readFileSyncSafe(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. 账号池 Worker（Pages 无法自带 DO，PoolDO 必须独立部署且先于 Pages）
+// ---------------------------------------------------------------------------
+console.log("\n[2b] 账号池 Worker（PoolDO 独立部署）");
+const poolTomlPath = resolve(root, "pool-worker/wrangler.toml");
+if (!existsSync(poolTomlPath)) {
+  bad("缺 pool-worker/wrangler.toml —— PoolDO 无处可部署");
+} else {
+  const poolToml = readFileSync(poolTomlPath, "utf8");
+  const poolName = poolToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
+  const hasMigrations = /\[\[migrations\]\]/.test(poolToml);
+  // Pages 侧 script_name 必须指向这个 Worker 的名字，否则运行时找不到 DO
+  const scriptName = toml.match(/script_name\s*=\s*"([^"]+)"/)?.[1] ?? "";
+  if (!hasMigrations) {
+    bad("pool-worker/wrangler.toml 缺 [[migrations]]：DO 类不会被注册");
+  } else if (!poolName) {
+    bad("pool-worker/wrangler.toml 未声明 name");
+  } else if (scriptName !== poolName) {
+    bad(
+      `Pages 的 script_name="${scriptName}" 与 pool worker 的 name="${poolName}" 不一致` +
+        ` → 运行时找不到 DO。改 wrangler.toml 的 script_name`,
+    );
+  } else {
+    ok(`script_name 与 pool worker 名一致：${poolName}`);
+  }
+  // 产物是否已构建
+  if (!existsSync(resolve(root, "pool-worker/dist/index.js"))) {
+    warn("pool-worker 未构建 → 部署前跑 npm run build:pool");
+    console.log("     部署顺序：npm run deploy:pool（先）→ Pages 部署（后）");
+  } else {
+    ok("pool-worker/dist/index.js 已构建");
+  }
+  const poolPlaceholders = [...poolToml.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]);
+  if (poolPlaceholders.length) {
+    bad(`pool-worker/wrangler.toml 仍有占位符：${[...new Set(poolPlaceholders)].join(", ")}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 3. API key（本地 Secret 文件）
 // ---------------------------------------------------------------------------
 console.log("\n[3] 管理员密钥");
