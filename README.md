@@ -4,9 +4,13 @@
 
 > 本重构是**云原生重写**而非逐行翻译：原 Go 的「进程内存状态 + 本地文件 + 常驻 goroutine 调度器」整体外移到 **Durable Objects / D1 / KV / R2**。前端（相对路径 + Bearer 鉴权）**零改动**部署。
 
-> **没有本地电脑？** 看 👉 [DEPLOY-WEB.md](./DEPLOY-WEB.md)：全程只用 Cloudflare Dashboard + GitHub 网页版，
-> 不用装 Node/wrangler、不用改任何文件——资源 ID 由构建机从 Cloudflare 环境变量注入
-> （`node scripts/fill-ids.mjs`，见第 4.5 节）。
+> **没有本地电脑 / 第一次用 Cloudflare？** 看 👉 [DEPLOY-NOVICE.md](./DEPLOY-NOVICE.md)：
+> 手把手网页版教学，从注册到面板能用，30–40 分钟照着点完。
+>
+> 有经验只要参数 → [DEPLOY-WEB.md](./DEPLOY-WEB.md)。
+>
+> **完全没有命令行**也能部署：Pages 侧 5 个绑定全在 Dashboard 点，
+> 两个 Worker 的资源 ID 由构建机从环境变量注入（`node scripts/fill-ids.mjs`，见 4.5 节）。
 > 本文第 4 节是命令行版步骤，两者**选一种即可**。
 
 ---
