@@ -119,7 +119,7 @@ export async function runHealthChecks(env: Env): Promise<{ ready: boolean; check
     checks.push({
       name: "pool_do",
       ok: false,
-      hint: `账号池 DO 不可用：${String(e?.message ?? e)}（wrangler.toml 缺 [[migrations]] new_classes？）`,
+      hint: `账号池 DO 不可用：${String(e?.message ?? e)}（engine worker 的 [[migrations]] 是否用 new_sqlite_classes 注册了 PoolDO？）`,
     });
   }
 

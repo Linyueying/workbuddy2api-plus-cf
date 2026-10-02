@@ -196,6 +196,7 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目�
 | 构建报「缺少 3 个资源 ID」 | 变量填到了 Variables and Secrets 而不是 Build | 第 2 步 |
 | Worker 部署报 Pages 相关错误 | Deploy command 用了默认值 | 第 2 步 |
 | 报 `R2 bucket 'xxx' not found` [code: 10085] | 配了 `CF_R2_BUCKET` 但桶不存在 | 删掉该变量，或去把桶建出来 |
+| 报 `must create a namespace using a new_sqlite_classes migration` [code: 10097] | DO 用了 KV 后端（免费套餐不支持） | 已在仓库修好（`new_sqlite_classes`），拉取最新代码重新部署 |
 | 定时任务从不执行 | Triggers 里没有那两条 cron | 第 2 步 |
 | 页面 404 | Build output directory 不是 `dist` | 第 3 步 |
 | 页面一直转圈 | 缺 `nodejs_compat` | 第 5 步 |

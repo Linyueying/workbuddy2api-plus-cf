@@ -24,9 +24,19 @@ crons = ["0 * * * *", "30 17 * * *"]
 
 # Durable Object 类靠 [[migrations]] 注册。Pages 项目的 wrangler.toml 反而不
 # 允许该字段，这正是 PoolDO 必须独立部署的原因。
+#
+# 必须用 new_sqlite_classes，不能用 new_classes：
+#   Cloudflare 自 2025 年起规定「新建 DO namespace 只能用 SQLite 存储后端」，
+#   免费套餐更是从未支持过 KV 后端的 DO。用 new_classes 部署会直接报：
+#     In order to use Durable Objects with a free plan, you must create a
+#     namespace using a new_sqlite_classes migration. [code: 10097]
+#
+#   对代码没有影响：SQLite 后端完整实现 storage 的 KV API（get/put/delete/list/
+#   setAlarm 全都一样用，底层存进隐藏的 SQLite 表），还额外白送 SQL API 与
+#   时间点恢复（PITR）。src/durable/ 里全是标准 KV 用法，无需改动。
 [[migrations]]
 tag = "v1"
-new_classes = ["PoolDO"]
+new_sqlite_classes = ["PoolDO"]
 
 # ---------------------------------------------------------------------------
 # 绑定

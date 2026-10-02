@@ -399,6 +399,7 @@ Pages 网址          ：_________________________________
 | 页面一直转圈 | 缺 `nodejs_compat` | 第 6 章 |
 | 日志归档不工作 | 跳过了 R2（预期行为，不是故障） | 第 2.3 节 |
 | 部署报 `R2 bucket 'xxx' not found` | 配了 `CF_R2_BUCKET` 但桶没建/名字错 | 第 2.3 节建桶，或删掉 `CF_R2_BUCKET` 这个变量 |
+| 部署报 `...new_sqlite_classes migration` [code: 10097] | DO 用了 KV 后端，免费套餐不支持 | 已在仓库修好，重新部署（Retry）即可 |
 
 ### 终极排查手段
 

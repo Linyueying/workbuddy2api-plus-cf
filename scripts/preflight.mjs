@@ -173,6 +173,20 @@ if (!existsSync(engineTomlPath)) {
   const engineToml = readFileSync(engineTomlPath, "utf8");
   const engineName = engineToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
   const hasMigrations = /\[\[migrations\]\]/.test(engineToml);
+  const activeEngine = engineToml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
+  // 免费套餐（以及 2025 年后新建的所有 namespace）只接受 SQLite 后端 DO。
+  // 用 new_classes 部署会硬失败：...must create a namespace using a
+  // new_sqlite_classes migration. [code: 10097]
+  const usesLegacyClasses =
+    /new_classes\s*=/.test(activeEngine) && !/new_sqlite_classes\s*=/.test(activeEngine);
+  if (hasMigrations && usesLegacyClasses) {
+    bad(
+      "engine-worker 的 [[migrations]] 用了 new_classes：免费套餐部署会报 code: 10097\n" +
+        "     → 把 new_classes 改成 new_sqlite_classes（storage 的 KV 用法完全不变）",
+    );
+  } else if (hasMigrations && /new_sqlite_classes/.test(activeEngine)) {
+    ok("DO 用 new_sqlite_classes 注册（免费套餐要求，storage KV API 不受影响）");
+  }
   // Pages 侧 script_name 必须指向这个 Worker 的名字，否则运行时找不到 DO。
   // 走 Dashboard 绑定时 wrangler.toml 里没有这一行（只有注释），改由下拉选择
   // engine worker 注册出来的 namespace，所以这里只在显式声明时才做一致性校验。
