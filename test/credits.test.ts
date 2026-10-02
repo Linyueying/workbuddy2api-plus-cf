@@ -196,6 +196,10 @@ describe("余额聚合（对齐 Go UserResourceDetailedWithExpiry）", () => {
     expect(h!.get("X-Enterprise-Id")).toBe("e1");
     expect(h!.get("X-Domain")).toBe("copilot.tencent.com");
     expect(h!.get("Authorization")).toBe("Bearer AT");
+    // Origin 族：登录链路当初就是缺 Origin 被上游拒，账单域同一套网关
+    expect(h!.get("Origin")).toBe("https://www.codebuddy.cn");
+    expect(h!.get("Referer")).toBe("https://www.codebuddy.cn/");
+    expect(h!.get("X-Requested-With")).toBe("XMLHttpRequest");
   });
 
   it("确实没有积分包（Accounts 为空）不是错误：返回 0 聚合且不抛", async () => {

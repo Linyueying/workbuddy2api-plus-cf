@@ -67,8 +67,13 @@ export async function dailyCheckinRetry(
       const res = await withTimeout(
         new Request(base.billing + p, {
           method: "POST",
-          // 账单域：必须用 billingHeaders（带 X-User-Id/X-Domain 等归属头）
-          headers: billingHeaders(auth, env, { Accept: "application/json" }),
+          // 账单域：billingHeaders（归属头）+ Origin 族，缺任一组网关都会 401
+          headers: billingHeaders(auth, env, {
+            Accept: "application/json",
+            Origin: base.billing,
+            Referer: base.billing + "/",
+            "X-Requested-With": "XMLHttpRequest",
+          }),
           body: "{}",
         }),
         timeout,

@@ -526,13 +526,22 @@ export async function postBillingResource(
   const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
   for (let i = 0; i < paths.length; i++) {
     const p = paths[i];
-    // 必须用 billingHeaders（对齐 Go headers.go BillingHeaders），不能用 buildHeaders：
-    // 账单域网关要 X-User-Id / X-Domain / X-Enterprise-Id / X-Device-Token 这套
-    // 归属头，buildHeaders 是 chat 域那套（X-IDE-*），缺归属头会被网关直接 401。
+    // 头有两组要求，缺任何一组网关都会 401：
+    //   1) billingHeaders（对齐 Go headers.go BillingHeaders）：X-User-Id /
+    //      X-Domain / X-Enterprise-Id / X-Device-Token 这套归属头。不能用
+    //      buildHeaders（chat 域那套只有 X-IDE-*）。
+    //   2) Origin / Referer / X-Requested-With（Go commonHeaders）——登录链路
+    //      当初就是缺 Origin 直接 4xx，账单域同一套网关，同样校验。Origin 取
+    //      账单域自身，同域，不会触发跨域拒绝。
     const res = await withTimeout(
       new Request(base.billing + p, {
         method: "POST",
-        headers: billingHeaders(auth, env, { Accept: "application/json" }),
+        headers: billingHeaders(auth, env, {
+          Accept: "application/json",
+          Origin: base.billing,
+          Referer: base.billing + "/",
+          "X-Requested-With": "XMLHttpRequest",
+        }),
         body,
       }),
       timeout,
@@ -552,9 +561,18 @@ export async function postBillingResource(
     const err: any = new Error(`http ${res.status}`);
     err.status = res.status;
     err.detail = detail;
+    // 响应头也要打：网关（APISIX）常在 WWW-Authenticate / X-* 里说明拒绝原因，
+    // 光看 HTML 正文什么也看不出来。token 只打长度与前缀，不落明文。
+    const rh: string[] = [];
+    res.headers.forEach((v, k) => rh.push(`${k}=${v}`.slice(0, 60)));
+    const tok = String(auth.accessToken ?? "");
     console.error(
       `[${tag}] 上游拒绝 uid=${auth.uid} realm=${auth.realm} base=${base.billing} ` +
-        `path=${p} status=${res.status} body=${detail}`,
+        `path=${p} status=${res.status} ` +
+        `token=${tok.length}位/${tok.slice(0, 6)}… ` +
+        `ua=${String(getConfigCached(env).upstream.user_agent ?? "").slice(0, 40)} ` +
+        `hasDeviceToken=${Boolean(auth.device_token || getConfigCached(env).upstream.device_token)} ` +
+        `respHeaders=[${rh.slice(0, 8).join("; ")}] body=${detail.slice(0, 120)}`,
     );
     throw err;
   }
@@ -651,9 +669,17 @@ export async function dailyCheckin(env: Env, auth: Auth): Promise<{ done: boolea
   const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
   const paths = checkinMeterPaths(auth.realm);
   for (const p of paths) {
-    // 同 postBillingResource：签到也在账单域，头必须用 billingHeaders
+    // 同 postBillingResource：签到也在账单域，头必须用 billingHeaders + Origin 族
     const res = await withTimeout(
-      new Request(base.billing + p, { method: "POST", headers: billingHeaders(auth, env), body: "{}" }),
+      new Request(base.billing + p, {
+        method: "POST",
+        headers: billingHeaders(auth, env, {
+          Origin: base.billing,
+          Referer: base.billing + "/",
+          "X-Requested-With": "XMLHttpRequest",
+        }),
+        body: "{}",
+      }),
       timeout,
     );
     if (res.status === 404 && p !== paths[paths.length - 1]) continue;
