@@ -35,16 +35,16 @@ const out = (v) => (Buffer.isBuffer(v) ? v.toString("utf8") : String(v ?? ""));
 // ---------------------------------------------------------------------------
 console.log("\n[1] wrangler.toml 绑定配置");
 
-// 纯网页部署通道：.github/workflows/deploy.yml 会在 CI 里用 GitHub Secrets
-// 替换占位符，所以仓库里保留 REPLACE_WITH_* 是**预期状态**，不该报错。
-// 只有走本地 CLI / Cloudflare 原生 Git 集成时才需要真实写进文件。
-const hasActionsDeploy = existsSync(resolve(root, ".github/workflows/deploy.yml"));
+// 纯网页部署通道：scripts/fill-ids.mjs 由构建机调用（Cloudflare Builds 的
+// Build command 或 CI），用环境变量里的真实 ID 替换占位符。所以仓库里保留
+// REPLACE_WITH_* 是**预期状态**，不该报错；只有走本地 CLI 直接部署才需要手工填。
+const hasFillIds = existsSync(resolve(root, "scripts/fill-ids.mjs"));
 
 function reportPlaceholders(label, text, file) {
   const ph = [...new Set([...text.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]))];
   if (!ph.length) return true;
-  if (hasActionsDeploy) {
-    warn(`${label} 有占位符 ${ph.join(", ")} —— 由 GitHub Actions 用 Secrets 注入，无需改文件`);
+  if (hasFillIds) {
+    warn(`${label} 有占位符 ${ph.join(", ")} —— 由构建机的 fill-ids 注入，无需改文件`);
     return true;
   }
   bad(`${label} 仍有占位符：${ph.join(", ")}`);
@@ -53,7 +53,7 @@ function reportPlaceholders(label, text, file) {
     console.log("       npx wrangler kv namespace create WB2A_CONFIG");
     console.log("       npx wrangler kv namespace create WB2A_CACHE");
     console.log("       npx wrangler d1 create workbuddy2api");
-    console.log("     或改走纯网页通道，见 DEPLOY-WEB.md 方案 A");
+    console.log("     或 npm run fill:ids（从环境变量注入）");
   }
   return false;
 }
@@ -62,9 +62,10 @@ const toml = readFileSync(resolve(root, "wrangler.toml"), "utf8");
 if (reportPlaceholders("wrangler.toml", toml, "wrangler.toml")) {
   ok("绑定配置就绪");
 }
-if (hasActionsDeploy) {
-  ok("检测到 .github/workflows/deploy.yml → 纯网页部署通道可用");
-  console.log("     需要填的 Secrets 见 DEPLOY-WEB.md 第 4 步");
+if (hasFillIds) {
+  ok("检测到 scripts/fill-ids.mjs → 纯网页部署通道可用");
+  console.log("     Build command 末尾加 && node scripts/fill-ids.mjs");
+  console.log("     需配环境变量 CF_KV_CONFIG_ID / CF_KV_CACHE_ID / CF_D1_ID，见 DEPLOY-WEB.md");
 }
 
 // R2 桶名是字面量不是占位符，上面的占位符扫描抓不到它。桶不存在时 wrangler

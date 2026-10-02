@@ -19,6 +19,7 @@
     "db:init": "node scripts/db-init.mjs",
     "db:init:remote": "node scripts/db-init.mjs --remote",
     "preflight": "node scripts/preflight.mjs",
+    "fill:ids": "node scripts/fill-ids.mjs",
     "smoke": "node scripts/smoke.mjs",
     "import:config": "node scripts/import-config.mjs",
     "import:auths": "node scripts/import-auths.mjs",

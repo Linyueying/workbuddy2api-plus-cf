@@ -5,8 +5,9 @@
 > 本重构是**云原生重写**而非逐行翻译：原 Go 的「进程内存状态 + 本地文件 + 常驻 goroutine 调度器」整体外移到 **Durable Objects / D1 / KV / R2**。前端（相对路径 + Bearer 鉴权）**零改动**部署。
 
 > **没有本地电脑？** 看 👉 [DEPLOY-WEB.md](./DEPLOY-WEB.md)：全程只用 Cloudflare Dashboard + GitHub 网页版，
-> 不用装 Node/wrangler、不用改任何文件（资源 ID 由 GitHub Actions 从 Secrets 注入）。
-> 本文第 4 节是命令行版部署步骤，两种方案**选一种即可**。
+> 不用装 Node/wrangler、不用改任何文件——资源 ID 由构建机从 Cloudflare 环境变量注入
+> （`node scripts/fill-ids.mjs`，见第 4.5 节）。
+> 本文第 4 节是命令行版步骤，两者**选一种即可**。
 
 ---
 
@@ -118,8 +119,17 @@ wrangler d1 create workbuddy2api
 wrangler r2 bucket create workbuddy2api-logs
 ```
 
-把上面返回的 **id** 填进 `wrangler.toml` 与 `pool-worker/wrangler.toml`
-（后者只需要 `WB2A_CONFIG` 的 KV id）。
+把上面返回的 **id** 填进 `wrangler.toml`、`pool-worker/wrangler.toml`、
+`scheduler-worker/wrangler.toml`（后两者只需要 `WB2A_CONFIG` 的 KV id，
+scheduler 另需 D1 id）。
+
+想省事就用 `npm run fill:ids`：它从环境变量读 ID 并替换三个文件里的占位符，
+幂等，适合接进 CI：
+
+```bash
+CF_KV_CONFIG_ID=xxx CF_KV_CACHE_ID=yyy CF_D1_ID=zzz npm run fill:ids
+# --lenient 缺哪个跳过哪个；--dry-run 只打印不落盘
+```
 
 ### 4.1a 部署定时作业 Worker（**必须，否则没有定时任务**）
 
@@ -232,7 +242,27 @@ WB2A_URL=https://xxx.pages.dev WB2A_API_KEY=xxx npm run smoke
 - `ready: false` + HTTP 503 → 配置坏了（D1 缺表/ 密钥为空 / 绑定不可用），响应体 `checks` 里逐项给出原因与修复命令；
 - `ready: true` + `healthy: false` → 配置没问题，只是池里还没可服务账号（新部署的正常中间态，不该报警）。
 
-### 4.5 导入原有配置与账号
+### 4.5 纯网页部署（没有本地电脑时）
+
+不想/不能敲命令，走 👉 [DEPLOY-WEB.md](./DEPLOY-WEB.md)。核心思路是把 4.1 的「填 ID」
+从「改仓库文件」变成「配 Cloudflare 环境变量」：
+
+| 部署单元 | Build command | Deploy command |
+|---|---|---|
+| `workbuddy2api-pool` | `npm install && npm run build:pool && node scripts/fill-ids.mjs` | `npx wrangler deploy --config pool-worker/wrangler.toml` |
+| `workbuddy2api-scheduler` | `npm install && npm run build:scheduler && node scripts/fill-ids.mjs` | `npx wrangler deploy --config scheduler-worker/wrangler.toml` |
+| `workbuddy2api-pages` | `npm install && npm run build && node scripts/fill-ids.mjs` | ——（Pages 无此字段，产物目录 `dist`） |
+
+三处都要配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个变量
+（Workers 在 **Settings → Build → Build variables and secrets**，Pages 在
+**Settings → Environment variables**）。
+
+> ⚠️ Pages 项目的 `wrangler.toml` 是配置唯一真源，只要它在，Dashboard 里的绑定就是
+> 只读、点不动的——所以 ID 没法纯点击填入，只能由构建机写入。
+> 万一 Cloudflare 在 build command 之前就解析了配置，改用 DEPLOY-WEB.md 的方案 C
+> （github.dev 在线改文件）。
+
+### 4.6 导入原有配置与账号
 
 ```bash
 # 导入 config.json（非敏感项；敏感 api_key 走 Secret）
