@@ -72,6 +72,9 @@ export function buildHeaders(auth: Auth, env: Env, extra?: Record<string, string
     h.set("X-IDE-Version", cfg.upstream.client_version);
   }
   h.set("X-Conversation-Request-ID", crypto.randomUUID());
+  // 稳定设备指纹三头（对齐原版 converter._device_headers）：纯 uid 哈希、不依赖
+  // 桌面端/SDK，任何环境都带——原版在云端/纯 Linux 跑通余额正是靠它，不能丢。
+  for (const [k, v] of Object.entries(deviceHeaders(auth.uid))) h.set(k, v);
   if (extra) for (const [k, v] of Object.entries(extra)) h.set(k, v);
   return h;
 }
@@ -568,8 +571,7 @@ export async function postBillingResource(
     if (res.status === 401 && !hadDT) {
       err.hint =
         "上游网关要求设备风控令牌 X-Device-Token（由本机 WorkBuddy 桌面端的 TuringShield " +
-        "原生 SDK 现场生成，Cloudflare 无法自动产生）。请在 Pages 的 WB2A_DEVICE_TOKEN " +
-        "Secret 填入从桌面端取得的设备令牌；或仅将该服务用于对话代理（余额/签到因风控不可用）。";
+      "（若仍失败，多为归属头/设备指纹头被网关拒绝；可检查 X-User-Id/X-Domain 与设备指纹头是否随请求送出）。";
     }
     // 响应头也要打：网关（APISIX）常在 WWW-Authenticate / X-* 里说明拒绝原因，
     // 光看 HTML 正文什么也看不出来。token 只打长度与前缀，不落明文。
@@ -778,6 +780,8 @@ export function billingHeaders(auth: Auth, env: Env, extra?: Record<string, stri
   if (auth.domain) h.set("X-Domain", auth.domain);
   const dt = auth.device_token || cfg.upstream.device_token;
   if (dt) h.set("X-Device-Token", dt);
+  // 稳定设备指纹三头：账单域同样必须带（同 buildHeaders），缺它网关 401。
+  for (const [k, v] of Object.entries(deviceHeaders(auth.uid))) h.set(k, v);
   if (extra) for (const [k, v] of Object.entries(extra)) h.set(k, v);
   return h;
 }
@@ -837,6 +841,96 @@ export function deriveID(auth: Auth, salt: string): string {
     out += (b & 0xff).toString(16).padStart(2, "0");
   }
   return out.slice(0, 36);
+}
+
+/**
+ * deviceHeaders 由 uid 稳定派生三个设备指纹头（对齐原版 core/fingerprint.py）。
+ * 算法逐字对齐参考实现 workbuddy2api-hub 的 md5("<salt>:<uid>")[:36]——混用两套实现
+ * 会让同一账号呈现两套指纹，被上游判定异常登录。
+ *
+ * ⚠️ 这是原版在「无桌面端 / 纯 Linux / 云端」环境仍能跑通余额与签到的关键：
+ * 该三头是纯哈希、不依赖 Turing SDK，任何部署环境都无条件注入；X-Device-Token
+ * 反而是「有就加、没有就降级」的可选头。TS 重写版此前漏了这三头，正是 Cloudflare
+ * 上账单域被网关（EdgeOne/openresty）401 的根因——原版在纯 Linux 能跑正是靠它。
+ */
+/** 纯 TS MD5（设备指纹派生用，非安全用途），对齐 Go/Python 参考实现的 md5 口径，
+ *  不依赖 node:crypto，Worker 原生可用。返回值形态与标准 md5 一致（32 位 hex）。 */
+export function md5Hex(input: string): string {
+  const utf8: number[] = [];
+  for (let i = 0; i < input.length; i++) {
+    let c = input.charCodeAt(i);
+    if (c < 0x80) utf8.push(c);
+    else if (c < 0x800) utf8.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else if (c >= 0xd800 && c < 0xdc00) {
+      const c2 = input.charCodeAt(++i);
+      const cp = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
+      utf8.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else utf8.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  const len = utf8.length;
+  utf8.push(0x80);
+  while (utf8.length % 64 !== 56) utf8.push(0);
+  const bitLen = len * 8;
+  utf8.push(
+    bitLen & 0xff, (bitLen >>> 8) & 0xff, (bitLen >>> 16) & 0xff, (bitLen >>> 24) & 0xff,
+    0, 0, 0, 0,
+  );
+
+  const s = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+  const K = new Array<number>(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0;
+  const X = new Array<number>(16).fill(0);
+
+  let a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+  for (let off = 0; off < utf8.length; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4;
+      X[i] = (utf8[j] | (utf8[j + 1] << 8) | (utf8[j + 2] << 16) | (utf8[j + 3] << 24)) >>> 0;
+    }
+    let A = a, B = b, C = c, D = d;
+    for (let r = 0; r < 64; r++) {
+      let F: number, g: number;
+      if (r < 16) { F = ((B & C) | (~B & D)) >>> 0; g = r; }
+      else if (r < 32) { F = ((D & B) | (~D & C)) >>> 0; g = (5 * r + 1) % 16; }
+      else if (r < 48) { F = (B ^ C ^ D) >>> 0; g = (3 * r + 5) % 16; }
+      else { F = (C ^ (B | ~D)) >>> 0; g = (7 * r) % 16; }
+      F = (F + A + K[r] + X[g]) >>> 0;
+      const rot = s[r];
+      F = ((F << rot) | (F >>> (32 - rot))) >>> 0;
+      A = D; D = C; C = B; B = (B + F) >>> 0;
+    }
+    a = (a + A) >>> 0; b = (b + B) >>> 0; c = (c + C) >>> 0; d = (d + D) >>> 0;
+  }
+  // MD5 规范：每个 32 位字按小端拆成 4 字节再 hex（不能按数值直接大端输出）。
+  const hex = (n: number) => {
+    const u = n >>> 0;
+    return [
+      (u & 0xff).toString(16).padStart(2, "0"),
+      ((u >>> 8) & 0xff).toString(16).padStart(2, "0"),
+      ((u >>> 16) & 0xff).toString(16).padStart(2, "0"),
+      ((u >>> 24) & 0xff).toString(16).padStart(2, "0"),
+    ].join("");
+  };
+  return hex(a) + hex(b) + hex(c) + hex(d);
+}
+
+function fpId(uid: string | undefined, salt: string): string {
+  const seed = `${salt}:${uid || "anonymous"}`;
+  return md5Hex(seed).slice(0, 36);
+}
+
+export function deviceHeaders(uid: string | undefined): Record<string, string> {
+  const reqSuffix = String(Date.now() % 1_000_000).padStart(6, "0");
+  return {
+    "X-Machine-ID": fpId(uid, "machine"),
+    "X-Session-ID": fpId(uid, "session"),
+    "X-Request-ID": `${fpId(uid, "req")}-${reqSuffix}`,
+  };
 }
 
 export function desktopFingerprint(auth: Auth): Record<string, any> {
