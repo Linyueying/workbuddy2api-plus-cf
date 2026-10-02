@@ -2,6 +2,8 @@
 
 全程只用浏览器：**Cloudflare Dashboard + GitHub 网页版**。不用装 Node / wrangler，不用敲命令。
 
+> 第一次用 Cloudflare、想要手把手版本 → [DEPLOY-NOVICE.md](./DEPLOY-NOVICE.md)
+
 ---
 
 ## 0. 为什么可以一个文件都不改
@@ -18,23 +20,20 @@
 > **Pages 项目一旦有 wrangler.toml 且被识别为生产配置，Dashboard 里对应的字段就变成只读、点不动。**
 
 而「被识别为生产配置」的触发条件就是文件里那行 **`pages_build_output_dir`**。
-K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前的版本有，所以只能改文件。
+K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；本项目也已经把这一行去掉了。
 
-**本项目的改动**：把 Pages 的 `wrangler.toml` 里那行去掉，绑定段也全部移除。
-现在 Pages 侧**零配置**，5 个绑定全在 Dashboard 点。
-
-> 两个 Worker（`pool` / `scheduler`）不是 Pages，不受这条规则约束，
-> 它们仍走「配置文件 + 构建环境变量注入 ID」的路子——见第 2、3 步。
+**所以现在**：Pages 侧 5 个绑定全在 Dashboard 点；Worker 侧的 ID 由构建机注入。
 
 ---
 
 ## 部署顺序
 
 ```
-① workbuddy2api-pool       ← 必须先有它，Pages 的 DO 下拉才选得到 PoolDO
-② workbuddy2api-scheduler
-③ workbuddy2api-pages      ← 最后，因为它要引用 ①
+① workbuddy2api-pool    ← 必须先有它，Pages 的 DO 下拉才选得到 PoolDO
+② workbuddy2api-pages   ← 引用 ①
 ```
+
+只有两个部署单元。定时作业（cron）已合并进 ①，不需要单独部署。
 
 ---
 
@@ -50,10 +49,11 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前�
 | R2 | Workers & Pages → R2 → Create bucket | `workbuddy2api-logs` | ——（名字固定） |
 
 > 表不用你建。Worker 第一次收到请求会**自动建表**（4 表 + 5 索引），幂等。
+> R2 通常要求账号绑支付方式；不想绑就跳过，只影响日志归档。
 
 ---
 
-## 第 2 步：部署账号池 Worker（①）
+## 第 2 步：部署 Worker ①（账号池 + 定时作业）
 
 **Workers & Pages → Create → Worker → Connect to Git**
 
@@ -77,33 +77,21 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前�
 > ⚠️ 是 **Settings → Build** 里的构建变量，**不是** Settings → Variables and Secrets
 > （那是运行时）。`fill-ids.mjs` 在构建阶段跑，只认构建变量。
 
-构建日志里应看到 `[fill-ids] pool-worker/wrangler.toml: 已写入`。
+### 确认定时生效
 
----
+部署成功后 → **Triggers** 标签，应该看到两条 cron：
 
-## 第 3 步：部署定时作业 Worker（②）
-
-同样 **Create → Worker → Connect to Git**，连**同一个**仓库：
-
-| 字段 | 值 |
-|---|---|
-| Worker name | `workbuddy2api-scheduler` |
-| Repository | 同一个仓库 |
-| Branch | `main` |
-| Root directory | 留空 |
-| **Build command** | `npm install && npm run build:scheduler && node scripts/fill-ids.mjs` |
-| **Deploy command** | `npx wrangler deploy --config scheduler-worker/wrangler.toml` |
-
-同样加那 3 个构建变量。
+```
+0 * * * *        ← 每小时整点跑作业
+30 17 * * *      ← UTC 17:30（= 北京 01:30）归档日志
+```
 
 > ⚠️ **Deploy command 必须改**。默认 `npx wrangler deploy` 会读仓库根目录的
 > `wrangler.toml`——那是 Pages 的配置，Worker 部署会失败。
 
-部署后到 **Triggers** 标签确认两条 cron：`0 * * * *`、`30 17 * * *`。
-
 ---
 
-## 第 4 步：建 Pages 项目（③）
+## 第 3 步：建 Pages 项目 ②
 
 **Workers & Pages → Create → Pages → Connect to Git**
 
@@ -116,64 +104,55 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前�
 | **Build command** | `npm run build` |
 | **Build output directory** | `dist` |
 
-> 注意：这里**不要**加 `node scripts/fill-ids.mjs`——Pages 的绑定不在文件里，不需要它。
-> 加也无害（脚本幂等），但没必要。
+> 不要加 `node scripts/fill-ids.mjs`——Pages 的绑定不在文件里，用不上。
 
 ---
 
-## 第 5 步：Pages 配 5 个绑定（原来的「改文件」变成「点 5 下」）
+## 第 4 步：Pages 配 5 个绑定
 
 **Pages 项目 → Settings → Functions**，逐个 Add binding：
 
-| 类别 | Variable name | 选什么 |
-|---|---|---|
-| KV namespace bindings | `WB2A_CONFIG` | `wb2api-config` |
-| KV namespace bindings | `WB2A_CACHE` | `wb2api-cache` |
-| D1 database bindings | `WB2A_DB` | `workbuddy2api` |
-| R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs` |
-| **Durable Object bindings** | `POOL` | 下拉里选 `PoolDO`（由第 2 步的 pool worker 注册） |
+| # | 类别 | Variable name | 选什么 |
+|---|---|---|---|
+| 1 | KV namespace bindings | `WB2A_CONFIG` | `wb2api-config` |
+| 2 | KV namespace bindings | `WB2A_CACHE` | `wb2api-cache` |
+| 3 | D1 database bindings | `WB2A_DB` | `workbuddy2api` |
+| 4 | R2 bucket bindings | `WB2A_LOGS` | `workbuddy2api-logs` |
+| 5 | **Durable Object bindings** | `POOL` | 下拉选 `PoolDO` |
 
-**变量名必须一字不差**，代码里就是按这些名字读的。
+⚠️ 四个坑：
 
-⚠️ 三个坑：
-
-1. **DO 绑定依赖第 2 步**。pool worker 没部署成功，下拉里就没有 `PoolDO`。
-2. **Production 与 Preview 两套环境各配一遍**（页面上有切换），只配一套的话预览分支会缺绑定。
-3. **改完必须重新部署**：Deployments → 最新部署 → **Retry deployment**。
+1. **变量名一字不差**，写错不报错、只是功能静默失效
+2. **第 5 项依赖第 2 步**——pool worker 没部署成功，下拉里就没有 `PoolDO`
+3. **Production 与 Preview 两套环境各配一遍**
+4. **改完必须 Retry deployment**
 
 ---
 
-## 第 6 步：兼容标志（一行）
+## 第 5 步：兼容标志
 
 **Pages 项目 → Settings → Functions → Compatibility flags**
 
 - Compatibility date：`2024-11-01` 或更新
-- Compatibility flags：填 `nodejs_compat`
+- Compatibility flags：`nodejs_compat`
 
-> 代码用 `process.env` 读运行时覆盖变量，需要这个标志。
-> 没填的话 `/panel/api/*` 可能在读取配置时报错。
-
----
-
-## 第 7 步：设置面板密钥 WB2A_API_KEY
-
-密钥不能进仓库，这步必须手动。
-
-**Pages 项目 → Settings → Variables and Secrets → Add**
-- Type：**Secret**
-- Variable name：`WB2A_API_KEY`
-- Value：你自己想一个强密码（面板登录 + `/v1/*` 接口鉴权都用它）
-
-**`workbuddy2api-pool` → Settings → Variables and Secrets → Add**，同名同值再设一遍。
-
-> ⚠️ **Secret 按 Worker 独立存储**，Pages 设了不会同步过来，两边都要设。
-> `workbuddy2api-scheduler` 不用设，它走内部调用、不鉴权。
-
-设完两边都要 **Retry deployment**。
+改完 Retry deployment。
 
 ---
 
-## 第 8 步：验证
+## 第 6 步：设置密钥 WB2A_API_KEY
+
+**Pages 项目 → Settings → Variables and Secrets → Add**：Type 选 **Secret**，
+变量名 `WB2A_API_KEY`，值自己想一个强密码。
+
+**`workbuddy2api-pool` → Settings → Variables and Secrets → Add**，同名同值**再设一遍**。
+
+> ⚠️ Secret 按 Worker 独立存储，Pages 设了不会同步过来，两边都要设。
+> 设完两边都要 Retry deployment。
+
+---
+
+## 第 7 步：验证
 
 | 地址 | 期望 |
 |---|---|
@@ -181,31 +160,22 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前�
 | `https://<项目>.pages.dev/status` | JSON，看下面字段 |
 | `https://<项目>.pages.dev/healthz` | `{"ok":true}` |
 
-`/status` 重点看：
-
-```jsonc
-{
-  "checks": {
-    "d1_schema": { "status": "ok" },   // ok / created = 自动建表成功
-    "pool":      { "status": "ok" },   // ok = DO 绑定生效
-    "kv_config": { "status": "ok" },
-    "api_key":   { "status": "ok" }    // 第 7 步设了才是 ok
-  }
-}
-```
-
-不是 `ok` 的项会带 `hint` 字段写明怎么修。**第一次访问 `d1_schema` 可能是 `skipped`**——
+`/status` 的 `checks` 里：`d1_schema`、`pool`、`kv_config`、`api_key` 都应 `ok`。
+失败项会带 `hint` 字段写明怎么修。第一次访问 `d1_schema` 可能是 `skipped`——
 自动建表异步触发，刷新一次即可。
 
 ---
 
-## 三个部署单元都是干什么的
+## 两个部署单元
 
-| 单元 | 类型 | 为什么独立 |
+| 单元 | 类型 | 职责 |
 |---|---|---|
-| `workbuddy2api-pages` | Pages | 前端 + 全部 API。Pages **不能自带 Durable Object**（不支持 `[[migrations]]`，而 DO 类必须靠它注册） |
-| `workbuddy2api-pool` | Worker | 承载 `PoolDO`（账号池单实例顺序锁） |
-| `workbuddy2api-scheduler` | Worker | 定时任务。**Pages 没有 Cron Triggers**，只有 Workers 有 |
+| `workbuddy2api-pool` | Worker | ① 承载 `PoolDO`（Pages 不能自带 DO）② 跑定时作业（Pages 没有 Cron） |
+| `workbuddy2api-pages` | Pages | 前端 + 全部 API |
+
+两者合在一个 Worker 里是合法的：一个 Worker 可以同时导出 DO 类与 `scheduled()`，
+也可以同时声明 `[[migrations]]` 与 `[triggers] crons`。合并后少一个部署单元，
+定时作业访问 PoolDO 也从跨 Worker 远程调用变成本地绑定。
 
 ---
 
@@ -213,34 +183,21 @@ K-Vault-Next 没有这行，所以它的绑定全归 Dashboard 管；我之前�
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| DO 下拉里没有 `PoolDO` | pool worker 没部署成功 | 先修好第 2 步，再回来配绑定 |
-| 面板能开但操作都「未授权」 | `WB2A_API_KEY` 没设 / 设完没重新部署 | 第 7 步 + Retry deployment |
-| `/status` 里 `pool` 失败 | DO 绑定名不是 `POOL`，或选错了 namespace | 检查绑定变量名 |
-| `d1_schema` 报 error | D1 绑定没配或选错库 | Settings → Functions → D1 database bindings |
-| Worker 构建报 `缺少 3 个资源 ID` | 构建变量配错页面 | Settings → **Build** → Build variables，不是 Variables and Secrets |
-| Worker 部署报 Pages 相关错误 | Deploy command 用了默认值 | 改成带 `--config` 的那条 |
-| 定时任务不跑 | scheduler 没起来或 cron 被覆盖 | 检查 Triggers 标签有两条 cron |
+| DO 下拉里没有 `PoolDO` | pool worker 没部署成功 | 先修好第 2 步 |
+| 面板能开但操作「未授权」 | `WB2A_API_KEY` 没设 / 设完没重新部署 | 第 6 步 + Retry |
+| `/status` 里 `pool` 失败 | DO 绑定名不是 `POOL` 或选错 namespace | 第 4 步第 5 项 |
+| `d1_schema` 报 error | D1 绑定没配或选错库 | 第 4 步第 3 项 |
+| 构建报「缺少 3 个资源 ID」 | 变量填到了 Variables and Secrets 而不是 Build | 第 2 步 |
+| Worker 部署报 Pages 相关错误 | Deploy command 用了默认值 | 第 2 步 |
+| 定时任务从不执行 | Triggers 里没有那两条 cron | 第 2 步 |
+| 页面 404 | Build output directory 不是 `dist` | 第 3 步 |
+| 页面一直转圈 | 缺 `nodejs_compat` | 第 5 步 |
 
 ---
 
-## 回退方案：如果 Dashboard 的绑定仍是只读
+## 回退方案
 
-第 5 步依赖 Cloudflare「文件里没声明的字段可以在 Dashboard 编辑」这条行为。
-万一你看到的是禁用状态，说明它把整个文件都当真源了——那就把绑定写回文件：
-
-1. GitHub 仓库页面按 **`.`** 键 → 打开网页版 VS Code（github.dev）
-2. 把 `wrangler.toml` 里注释掉的绑定段取消注释
-3. 全局替换 3 个 ID：`REPLACE_WITH_CONFIG_KV_ID` / `REPLACE_WITH_CACHE_KV_ID` / `REPLACE_WITH_D1_ID`
-4. Commit & Push
-
-或者更省事——把 `pages_build_output_dir = "dist"` 加回 `wrangler.toml` 顶部的同时，
-在 Worker 的 Build command 里保留 `node scripts/fill-ids.mjs`（它会自动填好那 3 个 ID）。
-
----
-
-## 部署后初始化
-
-1. 打开 `https://<项目>.pages.dev/panel`，用 `WB2A_API_KEY` 登录
-2. 导入账号凭证（面板内导入入口）
-3. 配上游地址、模型白名单、各定时任务开关
-4. 配置存在 KV（`wb2api-config`）里，**重新部署不会丢**
+如果 Dashboard 的绑定仍是只读（说明 Cloudflare 把整个文件都当真源了），
+就把绑定写回文件：GitHub 仓库页面按 **`.`** 打开网页版 VS Code，把
+`wrangler.toml` 里注释掉的绑定段取消注释，全局替换 3 个 ID，Commit & Push。
+或者用 `npm run fill:ids` 从环境变量注入（幂等）。

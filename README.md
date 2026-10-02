@@ -17,7 +17,7 @@
 
 ## 1. 架构总览
 
-三个部署单元（均为 Cloudflare 托管，同一仓库）：
+两个部署单元（均为 Cloudflare 托管，同一仓库）：
 
 ```
 ① Pages  workbuddy2api-pages       —— API + 面板静态资源
@@ -29,22 +29,26 @@
           │      └─ 模型缓存/登录态 ──→ KV
           └─ /panel/*（静态） ──→ env.ASSETS.fetch
 
-② Worker workbuddy2api-pool        —— 账号池 Durable Object
-   PoolDO（单实例，顺序单线程 = 天然锁）+ alarm 自调度（兜底）
-
-③ Worker workbuddy2api-scheduler   —— 定时作业（Pages 无 Cron Triggers）
-   cron 整点 → runScheduledJobs（签到/旅行/活跃/保活/夜猫子/成长）
-   cron 每日 → D1 请求日志 → R2 归档
+② Worker workbuddy2api-pool        —— 干两件事：
+   a. 承载 PoolDO（单实例，顺序单线程 = 天然锁）+ alarm 自调度（兜底）
+   b. 定时作业（Pages 无 Cron Triggers）
+      cron 整点 → runScheduledJobs（签到/旅行/活跃/保活/夜猫子/成长）
+      cron 每日 → D1 请求日志 → R2 归档
 ```
+
+> 为什么 ② 只用一个 Worker 而不是拆成「账号池 + 调度器」两个：
+> 一个 Worker 可以同时导出 DO 类与 `scheduled()`，也可以同时声明
+> `[[migrations]]` 与 `[triggers] crons`，没有冲突。合并后少一个部署单元、
+> 少配一遍构建变量，定时作业访问 PoolDO 也从跨 Worker 远程调用变成本地绑定。
 
 | 原 Go 形态 | 落点 |
 |---|---|
 | 全局 `map[uid]*Auth` + 锁 | 单实例 Durable Object `PoolDO`（②）|
 | `auths/*.json` / `state.json` | PoolDO Storage |
-| `usage.json` / `request-logs/*.jsonl` | D1（查询）+ R2（③ 归档）|
+| `usage.json` / `request-logs/*.jsonl` | D1（查询）+ R2（② 归档）|
 | `keys.json` | D1 |
 | `model.json` / `output_probes.json` | KV（TTL 缓存）|
-| `scheduler.Run` 常驻 goroutine | ③ 的 Cron Triggers（DO alarm / 外部 POST 退为兜底）|
+| `scheduler.Run` 常驻 goroutine | ② 的 Cron Triggers（DO alarm / 外部 POST 退为兜底）|
 | Upstash/Redis | 已移除（纯 DO Storage）|
 | `os.Getenv` / `config.json` | Pages Secrets（敏感）+ KV（非敏感）|
 
@@ -73,18 +77,18 @@ workbuddy2api-pages/
 ├── scripts/{import-config,import-auths,copy-frontend}.mjs
 ├── vendor/frontend/           # 原面板 index.html + app.js（零改动）
 ├── dist/                      # 构建输出（_worker.js + panel/）
-├── pool-worker/               # ② 独立 Worker：承载 PoolDO（Pages 不能自带 DO）
-│   ├── wrangler.toml          #   含 [[migrations]] —— Pages 里禁止，这里必需
-│   └── src/index.ts           #   export { PoolDO }（复用主项目 src/durable/）
-├── scheduler-worker/          # ③ 独立 Worker：Cron Triggers（Pages 没有 cron）
-│   ├── wrangler.toml          #   [triggers] crons = 整点作业 + 每日日志归档
-│   └── src/index.ts           #   scheduled() → runScheduledJobs / 日志归档
+├── pool-worker/               # ② 独立 Worker：PoolDO 宿主 + 定时作业
+│   ├── wrangler.toml          #   含 [[migrations]]（Pages 里禁止，这里必需）
+│   │                          #   含 [triggers] crons（Pages 里根本没有）
+│   └── src/index.ts           #   export { PoolDO } + scheduled()
 └── test/                      # Miniflare + Vitest
 ```
 
-> 为什么拆出 ②③：**Pages 项目无法承载 Durable Object**（禁止 `migrations`
+> 为什么必须有 ②：**Pages 项目无法承载 Durable Object**（禁止 `migrations`
 > 但 DO 又必须靠它注册），也**没有 Cron Triggers**。二者都是平台硬约束，
-> 不是设计选择。详见 4.1a / 4.1b。
+> 不是设计选择。而这两件事**可以合在同一个 Worker 里**——一个 Worker 同时
+> 导出 DO 类与 `scheduled()`、同时声明 `[[migrations]]` 与 `[triggers] crons`
+> 完全合法，所以没有拆成两个的必要。详见 4.1a。
 
 ---
 
@@ -128,39 +132,38 @@ wrangler r2 bucket create workbuddy2api-logs
 Dashboard 里的绑定变成只读、只能靠改文件填 ID。留空之后 5 个绑定全在
 Dashboard 的 Settings → Functions 里点（详见 [DEPLOY-WEB.md](./DEPLOY-WEB.md)）。
 
-**两个 Worker 需要填**：`pool-worker/wrangler.toml` 与 `scheduler-worker/wrangler.toml`
-里的占位符用 `npm run fill:ids` 注入，它从环境变量读 ID 替换，幂等，适合接进 CI：
+**Worker 侧需要填**：`pool-worker/wrangler.toml` 里的占位符用 `npm run fill:ids`
+注入，它从环境变量读 ID 替换，幂等，适合接进 CI：
 
 ```bash
 CF_KV_CONFIG_ID=xxx CF_KV_CACHE_ID=yyy CF_D1_ID=zzz npm run fill:ids
 # --lenient 缺哪个跳过哪个；--dry-run 只打印不落盘
 ```
 
-### 4.1a 部署定时作业 Worker（**必须，否则没有定时任务**）
+### 4.1a 部署 Worker ②（**必须，且要先于 Pages**）
 
-Pages 项目**没有 Cron Triggers**，所以 6 个定时作业（签到/旅行/活跃/保活/
-夜猫子/成长）与日志归档必须由独立 Worker 的 cron 触发。Workers 原生支持
-`[triggers] crons`，由平台保证触发，不再依赖外部 cron 服务，也不必手动 arm
-DO alarm（那两条退为兜底）。
+这一个 Worker 干两件事——承载 `PoolDO` + 跑定时作业。两者都是 Pages 做不到的事：
+
+| Pages 的硬约束 | 后果 |
+|---|---|
+| wrangler.toml **不支持** `[[migrations]]`，而 DO 类必须靠它注册 | Pages 无法自带 Durable Object |
+| **没有** Cron Triggers | 定时作业无处安放 |
 
 ```bash
-npm run deploy:scheduler
+npm run deploy:pool     # 构建 + wrangler deploy
 ```
 
-两条 cron（见 `scheduler-worker/wrangler.toml`）：
+两条 cron（见 `pool-worker/wrangler.toml`）：
 
 | cron (UTC) | 作用 |
 |---|---|
 | `0 * * * *` | 每整点：按北京时间判断该跑哪些作业（`runScheduledJobs`） |
 | `30 17 * * *` | 每日 UTC 17:30（北京时间 01:30 低峰）：把 7 天前的请求日志从 D1 归档到 R2 |
 
-> 本 Worker **不需要任何 Secret**（直接调内部函数，不走 HTTP 鉴权）。
-> 但要绑 `WB2A_CONFIG`（读作业开关 + 存归档水位）、`WB2A_DB`、`WB2A_LOGS`。
+> 定时作业直接调内部函数，不走 HTTP 鉴权，所以 cron 本身不需要 Secret；
+> 但 PoolDO 要读配置，所以 `WB2A_API_KEY` 仍要设（见 4.2）。
 
-### 4.1b 部署账号池 Worker（**必须，且要先于 Pages**）
-
-账号池 `PoolDO` 必须独立部署。**Pages 项目无法承载 Durable Object**，这是
-Cloudflare 的硬约束，两条规则互相锁死：
+`PoolDO` 为什么必须独立部署——Cloudflare 的硬约束，两条规则互相锁死：
 
 | 规则 | 来源 |
 |---|---|
@@ -169,12 +172,10 @@ Cloudflare 的硬约束，两条规则互相锁死：
 | Pages 的 DO binding **强制**要求 `script_name` | 云端构建直接报 `should specify a "script_name"` |
 | 官方：*"You cannot create and deploy a Durable Object within a Pages project"* | Pages 文档 |
 
-所以 PoolDO 拆到 `pool-worker/`，Pages 侧用 `script_name = "workbuddy2api-pool"`
+所以 PoolDO 放在 `pool-worker/`，Pages 侧用 `script_name = "workbuddy2api-pool"`
 远程引用。Pages 代码不用改，`env.POOL` 照旧可用。
-
-```bash
-npm run deploy:pool     # 构建 + wrangler deploy（独立 Worker）
-```
+而在 `pool-worker/` 内部，POOL 绑定**不写 `script_name`**——类和绑定同属一个
+script，默认就指向自己。
 
 > ⚠️ Secret 是按 Worker 独立存储的，Pages 项目设的不会带过来。
 > 这个 Worker 要单独设一遍（至少 `WB2A_API_KEY`）：
@@ -255,10 +256,9 @@ WB2A_URL=https://xxx.pages.dev WB2A_API_KEY=xxx npm run smoke
 | 部署单元 | Build command | Deploy command | 绑定怎么配 |
 |---|---|---|---|
 | `workbuddy2api-pool` | `npm install && npm run build:pool && node scripts/fill-ids.mjs` | `npx wrangler deploy --config pool-worker/wrangler.toml` | 构建环境变量注入 |
-| `workbuddy2api-scheduler` | `npm install && npm run build:scheduler && node scripts/fill-ids.mjs` | `npx wrangler deploy --config scheduler-worker/wrangler.toml` | 构建环境变量注入 |
 | `workbuddy2api-pages` | `npm run build` | ——（Pages 无此字段，产物目录 `dist`） | **Dashboard 点 5 个绑定** |
 
-两个 Worker 各配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个构建变量
+Worker 侧配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个构建变量
 （**Settings → Build → Build variables and secrets**，不是运行时那栏）。
 
 Pages 侧一个变量都不用配，只在 **Settings → Functions** 里加 5 个绑定：

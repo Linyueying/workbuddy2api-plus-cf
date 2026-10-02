@@ -204,28 +204,31 @@ if (!existsSync(poolTomlPath)) {
 }
 
 // ---------------------------------------------------------------------------
-// 2c. 定时作业 Worker（Pages 无 Cron Triggers，调度必须放 Workers）
+// 2c. 定时作业（Pages 无 Cron Triggers；已与 PoolDO 合并在同一个 Worker 里）
 // ---------------------------------------------------------------------------
-console.log("\n[2c] 定时作业 Worker（Cron）");
-const schedTomlPath = resolve(root, "scheduler-worker/wrangler.toml");
-if (!existsSync(schedTomlPath)) {
-  warn("缺 scheduler-worker/wrangler.toml —— 定时作业需外部 cron 或 DO alarm 兜底");
+console.log("\n[2c] 定时作业（Cron，与 PoolDO 同一个 Worker）");
+if (!existsSync(poolTomlPath)) {
+  bad("缺 pool-worker/wrangler.toml —— PoolDO 与定时作业都无处部署");
 } else {
-  const st = readFileSync(schedTomlPath, "utf8");
-  const crons = st.match(/crons\s*=\s*\[([^\]]*)\]/)?.[1] ?? "";
-  if (!/crons\s*=/.test(st)) {
-    bad("scheduler-worker 未配置 [triggers] crons —— 不会有任何定时触发");
+  const pt = readFileSync(poolTomlPath, "utf8");
+  const crons = pt.match(/crons\s*=\s*\[([^\]]*)\]/)?.[1] ?? "";
+  if (!/crons\s*=/.test(pt)) {
+    bad("pool-worker 未配置 [triggers] crons —— 不会有任何定时触发");
   } else {
     ok(`crons: ${crons.replace(/\s+/g, " ").trim()}`);
+    console.log("     0 * * * *    整点作业（代码按北京时间判断跑哪些）");
+    console.log("     30 17 * * *  UTC 17:30 = 北京 01:30，归档请求日志");
   }
-  const sName = st.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
-  if (!sName) bad("scheduler-worker/wrangler.toml 未声明 name");
-  else ok(`scheduler worker: ${sName}`);
-  reportPlaceholders("scheduler-worker/wrangler.toml", st, "scheduler-worker/wrangler.toml");
-  if (!existsSync(resolve(root, "scheduler-worker/dist/index.js"))) {
-    warn("scheduler-worker 未构建 → 部署前跑 npm run build:scheduler");
-  } else {
-    ok("scheduler-worker/dist/index.js 已构建");
+  // 合并后这个 Worker 必须同时具备 DO 与定时两套能力
+  if (!/\[\[migrations\]\]/.test(pt)) {
+    bad("pool-worker 缺 [[migrations]]：DO 类不会被注册");
+  }
+  // 定时作业要读 D1 日志、写 R2 归档，这两个绑定缺了归档会静默失败
+  if (!/\[\[d1_databases\]\]/.test(pt)) {
+    warn("pool-worker 未绑 D1 —— 日志归档读不到数据");
+  }
+  if (!/\[\[r2_buckets\]\]/.test(pt)) {
+    warn("pool-worker 未绑 R2 —— 日志归档无处可写");
   }
 }
 
