@@ -182,6 +182,22 @@ describe("余额聚合（对齐 Go UserResourceDetailedWithExpiry）", () => {
     expect(seen).toEqual(["/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"]);
   });
 
+  it("账单域必须带归属头：X-User-Id / X-Domain / X-Enterprise-Id", async () => {
+    // 回归护栏：曾经这里用的是 chat 域的 buildHeaders（只有 X-IDE-*），
+    // 账单域网关拿不到归属头直接 401，而响应是 HTML，代码把它当成空余额吞掉。
+    let h: Headers | null = null;
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      h = (req as Request).headers;
+      return json(envelope([]));
+    }));
+    await primeConfig(fakeEnv());
+    await getCredits(fakeEnv(), auth());
+    expect(h!.get("X-User-Id")).toBe("u_1");
+    expect(h!.get("X-Enterprise-Id")).toBe("e1");
+    expect(h!.get("X-Domain")).toBe("copilot.tencent.com");
+    expect(h!.get("Authorization")).toBe("Bearer AT");
+  });
+
   it("确实没有积分包（Accounts 为空）不是错误：返回 0 聚合且不抛", async () => {
     stubFetch(() => json(envelope([])));
     await primeConfig(fakeEnv());

@@ -2,7 +2,7 @@ import type { Env } from "../../worker-configuration.d.ts";
 import type { Auth } from "../types";
 import {
   basesFor,
-  buildHeaders,
+  billingHeaders,
   checkinMeterPaths,
   getConfigCached,
   withTimeout,
@@ -67,7 +67,8 @@ export async function dailyCheckinRetry(
       const res = await withTimeout(
         new Request(base.billing + p, {
           method: "POST",
-          headers: buildHeaders(auth, env, { Accept: "application/json" }),
+          // 账单域：必须用 billingHeaders（带 X-User-Id/X-Domain 等归属头）
+          headers: billingHeaders(auth, env, { Accept: "application/json" }),
           body: "{}",
         }),
         timeout,

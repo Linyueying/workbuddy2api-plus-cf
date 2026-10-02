@@ -526,10 +526,13 @@ export async function postBillingResource(
   const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
   for (let i = 0; i < paths.length; i++) {
     const p = paths[i];
+    // 必须用 billingHeaders（对齐 Go headers.go BillingHeaders），不能用 buildHeaders：
+    // 账单域网关要 X-User-Id / X-Domain / X-Enterprise-Id / X-Device-Token 这套
+    // 归属头，buildHeaders 是 chat 域那套（X-IDE-*），缺归属头会被网关直接 401。
     const res = await withTimeout(
       new Request(base.billing + p, {
         method: "POST",
-        headers: buildHeaders(auth, env, { Accept: "application/json" }),
+        headers: billingHeaders(auth, env, { Accept: "application/json" }),
         body,
       }),
       timeout,
@@ -648,13 +651,21 @@ export async function dailyCheckin(env: Env, auth: Auth): Promise<{ done: boolea
   const timeout = getConfigCached(env).upstream.timeout_seconds * 1000;
   const paths = checkinMeterPaths(auth.realm);
   for (const p of paths) {
+    // 同 postBillingResource：签到也在账单域，头必须用 billingHeaders
     const res = await withTimeout(
-      new Request(base.billing + p, { method: "POST", headers: buildHeaders(auth, env), body: "{}" }),
+      new Request(base.billing + p, { method: "POST", headers: billingHeaders(auth, env), body: "{}" }),
       timeout,
     );
     if (res.status === 404 && p !== paths[paths.length - 1]) continue;
     const j = (await res.json().catch(() => ({}))) as any;
     const already = isAlreadyCheckin(j);
+    if (!res.ok && !already) {
+      // 401/403 静默成「未签到」会让人以为今天还没签，实际是请求被网关拒了
+      console.error(
+        `[checkin] 上游拒绝 uid=${auth.uid} realm=${auth.realm} path=${p} status=${res.status} ` +
+          `msg=${String(j?.msg ?? "").slice(0, 120)}`,
+      );
+    }
     return { done: res.ok || already, already, message: j?.msg };
   }
   return { done: false, already: false, message: "checkin unreachable" };
