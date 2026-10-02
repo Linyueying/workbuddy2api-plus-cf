@@ -46,6 +46,29 @@ if (placeholders.length === 0) {
   console.log("       npx wrangler d1 create workbuddy2api");
 }
 
+// R2 桶名是字面量不是占位符，上面的占位符扫描抓不到它。桶不存在时 wrangler
+// 会在部署阶段报binding 错误，而 preflight 若不查就会一路绿灯到部署。
+console.log("\n[1b] R2 日志桶");
+const r2Name = toml.match(/\[\[r2_buckets\]\][^[]*?bucket_name\s*=\s*"([^"]+)"/)?.[1];
+if (!r2Name) {
+  warn("wrangler.toml 未声明 r2_buckets（请求日志归档将不可用）");
+} else {
+  try {
+    const listOut = out(execFileSync(
+      "npx", ["wrangler", "r2", "bucket", "list"], { stdio: ["ignore", "pipe", "pipe"], cwd: root },
+    ));
+    if (new RegExp(`\\b${r2Name}\\b`).test(listOut)) {
+      ok(`R2 桶已存在：${r2Name}`);
+    } else {
+      bad(`R2 桶不存在：${r2Name} → npx wrangler r2 bucket create ${r2Name}`);
+    }
+  } catch (e) {
+    // 未登录 wrangler 时无法判定，不阻塞本地检查
+    warn(`无法列举 R2 桶（wrangler 未登录？）：${(out(e.stderr) || out(e.message)).split("\n")[0]}`);
+    console.log(`     生产需确认桶已创建：npx wrangler r2 bucket create ${r2Name}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 2. migrations 文件与代码一致性（静态检查，不连远端）
 // ---------------------------------------------------------------------------
@@ -136,7 +159,7 @@ if (remote) {
       { stdio: ["ignore", "pipe", "pipe"], cwd: root },
     ));
     const remoteTables = [...o.matchAll(/"name":\s*"(\w+)"/g)].map((m) => m[1]);
-    const need = ["apikeys", "request_logs", "usage"];
+    const need = ["apikeys", "request_logs", "usage", "task_queue"];
     const absent = need.filter((t) => !remoteTables.includes(t));
     if (absent.length) {
       bad(`远端缺表：${absent.join(", ")} → 先跑 node scripts/db-init.mjs --remote`);
