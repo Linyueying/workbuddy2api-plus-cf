@@ -1,61 +1,67 @@
+# ============================================================================
+# wrangler.toml —— 仅供本地 wrangler CLI 参考，不是 Pages 的生产配置
+# ============================================================================
+#
+# ⚠️ 这里刻意**不写** pages_build_output_dir，也**不写**任何绑定。
+#
+# 原因：Cloudflare 的规则是——Pages 项目一旦有 wrangler.toml 且被识别为生产
+# 配置，Dashboard 里对应的字段就变成**只读、点不动**，绑定只能靠改文件填 ID
+# （这正是同类项目 K-Vault-Next 在它的 wrangler.toml 里写的：
+#   「KV/R2 → Pages 后台绑定，本文件写不了 Pages 的 binding」）。
+#
+# 所以本项目走「零配置部署」：
+#   构建输出目录、兼容标志、KV / D1 / R2 / Durable Object 绑定
+#   ——全部在 Cloudflare Dashboard 的 Pages 项目设置里配，一个文件都不用改。
+#   详见 DEPLOY-WEB.md。
+#
+# 本文件剩下的作用只有两个：
+#   1. 本地 `npm run dev` 时 wrangler 会读它拿 compatibility_flags
+#   2. 需要跑 D1 迁移等 CLI 命令时作为上下文
+#   本地缺失的绑定一律用命令行参数现场传（见 package.json 的 dev 脚本）。
+# ============================================================================
+
 name = "workbuddy2api-pages"
-pages_build_output_dir = "dist"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
 # ---------------------------------------------------------------------------
-# 敏感信息只放 Secrets（Dashboard 或 `wrangler secret put`），不写进本文件/代码。
-# 非敏感配置走 KV（WB2A_CONFIG）；
+# 以下是「如果哪天你想改成用配置文件管理绑定」时才需要的内容。
+# 取消注释并把 REPLACE_WITH_* 换成真实 ID 即可；也可以不改文件，用：
+#   npm run fill:ids     # 从环境变量注入，见 scripts/fill-ids.mjs
+#
+# 注意：一旦启用这些段，它们就会成为 Pages 的生产配置真源，
+# Dashboard 里对应的绑定会变成只读——那就回退到「改文件」的老路了。
+#
+# [[kv_namespaces]]
+# binding = "WB2A_CONFIG"   # 非敏感配置（config.json 导入后整体）
+# id = "REPLACE_WITH_CONFIG_KV_ID"
+#
+# [[kv_namespaces]]
+# binding = "WB2A_CACHE"    # 模型目录缓存 / model.json / output_probes
+# id = "REPLACE_WITH_CACHE_KV_ID"
+#
+# [[d1_databases]]
+# binding = "WB2A_DB"       # 用量记录、请求日志、子密钥库
+# database_name = "workbuddy2api"
+# database_id = "REPLACE_WITH_D1_ID"
+#
+# [[r2_buckets]]
+# binding = "WB2A_LOGS"     # 请求 JSONL 归档导出
+# bucket_name = "workbuddy2api-logs"
+#
+# [[durable_objects.bindings]]
+# name = "POOL"
+# class_name = "PoolDO"
+# script_name = "workbuddy2api-pool"
 # ---------------------------------------------------------------------------
-# [vars]  # 如需非敏感默认配置可放此处
-
-# 账号凭证 / 账号池状态快照 -> Durable Object PoolDO（见 durable_objects.bindings）
-# 非敏感配置（config.json 导入后整体）-> KV
-[[kv_namespaces]]
-binding = "WB2A_CONFIG"
-id = "REPLACE_WITH_CONFIG_KV_ID"
-
-# 模型目录缓存 / model.json / output_probes
-[[kv_namespaces]]
-binding = "WB2A_CACHE"
-id = "REPLACE_WITH_CACHE_KV_ID"
-
-# 用量记录、请求日志、子密钥库、任务中心队列
-[[d1_databases]]
-binding = "WB2A_DB"
-database_name = "workbuddy2api"
-database_id = "REPLACE_WITH_D1_ID"
-
-# 请求 JSONL 归档导出
-[[r2_buckets]]
-binding = "WB2A_LOGS"
-bucket_name = "workbuddy2api-logs"
-
-# 账号池 Durable Object（单实例顺序单线程，替代原 Go 全局锁）
-#
-# script_name 对 Pages 是**必填**（Workers 里才可选）：Pages 要求显式指出
-# DO 定义在哪个 Worker。而 Pages 项目自身不能承载 DO（原因见下），
-# 所以这里指向独立部署的 pool-worker（见 pool-worker/ 目录）。
-# 缺这个字段构建会直接失败：
-#   "Durable Objects bindings should specify a script_name"
-[[durable_objects.bindings]]
-name = "POOL"
-class_name = "PoolDO"
-script_name = "workbuddy2api-pool"
-
-# 注意：这里**不能**写 [[migrations]]。Pages 的 wrangler.toml 不支持该字段，
-# 写了构建直接报错：
-#   "Configuration file for Pages projects does not support \"migrations\""
-#
-# 但 Durable Object 类又必须靠 migrations 才能注册（实测：删掉该字段后
-# 本地 DO 调用会挂起）。两条约束合起来 = Pages 项目无法自带 DO，
-# 因此 PoolDO 单独部署为 Worker `workbuddy2api-pool`（见 pool-worker/），
-# 这里只做远程引用。Pages 侧代码无需改动，env.POOL 照旧可用。
 
 # ---------------------------------------------------------------------------
-# Pages 不支持 Cron Triggers。
-# 定时任务（签到/旅行/活跃/保活/夜猫子/成长/余额刷新）推荐用外部定时器：
-#   - 外部 cron-job.org / GitHub Action 每整点 POST /panel/api/checkin_all 等，带 api_key；
-#   - 或启用 PoolDO alarm 自调度（见 src/alarms.ts，deploy 后调用一次
-#     `POST /panel/api/scheduler/arm` 启动）。两者复用同一套调度逻辑，互为兜底。
+# Pages 项目有两个硬性限制，决定了另外两个 Worker 必须独立存在：
+#
+# 1. 不能自带 Durable Object。DO 类必须靠 [[migrations]] 注册，而 Pages 的
+#    wrangler.toml 不支持该字段（写了构建直接报错）。所以 PoolDO 单独部署为
+#    Worker `workbuddy2api-pool`（见 pool-worker/），Pages 只做远程引用。
+# 2. 没有 Cron Triggers。定时任务（签到/旅行/活跃/保活/夜猫子/成长/余额）
+#    由独立的 `workbuddy2api-scheduler` Worker 用原生 cron 触发（见
+#    scheduler-worker/），不再依赖外部 cron 服务或 DO alarm 自调度。
 # ---------------------------------------------------------------------------

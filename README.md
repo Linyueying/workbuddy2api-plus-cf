@@ -119,12 +119,13 @@ wrangler d1 create workbuddy2api
 wrangler r2 bucket create workbuddy2api-logs
 ```
 
-把上面返回的 **id** 填进 `wrangler.toml`、`pool-worker/wrangler.toml`、
-`scheduler-worker/wrangler.toml`（后两者只需要 `WB2A_CONFIG` 的 KV id，
-scheduler 另需 D1 id）。
+**Pages 侧不用填任何文件**：根目录 `wrangler.toml` 刻意不声明绑定、也不写
+`pages_build_output_dir`——一旦写了，Cloudflare 就会把它当生产配置真源，
+Dashboard 里的绑定变成只读、只能靠改文件填 ID。留空之后 5 个绑定全在
+Dashboard 的 Settings → Functions 里点（详见 [DEPLOY-WEB.md](./DEPLOY-WEB.md)）。
 
-想省事就用 `npm run fill:ids`：它从环境变量读 ID 并替换三个文件里的占位符，
-幂等，适合接进 CI：
+**两个 Worker 需要填**：`pool-worker/wrangler.toml` 与 `scheduler-worker/wrangler.toml`
+里的占位符用 `npm run fill:ids` 注入，它从环境变量读 ID 替换，幂等，适合接进 CI：
 
 ```bash
 CF_KV_CONFIG_ID=xxx CF_KV_CACHE_ID=yyy CF_D1_ID=zzz npm run fill:ids
@@ -247,20 +248,23 @@ WB2A_URL=https://xxx.pages.dev WB2A_API_KEY=xxx npm run smoke
 不想/不能敲命令，走 👉 [DEPLOY-WEB.md](./DEPLOY-WEB.md)。核心思路是把 4.1 的「填 ID」
 从「改仓库文件」变成「配 Cloudflare 环境变量」：
 
-| 部署单元 | Build command | Deploy command |
-|---|---|---|
-| `workbuddy2api-pool` | `npm install && npm run build:pool && node scripts/fill-ids.mjs` | `npx wrangler deploy --config pool-worker/wrangler.toml` |
-| `workbuddy2api-scheduler` | `npm install && npm run build:scheduler && node scripts/fill-ids.mjs` | `npx wrangler deploy --config scheduler-worker/wrangler.toml` |
-| `workbuddy2api-pages` | `npm install && npm run build && node scripts/fill-ids.mjs` | ——（Pages 无此字段，产物目录 `dist`） |
+| 部署单元 | Build command | Deploy command | 绑定怎么配 |
+|---|---|---|---|
+| `workbuddy2api-pool` | `npm install && npm run build:pool && node scripts/fill-ids.mjs` | `npx wrangler deploy --config pool-worker/wrangler.toml` | 构建环境变量注入 |
+| `workbuddy2api-scheduler` | `npm install && npm run build:scheduler && node scripts/fill-ids.mjs` | `npx wrangler deploy --config scheduler-worker/wrangler.toml` | 构建环境变量注入 |
+| `workbuddy2api-pages` | `npm run build` | ——（Pages 无此字段，产物目录 `dist`） | **Dashboard 点 5 个绑定** |
 
-三处都要配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个变量
-（Workers 在 **Settings → Build → Build variables and secrets**，Pages 在
-**Settings → Environment variables**）。
+两个 Worker 各配 `CF_KV_CONFIG_ID` / `CF_KV_CACHE_ID` / `CF_D1_ID` 三个构建变量
+（**Settings → Build → Build variables and secrets**，不是运行时那栏）。
 
-> ⚠️ Pages 项目的 `wrangler.toml` 是配置唯一真源，只要它在，Dashboard 里的绑定就是
-> 只读、点不动的——所以 ID 没法纯点击填入，只能由构建机写入。
-> 万一 Cloudflare 在 build command 之前就解析了配置，改用 DEPLOY-WEB.md 的方案 C
-> （github.dev 在线改文件）。
+Pages 侧一个变量都不用配，只在 **Settings → Functions** 里加 5 个绑定：
+`WB2A_CONFIG`、`WB2A_CACHE`（KV）、`WB2A_DB`（D1）、`WB2A_LOGS`（R2）、`POOL`（DO）。
+变量名必须一字不差；Production 与 Preview 两套环境各配一遍；改完要 Retry deployment。
+
+> 这套做法参照了同类项目 [K-Vault-Next](https://github.com/Linyueying/K-Vault-Next)：
+> 它同样是 Pages 项目，KV/R2 全在 Dashboard 绑，仓库里的 `wrangler.toml` 只作 CLI 参考。
+> 关键就是**不写 `pages_build_output_dir`**——写了这一行，Cloudflare 就把该文件当
+> 生产配置真源，Dashboard 里的字段随之变成只读。
 
 ### 4.6 导入原有配置与账号
 

@@ -8,7 +8,7 @@
     "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022 --define:process.env.NODE_ENV='\"production\"' && npm run copy-frontend",
     "build:worker": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022",
     "copy-frontend": "node scripts/copy-frontend.mjs",
-    "dev": "npm run build && wrangler pages dev dist --binding WB2A_API_KEY=dev-admin-key --do POOL=PoolDO@workbuddy2api-pool",
+    "dev": "npm run build && wrangler pages dev dist --binding WB2A_API_KEY=dev-admin-key --kv WB2A_CONFIG --kv WB2A_CACHE --d1 WB2A_DB --r2 WB2A_LOGS --do POOL=PoolDO@workbuddy2api-pool",
     "build:pool": "esbuild pool-worker/src/index.ts --bundle --format=esm --outfile=pool-worker/dist/index.js --platform=browser --target=es2022",
     "deploy:pool": "npm run build:pool && wrangler deploy --config pool-worker/wrangler.toml",
     "dev:pool": "wrangler dev --config pool-worker/wrangler.toml --port 8787",

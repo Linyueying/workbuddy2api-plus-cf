@@ -33,7 +33,33 @@ const out = (v) => (Buffer.isBuffer(v) ? v.toString("utf8") : String(v ?? ""));
 // ---------------------------------------------------------------------------
 // 1. wrangler.toml 占位符
 // ---------------------------------------------------------------------------
-console.log("\n[1] wrangler.toml 绑定配置");
+console.log("\n[1] Pages 绑定配置方式");
+
+// 两种互斥的绑定方式：
+//   A. Dashboard 零配置：wrangler.toml 不声明 pages_build_output_dir / 绑定，
+//      全部在 Cloudflare Dashboard 点。Pages 的 wrangler.toml 一旦被识别为
+//      生产配置，Dashboard 对应字段就变只读——所以这里刻意留空。
+//   B. 文件声明：wrangler.toml 里写明绑定 ID（可由 fill-ids 从环境变量注入）。
+const PAGES_DASHBOARD_BINDINGS = [
+  ["KV namespace bindings", "WB2A_CONFIG", "非敏感配置"],
+  ["KV namespace bindings", "WB2A_CACHE", "模型目录缓存"],
+  ["D1 database bindings", "WB2A_DB", "用量 / 请求日志 / 子密钥"],
+  ["R2 bucket bindings", "WB2A_LOGS", "请求 JSONL 归档"],
+  ["Durable Object bindings", "POOL", "PoolDO（指向 workbuddy2api-pool）"],
+];
+const toml = readFileSync(resolve(root, "wrangler.toml"), "utf8");
+const declaresBindings = /^\s*\[\[(kv_namespaces|d1_databases|r2_buckets|durable_objects\.bindings)\]\]/m.test(toml);
+
+if (!declaresBindings) {
+  ok("Pages 走 Dashboard 零配置绑定（wrangler.toml 不声明绑定）");
+  console.log("     Dashboard → Pages 项目 → Settings → Functions 需配：");
+  for (const [kind, name, desc] of PAGES_DASHBOARD_BINDINGS) {
+    console.log(`       ${kind} → ${name.padEnd(12)} (${desc})`);
+  }
+  console.log("     Production 与 Preview 两套环境各配一遍，详见 DEPLOY-WEB.md");
+} else {
+  warn("wrangler.toml 声明了绑定 → 这些字段在 Dashboard 会变成只读，改绑定需改文件");
+}
 
 // 纯网页部署通道：scripts/fill-ids.mjs 由构建机调用（Cloudflare Builds 的
 // Build command 或 CI），用环境变量里的真实 ID 替换占位符。所以仓库里保留
@@ -41,7 +67,9 @@ console.log("\n[1] wrangler.toml 绑定配置");
 const hasFillIds = existsSync(resolve(root, "scripts/fill-ids.mjs"));
 
 function reportPlaceholders(label, text, file) {
-  const ph = [...new Set([...text.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]))];
+  // 只看未注释的行：wrangler.toml 的注释里会举例写 REPLACE_WITH_*，不能算数
+  const active = text.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
+  const ph = [...new Set([...active.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]))];
   if (!ph.length) return true;
   if (hasFillIds) {
     warn(`${label} 有占位符 ${ph.join(", ")} —— 由构建机的 fill-ids 注入，无需改文件`);
@@ -58,14 +86,13 @@ function reportPlaceholders(label, text, file) {
   return false;
 }
 
-const toml = readFileSync(resolve(root, "wrangler.toml"), "utf8");
 if (reportPlaceholders("wrangler.toml", toml, "wrangler.toml")) {
-  ok("绑定配置就绪");
+  ok("Pages 的 wrangler.toml 无待填占位符");
 }
 if (hasFillIds) {
-  ok("检测到 scripts/fill-ids.mjs → 纯网页部署通道可用");
-  console.log("     Build command 末尾加 && node scripts/fill-ids.mjs");
-  console.log("     需配环境变量 CF_KV_CONFIG_ID / CF_KV_CACHE_ID / CF_D1_ID，见 DEPLOY-WEB.md");
+  ok("scripts/fill-ids.mjs 可用（pool / scheduler 两个 Worker 走这条路）");
+  console.log("     Worker 的 Build command 末尾加 && node scripts/fill-ids.mjs");
+  console.log("     并配环境变量 CF_KV_CONFIG_ID / CF_KV_CACHE_ID / CF_D1_ID");
 }
 
 // R2 桶名是字面量不是占位符，上面的占位符扫描抓不到它。桶不存在时 wrangler
@@ -73,7 +100,7 @@ if (hasFillIds) {
 console.log("\n[1b] R2 日志桶");
 const r2Name = toml.match(/\[\[r2_buckets\]\][^[]*?bucket_name\s*=\s*"([^"]+)"/)?.[1];
 if (!r2Name) {
-  warn("wrangler.toml 未声明 r2_buckets（请求日志归档将不可用）");
+  ok("R2 绑定走 Dashboard（桶名固定 workbuddy2api-logs，需在 Dashboard 创建）");
 } else {
   try {
     const listOut = out(execFileSync(
@@ -146,12 +173,18 @@ if (!existsSync(poolTomlPath)) {
   const poolToml = readFileSync(poolTomlPath, "utf8");
   const poolName = poolToml.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
   const hasMigrations = /\[\[migrations\]\]/.test(poolToml);
-  // Pages 侧 script_name 必须指向这个 Worker 的名字，否则运行时找不到 DO
-  const scriptName = toml.match(/script_name\s*=\s*"([^"]+)"/)?.[1] ?? "";
+  // Pages 侧 script_name 必须指向这个 Worker 的名字，否则运行时找不到 DO。
+  // 走 Dashboard 绑定时 wrangler.toml 里没有这一行（只有注释），改由下拉选择
+  // pool worker 注册出来的 namespace，所以这里只在显式声明时才做一致性校验。
+  const activePages = toml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
+  const scriptName = activePages.match(/script_name\s*=\s*"([^"]+)"/)?.[1] ?? "";
   if (!hasMigrations) {
     bad("pool-worker/wrangler.toml 缺 [[migrations]]：DO 类不会被注册");
   } else if (!poolName) {
     bad("pool-worker/wrangler.toml 未声明 name");
+  } else if (!scriptName) {
+    ok(`PoolDO 由 ${poolName} 注册；Pages 的 DO 绑定在 Dashboard 选这个 namespace`);
+    console.log(`     注意：必须先部署 ${poolName}，Dashboard 的下拉里才会出现 PoolDO`);
   } else if (scriptName !== poolName) {
     bad(
       `Pages 的 script_name="${scriptName}" 与 pool worker 的 name="${poolName}" 不一致` +
