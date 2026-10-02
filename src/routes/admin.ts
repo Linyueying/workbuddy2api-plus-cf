@@ -47,10 +47,12 @@ async function creditsOrReason(
   } catch (e: any) {
     // diag 里带 token 长度前缀/UA/hasDeviceToken/响应头，面板直接可见，
     // 用户手机上开不了实时日志流也能一次定位（token 不落明文）。
+    // hint 带根因说明（如「缺 X-Device-Token」），优先展示。
     const why =
+      String(e?.hint ?? "") ||
       String(e?.message ?? e) +
-      (e?.detail ? ` | ${String(e.detail).slice(0, 160)}` : "") +
-      (e?.diag ? ` | ${e.diag}` : "");
+        (e?.detail ? ` | ${String(e.detail).slice(0, 160)}` : "") +
+        (e?.diag ? ` | ${e.diag}` : "");
     console.error(`[admin] 余额查询失败 uid=${a?.uid ?? ""} realm=${a?.realm ?? ""} ${why}`);
     return { cr: null, why };
   }

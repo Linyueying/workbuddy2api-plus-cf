@@ -561,6 +561,16 @@ export async function postBillingResource(
     const err: any = new Error(`http ${res.status}`);
     err.status = res.status;
     err.detail = detail;
+    // 401 且未带设备令牌：几乎可以肯定是上游网关（EdgeOne/openresty）要求
+    // X-Device-Token 风控头。它在 Cloudflare 上无法生成（来自桌面端 TuringShield
+    // 原生 SDK），给调用方一句能落地的提示，而不是一句无解的 401。
+    const hadDT = Boolean(auth.device_token || getConfigCached(env).upstream.device_token);
+    if (res.status === 401 && !hadDT) {
+      err.hint =
+        "上游网关要求设备风控令牌 X-Device-Token（由本机 WorkBuddy 桌面端的 TuringShield " +
+        "原生 SDK 现场生成，Cloudflare 无法自动产生）。请在 Pages 的 WB2A_DEVICE_TOKEN " +
+        "Secret 填入从桌面端取得的设备令牌；或仅将该服务用于对话代理（余额/签到因风控不可用）。";
+    }
     // 响应头也要打：网关（APISIX）常在 WWW-Authenticate / X-* 里说明拒绝原因，
     // 光看 HTML 正文什么也看不出来。token 只打长度与前缀，不落明文。
     const rh: string[] = [];
