@@ -4,6 +4,10 @@
 
 > 本重构是**云原生重写**而非逐行翻译：原 Go 的「进程内存状态 + 本地文件 + 常驻 goroutine 调度器」整体外移到 **Durable Objects / D1 / KV / R2**。前端（相对路径 + Bearer 鉴权）**零改动**部署。
 
+> **没有本地电脑？** 看 👉 [DEPLOY-WEB.md](./DEPLOY-WEB.md)：全程只用 Cloudflare Dashboard + GitHub 网页版，
+> 不用装 Node/wrangler、不用改任何文件（资源 ID 由 GitHub Actions 从 Secrets 注入）。
+> 本文第 4 节是命令行版部署步骤，两种方案**选一种即可**。
+
 ---
 
 ## 1. 架构总览

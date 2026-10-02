@@ -34,16 +34,37 @@ const out = (v) => (Buffer.isBuffer(v) ? v.toString("utf8") : String(v ?? ""));
 // 1. wrangler.toml 占位符
 // ---------------------------------------------------------------------------
 console.log("\n[1] wrangler.toml 绑定配置");
+
+// 纯网页部署通道：.github/workflows/deploy.yml 会在 CI 里用 GitHub Secrets
+// 替换占位符，所以仓库里保留 REPLACE_WITH_* 是**预期状态**，不该报错。
+// 只有走本地 CLI / Cloudflare 原生 Git 集成时才需要真实写进文件。
+const hasActionsDeploy = existsSync(resolve(root, ".github/workflows/deploy.yml"));
+
+function reportPlaceholders(label, text, file) {
+  const ph = [...new Set([...text.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]))];
+  if (!ph.length) return true;
+  if (hasActionsDeploy) {
+    warn(`${label} 有占位符 ${ph.join(", ")} —— 由 GitHub Actions 用 Secrets 注入，无需改文件`);
+    return true;
+  }
+  bad(`${label} 仍有占位符：${ph.join(", ")}`);
+  if (file === "wrangler.toml") {
+    console.log("     创建真实资源后填入 wrangler.toml：");
+    console.log("       npx wrangler kv namespace create WB2A_CONFIG");
+    console.log("       npx wrangler kv namespace create WB2A_CACHE");
+    console.log("       npx wrangler d1 create workbuddy2api");
+    console.log("     或改走纯网页通道，见 DEPLOY-WEB.md 方案 A");
+  }
+  return false;
+}
+
 const toml = readFileSync(resolve(root, "wrangler.toml"), "utf8");
-const placeholders = [...toml.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]);
-if (placeholders.length === 0) {
-  ok("无占位符（全部已替换为真实 ID）");
-} else {
-  bad(`仍有 ${placeholders.length} 处占位符：${[...new Set(placeholders)].join(", ")}`);
-  console.log("     创建真实资源后填入 wrangler.toml：");
-  console.log("       npx wrangler kv namespace create WB2A_CONFIG");
-  console.log("       npx wrangler kv namespace create WB2A_CACHE");
-  console.log("       npx wrangler d1 create workbuddy2api");
+if (reportPlaceholders("wrangler.toml", toml, "wrangler.toml")) {
+  ok("绑定配置就绪");
+}
+if (hasActionsDeploy) {
+  ok("检测到 .github/workflows/deploy.yml → 纯网页部署通道可用");
+  console.log("     需要填的 Secrets 见 DEPLOY-WEB.md 第 4 步");
 }
 
 // R2 桶名是字面量不是占位符，上面的占位符扫描抓不到它。桶不存在时 wrangler
@@ -145,10 +166,7 @@ if (!existsSync(poolTomlPath)) {
   } else {
     ok("pool-worker/dist/index.js 已构建");
   }
-  const poolPlaceholders = [...poolToml.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]);
-  if (poolPlaceholders.length) {
-    bad(`pool-worker/wrangler.toml 仍有占位符：${[...new Set(poolPlaceholders)].join(", ")}`);
-  }
+  reportPlaceholders("pool-worker/wrangler.toml", poolToml, "pool-worker/wrangler.toml");
 }
 
 // ---------------------------------------------------------------------------
@@ -169,10 +187,7 @@ if (!existsSync(schedTomlPath)) {
   const sName = st.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
   if (!sName) bad("scheduler-worker/wrangler.toml 未声明 name");
   else ok(`scheduler worker: ${sName}`);
-  const sPh = [...st.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]);
-  if (sPh.length) {
-    bad(`scheduler-worker/wrangler.toml 仍有占位符：${[...new Set(sPh)].join(", ")}`);
-  }
+  reportPlaceholders("scheduler-worker/wrangler.toml", st, "scheduler-worker/wrangler.toml");
   if (!existsSync(resolve(root, "scheduler-worker/dist/index.js"))) {
     warn("scheduler-worker 未构建 → 部署前跑 npm run build:scheduler");
   } else {

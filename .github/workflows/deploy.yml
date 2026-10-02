@@ -1,0 +1,121 @@
+# =============================================================================
+# 纯网页部署通道（推荐给「没有本地电脑」的场景）
+# -----------------------------------------------------------------------------
+# 原理：三个 wrangler.toml 里的资源 ID 都是 REPLACE_WITH_* 占位符。
+#       本 workflow 在 CI 里用 GitHub Secrets 的值把它们替换掉再部署，
+#       所以你**不需要编辑任何文件**、也不需要装 Node / wrangler。
+#
+# 你需要做的只有一件事：在 GitHub 网页版添加下面这些 Secrets
+#   Settings > Secrets and variables > Actions > New repository secret
+#
+#   必填：
+#     CLOUDFLARE_API_TOKEN   Cloudflare API Token（Workers/Pages/D1 写权限）
+#     CLOUDFLARE_ACCOUNT_ID  Cloudflare 账号 ID（Dashboard 右下角可复制）
+#     CF_KV_CONFIG_ID        KV 命名空间 wb2api-config 的 ID
+#     CF_KV_CACHE_ID         KV 命名空间 wb2api-cache 的 ID
+#     CF_D1_ID               D1 数据库 workbuddy2api 的 ID
+#   可选：
+#     CF_R2_BUCKET           R2 桶名，留空则用默认的 workbuddy2api-logs
+#     CF_PAGES_PROJECT       Pages 项目名，留空则用 workbuddy2api-pages
+#
+# ⚠️ 二选一：本 workflow 与 Cloudflare 的 Git 集成（Pages / Workers Builds）
+#    做的是同一件事。如果你已经在 Cloudflare 那边连了仓库做 Git 集成，
+#    请把本文件删掉（或把 on.push 注释掉、只留 workflow_dispatch），
+#    否则每次 push 会部署两遍。
+# =============================================================================
+
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_SEND_METRICS: "false"
+      CI: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 必填 Secret 自检
+        run: |
+          missing=0
+          for k in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_KV_CONFIG_ID CF_KV_CACHE_ID CF_D1_ID; do
+            v="$(printenv "$k" || true)"
+            if [ -z "$v" ]; then echo "::error::缺少 Secret: $k"; missing=1; fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "请在 GitHub 仓库 Settings > Secrets and variables > Actions 里补齐，详见 DEPLOY-WEB.md"
+            exit 1
+          fi
+          echo "Secrets 齐全"
+        env:
+          CF_KV_CONFIG_ID: ${{ secrets.CF_KV_CONFIG_ID }}
+          CF_KV_CACHE_ID: ${{ secrets.CF_KV_CACHE_ID }}
+          CF_D1_ID: ${{ secrets.CF_D1_ID }}
+
+      - name: 把真实资源 ID 填进三个 wrangler.toml
+        run: |
+          set -euo pipefail
+          for f in wrangler.toml pool-worker/wrangler.toml scheduler-worker/wrangler.toml; do
+            [ -f "$f" ] || { echo "缺少 $f"; exit 1; }
+            sed -i \
+              -e "s|REPLACE_WITH_CONFIG_KV_ID|$CF_KV_CONFIG_ID|g" \
+              -e "s|REPLACE_WITH_CACHE_KV_ID|$CF_KV_CACHE_ID|g" \
+              -e "s|REPLACE_WITH_D1_ID|$CF_D1_ID|g" \
+              "$f"
+            if [ -n "${CF_R2_BUCKET:-}" ]; then
+              sed -i "s|workbuddy2api-logs|$CF_R2_BUCKET|g" "$f"
+            fi
+          done
+          echo "已替换占位符，抽查："
+          grep -n 'binding = "WB2A_DB"' -A2 wrangler.toml || true
+        env:
+          CF_KV_CONFIG_ID: ${{ secrets.CF_KV_CONFIG_ID }}
+          CF_KV_CACHE_ID: ${{ secrets.CF_KV_CACHE_ID }}
+          CF_D1_ID: ${{ secrets.CF_D1_ID }}
+          CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
+
+      # 顺序很重要：pool worker 是 Durable Object 的宿主，
+      # Pages 和 scheduler 都通过 script_name 引用它，必须先存在。
+      - name: 1/3 部署账号池 Worker（PoolDO 宿主）
+        run: npx wrangler deploy --config pool-worker/wrangler.toml
+
+      - name: 2/3 部署定时作业 Worker（Cron Triggers）
+        run: npx wrangler deploy --config scheduler-worker/wrangler.toml
+
+      - name: 构建 Pages 产物
+        run: npm run build
+
+      - name: 3/3 部署 Pages（前端 + API）
+        run: |
+          PROJECT="${CF_PAGES_PROJECT:-workbuddy2api-pages}"
+          # 项目不存在时先创建；已存在会报错，忽略即可。
+          npx wrangler pages project create "$PROJECT" --production-branch main || true
+          npx wrangler pages deploy dist --project-name "$PROJECT" --branch main
+        env:
+          CF_PAGES_PROJECT: ${{ secrets.CF_PAGES_PROJECT }}
+
+      - name: 部署结果
+        run: |
+          echo "三个部署单元已完成。"
+          echo "接下来请在 Cloudflare Dashboard 网页设置 WB2A_API_KEY（见 DEPLOY-WEB.md 第 5 步），"
+          echo "然后访问 Pages 域名打开面板完成初始化。"
