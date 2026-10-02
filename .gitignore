@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+*.log
+.DS_Store
+
+# 账号凭证绝不入库（改用 scripts/import-auths.mjs 导入）
+auths/
+auths-*.json
+config.json

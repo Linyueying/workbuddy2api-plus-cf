@@ -1,0 +1,194 @@
+// 出站请求体内容脱敏：剥离上游内容审核黑名单指纹
+// （替代 internal/upstream/sanitize.go）。
+//
+// 背景：客户端（Claude Code 类 CLI）在 system prompt 注入若干固定模板句，
+// 上游内容审核按**逐字精确匹配**拦截（非语义审核），一字改动即可绕过。
+// 策略：键值/header 型指纹整段剥离；承载语义的模板句最小改写（换一词），语义不变。
+
+/**
+ * sanitizeFeatures 特征预检：任一命中才进入净化（indexOf 快速路径，
+ * 普通请求全不中 → 原样返回，零分配）。
+ */
+const SANITIZE_FEATURES = [
+  "x-anthropic-billing-header", // header 键值段键名
+  "cc_entrypoint=", // 尾随裸键值（截断前缀即可命中）
+  "You are Claude Code", // 身份句（截断前缀即可命中）
+  "Main branch (", // 注入指令句（截断前缀即可命中）
+  "You are a coding agent running in the Codex CLI", // Codex instructions 首段
+  "github.com/anthropics/", // 反馈句里的 Anthropic 仓库链接
+  "11128", // 上游反探测：裸数字错误码
+];
+
+/**
+ * sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
+ * 注意 Go 用 `[^;\n]*`，JS 无同等字符类语义差异（`[^;\n]` 等价），直接沿用。
+ */
+const SANITIZE_HDR_RE = /x-anthropic-billing-header:[^;\n]*;?\s*/gi;
+
+/**
+ * sanitizeBareHdrRe 兜底层：裸键名（无冒号无值）同样是指纹——2026-09-13 实验 F4
+ * 证实 assistant 消息里反引号引用裸键名即触发 11128，而剥离层要求冒号、对裸串无效。
+ * 键值形态被整段删除后，残留的裸键名做最小缩写（header→hdr）：破坏逐字匹配、
+ * 语义不变、保留可读性。大小写不敏感，覆盖 X-Anthropic-... 变体。
+ *
+ * 注意该正则不要求冒号，是 SANITIZE_HDR_RE 的超集——hasFingerprint 与
+ * sanitizeText 中两者并用：先删键值形态，再缩写残留裸键名，替换语义不同
+ * （整段删除 vs 最小缩写），不可合并为一个正则。
+ */
+const SANITIZE_BARE_HDR_RE = /x-anthropic-billing-header/gi;
+
+/** sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）全局清理。 */
+const SANITIZE_KV_RE = /\bcc_[a-z0-9_]+=[^;\n]*;?\s*/gi;
+
+/**
+ * sanitizeRewrites 改写层：全模板句逐字替换（每句只改一个词，语义不变）。
+ *
+ * 身份句的匹配串**不带结尾标点**（只到 "…for Claude" 为止）：CLI 版这句以句号
+ * 收尾，桌面版（claude-desktop-3p / Agent SDK）以逗号接后继内容。带句号的整句
+ * 只匹配前者，桌面版会漏网、指纹原样发上游 → 400 code=11128。去掉结尾标点后两种
+ * 形态一并覆盖（替换串同样不带标点，让原有标点原样保留）。
+ */
+const SANITIZE_REWRITES: [string, string][] = [
+  [
+    "You are Claude Code, Anthropic's official CLI for Claude",
+    "You are Claude Code, Anthropic's official CLI tool for Claude",
+  ],
+  [
+    "Main branch (you will usually use this for PRs)",
+    "Default branch (you will usually use this for PRs)",
+  ],
+  [
+    "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+    "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+  ],
+  [
+    // 反馈句：整句带 Anthropic 仓库链接，上游按整句拦截（只留链接或只留半边均不拦，
+    // 实测需整句同时出现）。give→provide 一词之差即可绕过，语义不变。
+    "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+    "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+  ],
+  [
+    // 上游反探测：只要请求体里出现裸数字 11128 就整单拦截（与上下文无关——
+    // "code=11128" / 裸 "11128" / "错误码 11128" / "Code=11128" 全部命中；相邻的
+    // 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码。
+    // 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是
+    // 拦截条件，不改写必然失败。插入连字符保留可读性与指代。
+    "11128",
+    "11-128",
+  ],
+];
+
+/**
+ * hasFingerprint 特征预检：先走 indexOf 快速路径（零分配）；header 键名有大小写
+ * 变体（X-Anthropic-...）且可能以裸键名形态出现（无冒号），indexOf 大小写敏感、
+ * SANITIZE_HDR_RE 要求冒号——两者都会漏掉「混合大小写 + 裸键名」，必须再用不要求
+ * 冒号的 (?i) 正则兜底，否则整条净化被跳过。
+ */
+export function hasFingerprint(text: string): boolean {
+  for (const f of SANITIZE_FEATURES) {
+    if (text.includes(f)) return true;
+  }
+  SANITIZE_BARE_HDR_RE.lastIndex = 0;
+  return SANITIZE_BARE_HDR_RE.test(text);
+}
+
+/** sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。 */
+export function sanitizeText(text: string): string {
+  if (!text || !hasFingerprint(text)) return text;
+  let out = text;
+  for (const [from, to] of SANITIZE_REWRITES) out = out.split(from).join(to);
+  SANITIZE_HDR_RE.lastIndex = 0;
+  out = out.replace(SANITIZE_HDR_RE, "");
+  if (out.includes("cc_")) {
+    // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）——需循环到不动点：
+    // 一次 replace 可能只清掉前半段（`;` 分隔的多段）。
+    for (let prev = ""; prev !== out; ) {
+      prev = out;
+      SANITIZE_KV_RE.lastIndex = 0;
+      out = out.replace(SANITIZE_KV_RE, "");
+    }
+  }
+  // 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
+  SANITIZE_BARE_HDR_RE.lastIndex = 0;
+  out = out.replace(SANITIZE_BARE_HDR_RE, "x-anthropic-billing-hdr");
+  return out.trim();
+}
+
+/**
+ * sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
+ * 返回净化后的值及是否发生变化。
+ */
+export function sanitizeContent(v: any): [any, boolean] {
+  if (typeof v === "string") {
+    const s = sanitizeText(v);
+    return [s, s !== v];
+  }
+  if (Array.isArray(v)) {
+    let changed = false;
+    for (const p of v) {
+      if (!p || typeof p !== "object") continue;
+      const text = (p as any).text;
+      if (typeof text !== "string") continue;
+      const s = sanitizeText(text);
+      if (s !== text) {
+        (p as any).text = s;
+        changed = true;
+      }
+    }
+    return [v, changed];
+  }
+  return [v, false];
+}
+
+/**
+ * sanitizeToolCalls 净化 assistant.tool_calls[].function.arguments。
+ *
+ * arguments 是**字符串化的 JSON**（不是对象），因此按文本走 sanitizeText 即可。
+ * 这块长期是盲区：工具调用消息的 content 通常为 null，若在 content 缺失时
+ * 整条消息 continue，tool_calls 就会连同历史里写进工具参数的被拦字符串
+ * （文件名、命令、写入内容）原样漏出。
+ */
+export function sanitizeToolCalls(v: any): boolean {
+  if (!Array.isArray(v)) return false;
+  let changed = false;
+  for (const c of v) {
+    if (!c || typeof c !== "object") continue;
+    const fn = (c as any).function;
+    if (!fn || typeof fn !== "object") continue;
+    const args = (fn as any).arguments;
+    if (typeof args !== "string") continue;
+    const s = sanitizeText(args);
+    if (s !== args) {
+      (fn as any).arguments = s;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** sanitizeMessages 净化 messages 中的 content / reasoning_content / tool_calls。 */
+export function sanitizeMessages(messages: any[]): boolean {
+  let changed = false;
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    // content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
+    // 在此 continue 会导致这类消息的 tool_calls 完全不被净化。
+    if ("content" in m) {
+      const [nc, ch] = sanitizeContent(m.content);
+      if (ch) {
+        m.content = nc;
+        changed = true;
+      }
+    }
+    // reasoning_content（思维链回填字段）实测同样携带指纹，与 content 同等净化。
+    if (typeof m.reasoning_content === "string") {
+      const s = sanitizeText(m.reasoning_content);
+      if (s !== m.reasoning_content) {
+        m.reasoning_content = s;
+        changed = true;
+      }
+    }
+    if ("tool_calls" in m && sanitizeToolCalls(m.tool_calls)) changed = true;
+  }
+  return changed;
+}

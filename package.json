@@ -1,0 +1,36 @@
+{
+  "name": "workbuddy2api-pages",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "workbuddy2api 网关：Go 后端云原生重写为 Cloudflare Pages (Pages Functions + Durable Objects)。前端静态资源与后端 API 全部由 Pages 托管。",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022 --define:process.env.NODE_ENV='\"production\"' && npm run copy-frontend",
+    "build:worker": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022",
+    "copy-frontend": "node scripts/copy-frontend.mjs",
+    "dev": "npm run build && wrangler pages dev dist --binding WB2A_API_KEY=dev-admin-key",
+    "deploy": "npm run build && wrangler pages deploy dist",
+    "db:init": "node scripts/db-init.mjs",
+    "db:init:remote": "node scripts/db-init.mjs --remote",
+    "preflight": "node scripts/preflight.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "import:config": "node scripts/import-config.mjs",
+    "import:auths": "node scripts/import-auths.mjs",
+    "cli": "node scripts/wb2api.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241101.0",
+    "esbuild": "^0.24.2",
+    "miniflare": "^3.20241101.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^3.90.0",
+    "zod": "^3.23.8"
+  }
+}

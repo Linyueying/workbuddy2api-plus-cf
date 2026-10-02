@@ -1,0 +1,50 @@
+name = "workbuddy2api-pages"
+pages_build_output_dir = "dist"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# 敏感信息只放 Secrets（Dashboard 或 `wrangler secret put`），不写进本文件/代码。
+# 非敏感配置走 KV（WB2A_CONFIG）；
+# ---------------------------------------------------------------------------
+# [vars]  # 如需非敏感默认配置可放此处
+
+# 账号凭证 / 账号池状态快照 -> Durable Object PoolDO（见 durable_objects.bindings）
+# 非敏感配置（config.json 导入后整体）-> KV
+[[kv_namespaces]]
+binding = "WB2A_CONFIG"
+id = "REPLACE_WITH_CONFIG_KV_ID"
+
+# 模型目录缓存 / model.json / output_probes
+[[kv_namespaces]]
+binding = "WB2A_CACHE"
+id = "REPLACE_WITH_CACHE_KV_ID"
+
+# 用量记录、请求日志、子密钥库、任务中心队列
+[[d1_databases]]
+binding = "WB2A_DB"
+database_name = "workbuddy2api"
+database_id = "REPLACE_WITH_D1_ID"
+
+# 请求 JSONL 归档导出
+[[r2_buckets]]
+binding = "WB2A_LOGS"
+bucket_name = "workbuddy2api-logs"
+
+# 账号池 Durable Object（单实例顺序单线程，替代原 Go 全局锁）
+[[durable_objects.bindings]]
+name = "POOL"
+class_name = "PoolDO"
+
+# Pages 在 Pages 项目中启用 DO 需要 migrations 声明
+[[migrations]]
+tag = "v1"
+new_classes = ["PoolDO"]
+
+# ---------------------------------------------------------------------------
+# Pages 不支持 Cron Triggers。
+# 定时任务（签到/旅行/活跃/保活/夜猫子/成长/余额刷新）推荐用外部定时器：
+#   - 外部 cron-job.org / GitHub Action 每整点 POST /panel/api/checkin_all 等，带 api_key；
+#   - 或启用 PoolDO alarm 自调度（见 src/alarms.ts，deploy 后调用一次
+#     `POST /panel/api/scheduler/arm` 启动）。两者复用同一套调度逻辑，互为兜底。
+# ---------------------------------------------------------------------------

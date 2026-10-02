@@ -1,0 +1,209 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { proxyChat, openAIError, clientIP } from "../src/services/proxy";
+import { DEFAULT_CONFIG } from "../src/config";
+import type { Auth } from "../src/types";
+
+function makeAuth(uid: string): Auth {
+  return {
+    accessToken: "at",
+    refreshToken: "rt",
+    expiresAt: Date.now() + 3600_000,
+    domain: "copilot.tencent.com",
+    realm: "cn",
+    uid,
+    enterpriseId: "e",
+    nickname: "n",
+  };
+}
+
+function fakeEnv(auth: Auth) {
+  const poolStub = {
+    async fetch(req: Request) {
+      const url = new URL(req.url);
+      const p = url.pathname;
+      if (p === "/internal/pick") return new Response(JSON.stringify({ uid: auth.uid, auth }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  };
+  // 可读写的内存 KV：降级门（prompt:degraded_until）要能落盘并读回。
+  const kvMap = new Map<string, string>();
+  const fakeKV = {
+    m: kvMap,
+    get: async (k: string) => kvMap.get(k) ?? null,
+    put: async (k: string, v: string) => void kvMap.set(k, v),
+    delete: async (k: string) => void kvMap.delete(k),
+  };
+  const fakeDB = { prepare: () => ({ bind: () => ({ run: async () => ({}) }) }) };
+  return {
+    POOL: { get: () => poolStub, idFromName: () => ({}) },
+    WB2A_CONFIG: fakeKV,
+    WB2A_CACHE: fakeKV,
+    WB2A_DB: fakeDB,
+    WB2A_LOGS: {},
+  } as any;
+}
+
+function mockUpstream(status: number, body: string) {
+  return vi.fn(async (_req: Request) => new Response(body, { status, headers: { "content-type": "text/event-stream" } }));
+}
+
+describe("proxy helpers", () => {
+  it("openAIError 形态一致", () => {
+    const r = openAIError(429, "rate_limit_exceeded", "slow down", "hint");
+    expect(r.status).toBe(429);
+  });
+  it("clientIP 尊重 cf-connecting-ip", () => {
+    const req = new Request("https://x/v1/chat/completions", { headers: { "cf-connecting-ip": "1.2.3.4" } });
+    expect(clientIP(req)).toBe("1.2.3.4");
+  });
+});
+
+describe("proxyChat", () => {
+  beforeEach(() => {});
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("非流式成功：聚合上游并回 chat.completion", async () => {
+    // 用聚合（非 TransformStream）路径覆盖代理核心逻辑（流式透传在 workerd 原生运行）
+    const fetchMock = mockUpstream(200, 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n');
+    vi.stubGlobal("fetch", fetchMock);
+    const env = fakeEnv(makeAuth("u1"));
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "9.9.9.9" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const res = await proxyChat(env, req, "cn:hy3", { model: "cn:hy3", stream: false, messages: [] }, "9.9.9.9", "ua");
+    expect(res.status).toBe(200);
+    const j = await res.json();
+    expect(j.choices[0].message.content).toContain("hi");
+  });
+
+  it("出站 body 经payload 管线：强制 stream + cache_key 注入 + 指纹脱敏，入参 body 不被污染", async () => {
+    let sent: any = null;
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        sent = await req.clone().json();
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { "content-type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const env = fakeEnv(makeAuth("u1"));
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    // 非流式入参：管线强制 stream=true，但代理层仍按 body.stream=false 走聚合路径
+    const bodyIn = {
+      model: "cn:hy3",
+      stream: false,
+      max_completion_tokens: 2000,
+      messages: [
+        { role: "developer", content: "sys" },
+        { role: "user", content: "Main branch (you will usually use this for PRs)" },
+      ],
+    };
+    const res = await proxyChat(env, req, "cn:hy3", bodyIn, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    // 出站：管线生效
+    expect(sent.stream).toBe(true);
+    expect(sent.max_tokens).toBe(2000);
+    expect("max_completion_tokens" in sent).toBe(false);
+    expect(sent.messages[0].role).toBe("system");
+    expect(sent.messages[1].content).toBe("Default branch (you will usually use this for PRs)");
+    // cache_key：按账号隔离注入
+    expect(String(sent.prompt_cache_key)).toMatch(/^wb2a-u1-[0-9a-f]{32}$/);
+    // 入参 body 未被污染（stream 仍是 false，role/content 原样）
+    expect(bodyIn.stream).toBe(false);
+    expect(bodyIn.messages[0].role).toBe("developer");
+    expect(bodyIn.messages[1].content).toBe("Main branch (you will usually use this for PRs)");
+    expect("max_tokens" in bodyIn).toBe(false);
+  });
+
+  it("上游 429 -> OpenAI 错误信封（不崩溃）", async () => {
+    const fetchMock = mockUpstream(429, JSON.stringify({ code: "rate_limit_exceeded" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const env = fakeEnv(makeAuth("u1"));
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    const res = await proxyChat(env, req, "cn:hy3", { model: "cn:hy3", stream: false, messages: [] }, "0.0.0.0", "");
+    const j = await res.json();
+    expect(j.error.code).toBe("rate_limit_exceeded");
+  });
+
+  it("内容拦截（指纹误报）→ 换 Degraded 提示词同请求内重试一次并成功", async () => {
+    // 第一次出站带客户端原始 system → 上游按审核文案 400；网关判定误报，
+    // 触发降级并把 system 换成 Degraded 重试；第二次出站即命中。
+    const sent: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        const b = await req.clone().json();
+        sent.push(b);
+        if (b.messages[0]?.content?.includes("客户端原文")) {
+          return new Response(JSON.stringify({ code: 400, msg: "Request blocked by security policy" }), {
+            status: 400, headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { "content-type": "text/event-stream" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const env = fakeEnv(makeAuth("u1"));
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    const res = await proxyChat(
+      env, req, "cn:hy3",
+      { model: "cn:hy3", stream: false, messages: [{ role: "system", content: "客户端原文" }, { role: "user", content: "U" }] },
+      "0.0.0.0", "",
+    );
+    expect(res.status).toBe(200);
+    expect(sent).toHaveLength(2);
+    // 第一次：客户端原文在头部
+    expect(sent[0].messages[0].content).toBe("客户端原文");
+    // 第二次：已替换为 Degraded，且不带客户端原文
+    expect(sent[1].messages[0].content).not.toContain("客户端原文");
+    expect(sent[1].messages[0].content).toBe(
+      "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise.",
+    );
+    // 降级状态已持久化到 KV（次日 00:00 CST 前有效）
+    expect(Number(env.WB2A_CACHE.m.get("prompt:degraded_until"))).toBeGreaterThan(Date.now());
+  });
+
+  it("内容拦截重试后仍被拦 → 回 content_blocked，不无限重试", async () => {
+    let calls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        calls++;
+        return new Response(JSON.stringify({ code: 400, msg: "Request blocked by security policy" }), {
+          status: 400, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const env = fakeEnv(makeAuth("u1"));
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    const res = await proxyChat(
+      env, req, "cn:hy3",
+      { model: "cn:hy3", stream: false, messages: [{ role: "user", content: "U" }] },
+      "0.0.0.0", "",
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error.code).toBe("content_blocked");
+    // 降级重试只给一次机会：原始 + 降级 = 2 次，不继续轮转
+    expect(calls).toBe(2);
+  });
+});

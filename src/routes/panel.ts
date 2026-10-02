@@ -1,0 +1,385 @@
+import type { Hono } from "hono";
+import type { Env } from "../../worker-configuration.d.ts";
+import { getConfig, saveConfig } from "../config";
+import { poolRPC } from "../durable/account-pool";
+import { listModels } from "../services/resolveModel";
+import {
+  queryRequestLogs,
+  listKeys,
+  getKey,
+  insertKey,
+  patchKey,
+  deleteKey,
+  queryUsage,
+  maxKeySeq,
+  quotaUsage,
+  run,
+} from "../storage/d1";
+import { kvGetJSON, CACHE_KEY_OUTPUT_PROBES, cacheKV } from "../storage/kv";
+import { forEachAccount, runCreditReport, runTrialBatch, prettyReport } from "../services/tasks";
+import { creditPackages, getCredits } from "../services/upstream";
+import {
+  signinOne,
+  renderSigninTable,
+  summarizeSignin,
+  type SigninOutcome,
+} from "../services/checkin";
+import { normRealm } from "../services/apikeys";
+import type { ApiKeyRow, Auth } from "../types";
+import type { CtxVars } from "../types";
+
+const VERSION = "1.0.0-pages";
+const STARTED_AT = Date.now();
+
+function genKey(): string {
+  const b = new Uint8Array(24);
+  crypto.getRandomValues(b);
+  return "wbk_" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** numOr 取有限数值，缺省/非法回落 def。配额字段的零值语义是「不限」，故负数也压到 0。 */
+function numOr(v: unknown, def: number): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return def;
+  return n;
+}
+
+/**
+ * validateKeyInput 子密钥入参校验。
+ *
+ * 只拒「语义上不可能」的值（负数配额、非字符串名字段、数组字段塞了非数组），
+ * 其余一律宽容归一——管理面板是自家人在用，为一个手滑的空字符串打回整次
+ * 保存只会逼人改用 API。partial=true 时只校验出现的字段（PATCH 语义）。
+ */
+function validateKeyInput(body: any, partial = false): string | null {
+  if (body.quota !== undefined && Number(body.quota) < 0) return "invalid_quota";
+  if (body.quota_credit !== undefined && (!Number.isFinite(Number(body.quota_credit)) || Number(body.quota_credit) < 0)) {
+    return "invalid_quota_credit";
+  }
+  if (body.max_ips !== undefined && Number(body.max_ips) < 0) return "invalid_max_ips";
+  if (!partial && body.name !== undefined && typeof body.name !== "string") return "invalid_name";
+  for (const f of ["models", "ip_allowlist"]) {
+    if (body[f] !== undefined && !Array.isArray(body[f])) return `invalid_${f}`;
+  }
+  return null;
+}
+
+export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
+  // 概览
+  app.get("/panel/api/overview", async (c) => {
+    const cfg = await getConfig(c.env);
+    const st = await poolRPC(c.env, "/internal/status").catch(() => null);
+    const accounts = (await poolRPC(c.env, "/internal/list").catch(() => [])) as any[];
+    return c.json({
+      version: VERSION,
+      uptime_sec: Math.floor((Date.now() - STARTED_AT) / 1000),
+      auth_required: true,
+      redis_mode: false,
+      sticky_sessions: st?.sticky_sessions ?? 0,
+      total: st?.total ?? 0,
+      healthy: st?.healthy ?? 0,
+      cooling: st?.cooling ?? 0,
+      disabled: st?.disabled ?? 0,
+      in_flight_full: st?.in_flight_full ?? 0,
+      accounts: (accounts ?? []).map((a) => ({
+        uid: a.uid,
+        nickname: a.nickname,
+        realm: a.realm,
+        status: a.status,
+        credits: a.credits,
+        credits_total: a.creditsTotal,
+        in_flight: a.inFlight,
+      })),
+    });
+  });
+
+  // 日志环形缓冲（读 D1 最近 entries）
+  app.get("/panel/api/logs", async (c) => {
+    const entries = await queryRequestLogs(c.env, { limit: 200 }).catch(() => []);
+    return c.json({ entries: entries.map((e) => ({ ts: e.ts, channel: e.channel, msg: `${e.outcome} ${e.model ?? ""} uid=${e.uid ?? "-"} ${e.status}` })) });
+  });
+
+  app.get("/panel/api/request_metrics", async (c) => {
+    return c.json({ requests: 0, note: "see /panel/api/request_logs" });
+  });
+
+  app.get("/panel/api/request_logs", async (c) => {
+    const q = c.req.query();
+    const entries = await queryRequestLogs(c.env, {
+      limit: Number(q.limit) || 200,
+      outcome: q.outcome,
+      account: q.account,
+      model: q.model,
+      client_ip: q.client_ip,
+      user_agent: q.user_agent,
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+    }).catch(() => []);
+    return c.json({ entries, limit: Number(q.limit) || 200 });
+  });
+
+  // 模型目录（直连上游实时探测）
+  app.get("/panel/api/models", async (c) => {
+    const cn = await listModels(c.env, "cn").catch(() => []);
+    const gl = await listModels(c.env, "global").catch(() => []);
+    return c.json({ ok: true, models: [...cn, ...gl] });
+  });
+
+  // 导入：配置
+  app.post("/panel/api/import/config", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const cfg = await saveConfig(c.env, body);
+    return c.json({ ok: true, restart_required: [] as string[] });
+  });
+
+  // 导入：auths 数组
+  app.post("/panel/api/import/auths", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const arr: any[] = Array.isArray(body) ? body : body.accounts ?? [];
+    let imported = 0;
+    const errors: string[] = [];
+    for (const a of arr) {
+      try {
+        await poolRPC(c.env, "/internal/add", "POST", { auth: a });
+        await poolRPC(c.env, "/internal/manage", "POST", { uid: a.uid, action: "revive" });
+        imported++;
+      } catch (e: any) {
+        errors.push(String(e?.message ?? e));
+      }
+    }
+    return c.json({ ok: true, imported, errors });
+  });
+
+  // 导入：cockpit 多账号文件（multipart）
+  app.post("/panel/api/import/cockpit", async (c) => {
+    const form = await c.req.parseBody({ all: true }).catch(() => null);
+    const file = form?.["file"] as File | undefined;
+    if (!file) return c.json({ ok: false, error: "no file" }, 400);
+    const text = await file.text();
+    let arr: any[] = [];
+    try {
+      const j = JSON.parse(text);
+      arr = Array.isArray(j) ? j : j.accounts ?? [j];
+    } catch {
+      return c.json({ ok: false, error: "invalid json" }, 400);
+    }
+    let imported = 0;
+    const errors: string[] = [];
+    for (const a of arr) {
+      try {
+        await poolRPC(c.env, "/internal/add", "POST", { auth: a });
+        imported++;
+      } catch (e: any) {
+        errors.push(String(e?.message ?? e));
+      }
+    }
+    return c.json({ ok: true, imported, errors });
+  });
+
+  // 配置读写
+  app.get("/panel/api/config", async (c) => {
+    const cfg = await getConfig(c.env);
+    return c.json(cfg);
+  });
+  app.post("/panel/api/config", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const cfg = await saveConfig(c.env, body);
+    return c.json({ ok: true, restart_required: [] as string[] });
+  });
+
+  // 子密钥
+  app.get("/panel/api/keys", async (c) => {
+    const keys = await listKeys(c.env).catch(() => []);
+    return c.json({ ok: true, keys });
+  });
+  app.post("/panel/api/keys", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const key = genKey();
+    const bad = validateKeyInput(body);
+    if (bad) return c.json({ ok: false, error: bad }, 400);
+    const row: ApiKeyRow = {
+      id: crypto.randomUUID(),
+      key_hash: await sha256Hex(key),
+      name: String(body.name || "key"),
+      models: Array.isArray(body.models) ? body.models.map(String) : [],
+      created_at: Date.now(),
+      last_used: 0,
+      enabled: body.enabled === false || body.enabled === 0 ? 0 : 1,
+      expires_at: numOr(body.expires_at, 0),
+      realm: normRealm(body.realm),
+      ip_allowlist: Array.isArray(body.ip_allowlist) ? body.ip_allowlist.map(String) : [],
+      max_ips: numOr(body.max_ips, 0),
+      ips: [],
+      last_ip: "",
+      req_count: 0,
+      quota: numOr(body.quota, 0),
+      used_tokens: 0,
+      quota_credit: numOr(body.quota_credit, 0),
+      used_credit: 0,
+      seq: (await maxKeySeq(c.env).catch(() => 0)) + 1,
+    };
+    await insertKey(c.env, row).catch(() => {});
+    return c.json({ ok: true, key, id: row.id }); // 仅此刻明文返回
+  });
+  app.get("/panel/api/keys/:id", async (c) => {
+    const k = await getKey(c.env, c.req.param("id")).catch(() => null);
+    return c.json({ ok: true, key: k });
+  });
+  // 改管控字段（停用/配额/IP/模型/有效期）。不接收 key_hash —— 轮换走 reset。
+  app.patch("/panel/api/keys/:id", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const bad = validateKeyInput(body, true);
+    if (bad) return c.json({ ok: false, error: bad }, 400);
+    await patchKey(c.env, c.req.param("id"), body).catch(() => {});
+    const k = await getKey(c.env, c.req.param("id")).catch(() => null);
+    return c.json({ ok: true, key: k });
+  });
+  app.delete("/panel/api/keys/:id", async (c) => {
+    await deleteKey(c.env, c.req.param("id")).catch(() => {});
+    return c.json({ ok: true });
+  });
+  app.post("/panel/api/keys/:id/reset", async (c) => {
+    const id = c.req.param("id");
+    const k = await getKey(c.env, id).catch(() => null);
+    if (!k) return c.json({ ok: false }, 404);
+    const key = genKey();
+    await insertKey(c.env, { ...k, key_hash: await sha256Hex(key), last_used: 0 }).catch(() => {});
+    return c.json({ ok: true, key });
+  });
+  // 清零已用额度（续期/加配额后免重建密钥）。
+  app.post("/panel/api/keys/:id/reset_usage", async (c) => {
+    await run(c.env, "UPDATE apikeys SET used_tokens = 0, used_credit = 0, req_count = 0 WHERE id = ?", [
+      c.req.param("id"),
+    ]).catch(() => {});
+    return c.json({ ok: true });
+  });
+  // 配额概览（面板顶部：多少把钥匙、已用多少 token/积分、多少把已超额）。
+  app.get("/panel/api/keys/quota", async (c) => {
+    return c.json({ ok: true, ...(await quotaUsage(c.env).catch(() => ({ keys: 0, tokens: 0, credit: 0, exhausted: 0 }))) });
+  });
+  app.post("/panel/api/keys/check-models", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const cn = await listModels(c.env, "cn").catch(() => []);
+    const gl = await listModels(c.env, "global").catch(() => []);
+    const all = new Set([...cn, ...gl].map((m: any) => m.id));
+    const invalid = (body.models ?? []).filter((m: string) => !all.has(m));
+    return c.json({ ok: true, invalid });
+  });
+
+  // 用量
+  app.get("/panel/api/usage", async (c) => {
+    const q = c.req.query();
+    const to = Date.now();
+    const hours = Number(q.hours) || 24;
+    const from = q.from ? Number(q.from) : to - hours * 3600_000;
+    const rows = await queryUsage(c.env, from, q.to ? Number(q.to) : to).catch(() => []);
+    return c.json({ ok: true, from, to: q.to ? Number(q.to) : to, rows });
+  });
+  app.post("/panel/api/usage/save", async (c) => {
+    return c.json({ ok: true });
+  });
+
+  // 模型探测
+  app.get("/panel/api/model_probes", async (c) => {
+    const probes = (await kvGetJSON(cacheKV(c.env), CACHE_KEY_OUTPUT_PROBES).catch(() => null)) as any;
+    return c.json({ probes: probes ?? [], exists: !!probes, updated_at: probes?.updated_at ?? null });
+  });
+
+  // 积分包：逐账号向上游实时查询（对齐 Go panel.packages）。
+  // 并发上限 3，避免瞬时打满上游限流；单号失败只在对应行标 error，不影响整页。
+  app.get("/panel/api/packages", async (c) => {
+    const accounts = ((await poolRPC(c.env, "/internal/list").catch(() => [])) as any[]) ?? [];
+    const rows: any[] = new Array(accounts.length);
+    let cursor = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= accounts.length) return;
+        const a = accounts[i];
+        const row: any = { uid: a.uid, nickname: a.nickname, realm: a.realm, remain: 0, size: 0, packages: [] };
+        try {
+          const auth = a.auth as Auth;
+          if (!auth?.accessToken) throw new Error("account not loaded");
+          const packs = await creditPackages(c.env, auth);
+          row.packages = packs;
+          row.remain = packs.reduce((s, p) => s + p.remain, 0);
+          row.size = packs.reduce((s, p) => s + p.size, 0);
+        } catch (e: any) {
+          row.error = String(e?.message ?? e);
+        }
+        rows[i] = row;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, accounts.length) }, worker));
+    // 余额降序：多的在前，便于和少的对比。
+    rows.sort((x, y) => (y.remain ?? 0) - (x.remain ?? 0));
+    return c.json({ accounts: rows });
+  });
+
+  // 校园代金券
+  app.get("/panel/api/school/vouchers", async (c) => {
+    const out = await forEachAccount(c.env, (auth) =>
+      fetch("https://www.workbuddy.cn/api/school/vouchers", { headers: { Authorization: "Bearer " + auth.accessToken } }).then((r) => r.json().catch(() => ({}))),
+    ).catch(() => []);
+    return c.json({ ok: true, results: out });
+  });
+
+  // ---- CLI 能力的服务端入口（替代 cmd/credit、cmd/trial）----
+  //
+  // Go 侧这两个命令是遍历本地 auths/ 目录的独立二进制；Workers 下账号池在 DO、
+  // 凭证在 Secrets，能力上移为服务端批量操作，这里是它们的 HTTP 落点。
+  // ?pretty=1 返回人类可读行数组（CLI 直接打印），默认返回结构化 JSON。
+
+  // GET /panel/api/credits?realm=cn|global&pretty=1
+  app.get("/panel/api/credits", async (c) => {
+    const realm = c.req.query("realm") || undefined;
+    const report = await runCreditReport(c.env, realm);
+    if (c.req.query("pretty") === "1") return c.json({ ok: true, lines: prettyReport(report) });
+    return c.json(report);
+  });
+
+  // POST /panel/api/trial —— 批量领取 global trial 加油包（CN 自动 N/A）
+  app.post("/panel/api/trial", async (c) => {
+    const { rows, summary } = await runTrialBatch(c.env);
+    return c.json({ ok: summary.fail === 0, summary, accounts: rows });
+  });
+
+  /**
+   * POST /panel/api/signin_report —— 批量签到并**同步返回逐账号结果**。
+   *
+   * 与 /panel/api/checkin_all 的区别不是重复：后者是 fire-and-forget（后台跑完
+   * 只能去面板看日志），对齐的是定时任务；而 CLI 要的是 cmd/signin 那张逐账号
+   * 表格（谁 OK、谁已签、谁 AUTH_INVALID），必须同步拿结果。
+   * 并发压到 3（同/packages）：全池串行会撞 Workers 请求时限。
+   * 签到结果不回写面板缓存——余额台账由 runCheckin 那条链路负责刷新。
+   */
+  app.post("/panel/api/signin_report", async (c) => {
+    const realm = c.req.query("realm") || undefined;
+    const list = ((await poolRPC(c.env, "/internal/list").catch(() => [])) as any[]) ?? [];
+    const rows: SigninOutcome[] = new Array(list.length);
+    let cursor = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= list.length) return;
+        const a = list[i];
+        if (realm && a.realm !== realm) continue;
+        const r = await signinOne(c.env, a.auth as Auth);
+        // 顺手查余额（对齐 cmd/signin 的 remain 列），失败留 null 不影响签到判定。
+        try {
+          const cr = await getCredits(c.env, a.auth as Auth);
+          rows[i] = { ...r, remain: cr.credits, creditsTotal: cr.creditsTotal };
+        } catch {
+          rows[i] = r;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, list.length) }, worker));
+    const filled = rows.filter(Boolean);
+    return c.json({ ok: true, summary: summarizeSignin(filled), accounts: filled, table: renderSigninTable(filled) });
+  });
+}
