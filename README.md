@@ -8,25 +8,34 @@
 
 ## 1. 架构总览
 
+三个部署单元（均为 Cloudflare 托管，同一仓库）：
+
 ```
-请求 → _worker.js(Hono)
-        ├─ /v1/*、/status、/panel/api/* ──→ Hono 路由
-        │        └─ 账号池状态/选号/冷却/刷新 ──→ Durable Object PoolDO（单实例，顺序单线程）
-        │        └─ 上行 SSE/代理/OAuth ──→ fetch（上游 copilot.tencent.com / workbuddy.ai）
-        │        └─ 用量/日志/子密钥 ──→ D1
-        │        └─ 模型缓存/登录态 ──→ KV
-        │        └─ 日志归档 ──→ R2
-        └─ /panel/*（静态） ──→ env.ASSETS.fetch（dist/panel/index.html、app.js）
+① Pages  workbuddy2api-pages       —— API + 面板静态资源
+   请求 → _worker.js(Hono)
+          ├─ /v1/*、/status、/panel/api/* ──→ Hono 路由
+          │      └─ 账号池 RPC ──→ ② 的 PoolDO
+          │      └─ 上行 SSE/代理/OAuth ──→ fetch（上游 copilot.tencent.com / workbuddy.ai）
+          │      └─ 用量/日志/子密钥 ──→ D1（首个请求自动建表）
+          │      └─ 模型缓存/登录态 ──→ KV
+          └─ /panel/*（静态） ──→ env.ASSETS.fetch
+
+② Worker workbuddy2api-pool        —— 账号池 Durable Object
+   PoolDO（单实例，顺序单线程 = 天然锁）+ alarm 自调度（兜底）
+
+③ Worker workbuddy2api-scheduler   —— 定时作业（Pages 无 Cron Triggers）
+   cron 整点 → runScheduledJobs（签到/旅行/活跃/保活/夜猫子/成长）
+   cron 每日 → D1 请求日志 → R2 归档
 ```
 
-| 原 Go 形态 | Pages 落点 |
+| 原 Go 形态 | 落点 |
 |---|---|
-| 全局 `map[uid]*Auth` + 锁 | 单实例 Durable Object `PoolDO`（顺序单线程 = 天然锁）|
+| 全局 `map[uid]*Auth` + 锁 | 单实例 Durable Object `PoolDO`（②）|
 | `auths/*.json` / `state.json` | PoolDO Storage |
-| `usage.json` / `request-logs/*.jsonl` | D1（查询）+ R2（归档）|
+| `usage.json` / `request-logs/*.jsonl` | D1（查询）+ R2（③ 归档）|
 | `keys.json` | D1 |
 | `model.json` / `output_probes.json` | KV（TTL 缓存）|
-| `scheduler.Run` 常驻 goroutine | DO `alarm()` 自调度 **或** 外部 cron → `/panel/api/*_all` |
+| `scheduler.Run` 常驻 goroutine | ③ 的 Cron Triggers（DO alarm / 外部 POST 退为兜底）|
 | Upstash/Redis | 已移除（纯 DO Storage）|
 | `os.Getenv` / `config.json` | Pages Secrets（敏感）+ KV（非敏感）|
 
@@ -55,8 +64,18 @@ workbuddy2api-pages/
 ├── scripts/{import-config,import-auths,copy-frontend}.mjs
 ├── vendor/frontend/           # 原面板 index.html + app.js（零改动）
 ├── dist/                      # 构建输出（_worker.js + panel/）
+├── pool-worker/               # ② 独立 Worker：承载 PoolDO（Pages 不能自带 DO）
+│   ├── wrangler.toml          #   含 [[migrations]] —— Pages 里禁止，这里必需
+│   └── src/index.ts           #   export { PoolDO }（复用主项目 src/durable/）
+├── scheduler-worker/          # ③ 独立 Worker：Cron Triggers（Pages 没有 cron）
+│   ├── wrangler.toml          #   [triggers] crons = 整点作业 + 每日日志归档
+│   └── src/index.ts           #   scheduled() → runScheduledJobs / 日志归档
 └── test/                      # Miniflare + Vitest
 ```
+
+> 为什么拆出 ②③：**Pages 项目无法承载 Durable Object**（禁止 `migrations`
+> 但 DO 又必须靠它注册），也**没有 Cron Triggers**。二者都是平台硬约束，
+> 不是设计选择。详见 4.1a / 4.1b。
 
 ---
 
@@ -97,6 +116,27 @@ wrangler r2 bucket create workbuddy2api-logs
 
 把上面返回的 **id** 填进 `wrangler.toml` 与 `pool-worker/wrangler.toml`
 （后者只需要 `WB2A_CONFIG` 的 KV id）。
+
+### 4.1a 部署定时作业 Worker（**必须，否则没有定时任务**）
+
+Pages 项目**没有 Cron Triggers**，所以 6 个定时作业（签到/旅行/活跃/保活/
+夜猫子/成长）与日志归档必须由独立 Worker 的 cron 触发。Workers 原生支持
+`[triggers] crons`，由平台保证触发，不再依赖外部 cron 服务，也不必手动 arm
+DO alarm（那两条退为兜底）。
+
+```bash
+npm run deploy:scheduler
+```
+
+两条 cron（见 `scheduler-worker/wrangler.toml`）：
+
+| cron (UTC) | 作用 |
+|---|---|
+| `0 * * * *` | 每整点：按北京时间判断该跑哪些作业（`runScheduledJobs`） |
+| `30 17 * * *` | 每日 UTC 17:30（北京时间 01:30 低峰）：把 7 天前的请求日志从 D1 归档到 R2 |
+
+> 本 Worker **不需要任何 Secret**（直接调内部函数，不走 HTTP 鉴权）。
+> 但要绑 `WB2A_CONFIG`（读作业开关 + 存归档水位）、`WB2A_DB`、`WB2A_LOGS`。
 
 ### 4.1b 部署账号池 Worker（**必须，且要先于 Pages**）
 

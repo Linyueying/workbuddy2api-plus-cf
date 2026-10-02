@@ -4,10 +4,15 @@ import type { RequestLogEntry } from "../types";
 // 请求日志归档到 R2（替代 request-logs/*.jsonl）。
 // 按日期分片：logs/YYYY-MM-DD.jsonl（追加模式：先读后写）。
 
-export async function archiveLogs(env: Env, entries: RequestLogEntry[]): Promise<void> {
+/**
+ * @param day 覆盖分片日期（YYYY-MM-DD）。默认今天。
+ *   归档历史数据时必须传——否则 7 天前的日志会被写进"今天"的分片，
+ *   文件名与内容日期不符，事后无法按日期定位。
+ */
+export async function archiveLogs(env: Env, entries: RequestLogEntry[], day?: string): Promise<void> {
   if (!entries.length) return;
-  const day = new Date().toISOString().slice(0, 10);
-  const key = "logs/" + day + ".jsonl";
+  const d = day && /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : new Date().toISOString().slice(0, 10);
+  const key = "logs/" + d + ".jsonl";
   let existing = "";
   try {
     const obj = await env.WB2A_LOGS.get(key);

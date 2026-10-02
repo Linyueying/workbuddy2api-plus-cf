@@ -152,6 +152,35 @@ if (!existsSync(poolTomlPath)) {
 }
 
 // ---------------------------------------------------------------------------
+// 2c. 定时作业 Worker（Pages 无 Cron Triggers，调度必须放 Workers）
+// ---------------------------------------------------------------------------
+console.log("\n[2c] 定时作业 Worker（Cron）");
+const schedTomlPath = resolve(root, "scheduler-worker/wrangler.toml");
+if (!existsSync(schedTomlPath)) {
+  warn("缺 scheduler-worker/wrangler.toml —— 定时作业需外部 cron 或 DO alarm 兜底");
+} else {
+  const st = readFileSync(schedTomlPath, "utf8");
+  const crons = st.match(/crons\s*=\s*\[([^\]]*)\]/)?.[1] ?? "";
+  if (!/crons\s*=/.test(st)) {
+    bad("scheduler-worker 未配置 [triggers] crons —— 不会有任何定时触发");
+  } else {
+    ok(`crons: ${crons.replace(/\s+/g, " ").trim()}`);
+  }
+  const sName = st.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? "";
+  if (!sName) bad("scheduler-worker/wrangler.toml 未声明 name");
+  else ok(`scheduler worker: ${sName}`);
+  const sPh = [...st.matchAll(/REPLACE_WITH_\w+/g)].map((m) => m[0]);
+  if (sPh.length) {
+    bad(`scheduler-worker/wrangler.toml 仍有占位符：${[...new Set(sPh)].join(", ")}`);
+  }
+  if (!existsSync(resolve(root, "scheduler-worker/dist/index.js"))) {
+    warn("scheduler-worker 未构建 → 部署前跑 npm run build:scheduler");
+  } else {
+    ok("scheduler-worker/dist/index.js 已构建");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 3. API key（本地 Secret 文件）
 // ---------------------------------------------------------------------------
 console.log("\n[3] 管理员密钥");
