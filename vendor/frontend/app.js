@@ -1804,6 +1804,9 @@ function renderUsageDiag(d) {
   }).join('');
 }
 
+/* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
+   放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
+function usKpi(v, k, cls, sub, bar) {
   return '<div class="kpi ' + (cls || '') + '">' +
     '<div class="k">' + esc(k) + '</div>' +
     '<div class="v">' + esc(v) + '</div>' +

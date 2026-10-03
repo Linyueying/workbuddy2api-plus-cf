@@ -18,6 +18,7 @@
     "preflight": "node scripts/preflight.mjs",
     "fill:ids": "node scripts/fill-ids.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:panel": "node scripts/smoke-panel.mjs",
     "import:config": "node scripts/import-config.mjs",
     "import:auths": "node scripts/import-auths.mjs",
     "cli": "node scripts/wb2api.mjs",
