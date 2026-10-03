@@ -192,6 +192,14 @@ export interface RequestLogEntry {
   status: number;
   ms: number;
   msg?: string;
+  // ---- 用量指标（0003_usage_metrics.sql；单次请求一级，非预聚合）----
+  /** prompt_tokens 输入 Token；不确定留 0（不能留 null，聚合时会被当成样本缺失）。 */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  /** credits 上游 usage.credit，REAL 小数——成本与积分扣费的唯一真实来源。 */
+  credits?: number;
+  /** cache_read_tokens 前缀缓存读命中 Token，用于算缓存命中率。 */
+  cache_read_tokens?: number;
 }
 
 /** CtxVars Hono context 变量（鉴权中间件 → 路由 handler 的共享载荷）。

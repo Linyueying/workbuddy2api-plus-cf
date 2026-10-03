@@ -33,14 +33,31 @@ function fakeEnv(auth: Auth) {
     put: async (k: string, v: string) => void kvMap.set(k, v),
     delete: async (k: string) => void kvMap.delete(k),
   };
-  const fakeDB = { prepare: () => ({ bind: () => ({ run: async () => ({}) }) }) };
-  return {
+  // SQL 记录器：用量链路要靠 INSERT（占位）+ UPDATE（回填）两条语句验证，
+  // 光看返回值看不出来。sidecar 形态不影响既有测试——它们不检查 SQL。
+  const sqlWrites: Array<{ sql: string; params: any[] }> = [];
+  const fakeDB = {
+    prepare: (sql: string) => ({
+      bind: (...params: any[]) => ({
+        run: async () => {
+          sqlWrites.push({ sql, params });
+          // last_row_id 给个固定值，回填时能否把用了同一 id 就有得验。
+          return { meta: { last_row_id: 42, changes: 1 } };
+        },
+        all: async () => ({ results: [] }),
+        first: async () => null,
+      }),
+    }),
+  };
+  const env = {
     POOL: { get: () => poolStub, idFromName: () => ({}) },
     WB2A_CONFIG: fakeKV,
     WB2A_CACHE: fakeKV,
     WB2A_DB: fakeDB,
     WB2A_LOGS: {},
+    writes: sqlWrites,
   } as any;
+  return env;
 }
 
 function mockUpstream(status: number, body: string) {
@@ -205,5 +222,83 @@ describe("proxyChat", () => {
     expect((await res.json()).error.code).toBe("content_blocked");
     // 降级重试只给一次机会：原始 + 降级 = 2 次，不继续轮转
     expect(calls).toBe(2);
+  });
+});
+
+// 流式用量的写入曾是全链路最脆的一环：日志路径从不覆盖流式（面板日志页全空），
+// 用量表更是从未被写过。这两件事在沙箱里本来没法验（依赖 TransformStream），
+// 好在 Node 18+ 已内置全局 TransformStream —— 管道能跑，就能覆盖到。
+describe("流式用量写入（占位 + 末帧回填）", () => {
+  const STREAM_WITH_USAGE =
+    'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+    'data: {"choices":[{"delta":{"content":" there"}}],"usage":{"credit":1.5,"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}\n\n' +
+    "data: [DONE]\n\n";
+
+  function envFor() {
+    const env = fakeEnv(makeAuth("u1"));
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        return new Response(STREAM_WITH_USAGE, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    return env;
+  }
+
+  function reqFor() {
+    return new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: true, messages: [] }),
+    });
+  }
+
+  it("流式请求写一条日志（占位），此前完全不写——面板日志页全空的直接原因", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    // 把流读完才会触发末帧回填。这里顺带锁定「流式转发内容不丢」：
+    // 用户曾实测到 200 + SSE 头 + 零正文（sseSplit 的 while 循环不更新缓冲导致
+    // 无限 enqueue 同一帧，Worker 被 OOM 杀掉），这类退化一定会让这里变空或超时。
+    const text = await res.text();
+    expect(text).toContain("hi");
+    expect(text).toContain("there");
+    await new Promise((r) => setTimeout(r, 0));
+
+    const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(inserts).toHaveLength(1); // 恰好一条：不重复记账
+    // 占位时还没有用量，四列应为 0
+    const p = inserts[0].params;
+    expect(p.slice(-4)).toEqual([0, 0, 0, 0]);
+  });
+
+  it("末帧 usage 回填到同一行（UPDATE 的 WHERE id 取自 INSERT 返回的 rowid）", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
+    expect(upd).toBeTruthy();
+    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, id
+    expect(upd!.params).toEqual([100, 50, 1.5, 0, 42]);
+  });
+
+  it("非流式也写且只写一条：token/credit 随 INSERT 一次落清，无需回填", async () => {
+    const env = envFor();
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    const res = await proxyChat(env, req, "cn:hy3", { model: "cn:hy3", stream: false, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(inserts).toHaveLength(1); // 回归：此前两个 log 调用点叠加会写成 2 条
+    expect(inserts[0].params.slice(-4)).toEqual([100, 50, 1.5, 0]);
+    // 非流式不需要回填
+    expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 });

@@ -172,23 +172,112 @@ export async function quotaUsage(env: Env): Promise<{ keys: number; tokens: numb
 }
 
 // ---------- 请求日志 ----------
-export async function insertRequestLog(env: Env, e: RequestLogEntry): Promise<void> {
+
+/** USAGE_COLUMNS 用量指标列名 → DDL 定义。sqlite 的 ADD COLUMN 不支持 IF NOT
+ *  EXISTS，也没法一次 import Marx多列，故按字典逐列补。见 0003 迁移。
+ *
+ *  自愈的存在理由：本项目的目标部署方式是 CF Git 集成（推 GitHub 自动构建），
+ *  用户侧没有 CLI，migrations/*.sql 只能靠手工去 D1 Console 粘贴——漏掉这一步
+ *  的概率极高，而症状是「用量页全空」这种无声失败。宁可在首次写日志时自己把列
+ *  补上，也不要让一个 14 列的 INSERT 因为缺 4 列而永久静默失效。
+ */
+const USAGE_COLUMNS: Record<string, string> = {
+  prompt_tokens: "prompt_tokens INTEGER NOT NULL DEFAULT 0",
+  completion_tokens: "completion_tokens INTEGER NOT NULL DEFAULT 0",
+  credits: "credits REAL NOT NULL DEFAULT 0",
+  cache_read_tokens: "cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+};
+
+/** usageColumnsReady 自愈状态：同一次实例生命周期内只尝试一次，失败即放弃
+ *  （不能每个请求都探测一次列）。 */
+let usageColumnsReady: Promise<boolean> | null = null;
+
+/** isMissingColumn 判断 D1 报错是否为「列不存在」。 */
+function isMissingColumn(e: any): boolean {
+  const m = String(e?.message ?? e ?? "").toLowerCase();
+  return m.includes("no such column") || m.includes("has no column named");
+}
+
+/** ensureUsageColumns 自愈：给 request_logs 补上缺失的用量列。 */
+async function ensureUsageColumns(env: Env): Promise<boolean> {
+  if (!usageColumnsReady) {
+    usageColumnsReady = (async () => {
+      for (const [col, ddl] of Object.entries(USAGE_COLUMNS)) {
+        try {
+          await db(env).prepare(`ALTER TABLE request_logs ADD COLUMN ${ddl}`).run();
+        } catch (e: any) {
+          // 列已存在报 duplicate column name —— 正是我们想要的终态，不算失败。
+          if (!String(e?.message ?? "").toLowerCase().includes("duplicate column")) return false;
+        }
+      }
+      return true;
+    })().catch(() => Promise.resolve(false));
+  }
+  return usageColumnsReady;
+}
+
+/**
+ * insertRequestLog 写一条请求日志，返回自增 id（供流式回填用量）。
+ *
+ * 流式无法在开始时就知道用量（usage 在末帧），所以这里是「先占位、后 UPDATE」：
+ * 拿到 id 才能在流结束时把 token/credit 回写到同一行。见 updateRequestLogUsage。
+ */
+export async function insertRequestLog(env: Env, e: RequestLogEntry): Promise<number> {
+  const params = [
+    e.ts,
+    e.channel,
+    e.client_ip ?? null,
+    e.user_agent ?? null,
+    e.uid ?? null,
+    e.model ?? null,
+    e.realm ?? null,
+    e.outcome,
+    e.status,
+    e.ms,
+    e.msg ?? null,
+    Number(e.prompt_tokens ?? 0) || 0,
+    Number(e.completion_tokens ?? 0) || 0,
+    Number(e.credits ?? 0) || 0,
+    Number(e.cache_read_tokens ?? 0) || 0,
+  ];
+  const sql = `INSERT INTO request_logs
+     (ts, channel, client_ip, user_agent, uid, model, realm, outcome, status, ms, msg,
+      prompt_tokens, completion_tokens, credits, cache_read_tokens)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  try {
+    const r = await db(env).prepare(sql).bind(...(params as any[])).run();
+    return Number(r?.meta?.last_row_id ?? 0);
+  } catch (err) {
+    // 首次遇到缺列：自愈补列后重试一次。仍失败才是真故障（D1 只读/配额等）。
+    if (isMissingColumn(err) && (await ensureUsageColumns(env))) {
+      const r = await db(env).prepare(sql).bind(...(params as any[])).run();
+      return Number(r?.meta?.last_row_id ?? 0);
+    }
+    throw err;
+  }
+}
+
+/** UsagePatch 流式末帧回填的用量字段。 */
+export interface UsagePatch {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  credits?: number;
+  cache_read_tokens?: number;
+}
+
+/** updateRequestLogUsage 把末帧用量回填到流式开始时的占位日志行。 */
+export async function updateRequestLogUsage(env: Env, id: number, u: UsagePatch): Promise<void> {
+  if (!id) return;
   await run(
     env,
-    `INSERT INTO request_logs (ts, channel, client_ip, user_agent, uid, model, realm, outcome, status, ms, msg)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `UPDATE request_logs SET prompt_tokens = ?, completion_tokens = ?, credits = ?, cache_read_tokens = ?
+     WHERE id = ?`,
     [
-      e.ts,
-      e.channel,
-      e.client_ip ?? null,
-      e.user_agent ?? null,
-      e.uid ?? null,
-      e.model ?? null,
-      e.realm ?? null,
-      e.outcome,
-      e.status,
-      e.ms,
-      e.msg ?? null,
+      Number(u.prompt_tokens ?? 0) || 0,
+      Number(u.completion_tokens ?? 0) || 0,
+      Number(u.credits ?? 0) || 0,
+      Number(u.cache_read_tokens ?? 0) || 0,
+      id,
     ],
   );
 }
@@ -233,7 +322,54 @@ export async function deleteRequestLogsBefore(env: Env, cutoff: number): Promise
   return Number(r?.meta?.changes ?? 0);
 }
 
-// ---------- 用量聚合（按模型+小时窗口）----------
+// ---------- 用量 ----------
+// 0001 建的 usage 表（hour,model,realm,tokens,cnt）已废弃：它按小时预聚合且无
+// uid，面板要的「按账号」「prompt/completion 拆分」「credit」「缓存命中」全都
+// 出不来；更要命的是它的写入函数 recordUsage 从未被任何地方调用。用量改从
+// request_logs 实时聚合——那才是唯一真实在被写的表。表保留不删：历史数据不动，
+// 也不值得为一张空表写 DROP（万一有人已经在用）。
+
+/** UsageRow 用量聚合的输入行：单次请求一级，未聚合。 */
+export interface UsageRow {
+  ts: number;
+  uid: string | null;
+  model: string | null;
+  realm: string | null;
+  outcome: string;
+  status: number;
+  ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  credits: number;
+  cache_read_tokens: number;
+}
+
+/**
+ * queryUsageWindow 取 [from, to] 窗口内的日志行（含失败与非 relevant 通道）。
+ *
+ * 失败也取：面板要「请求数（含失败尝试）」和失败率。
+ * LIMIT 50000：90 天窗口的上限保护。再大就是全表扫描 + 序列化成本失控，
+ * 真到那个量级应该按小时物化，而不是继续加 LIMIT。
+ */
+export async function queryUsageWindow(env: Env, from: number, to: number): Promise<UsageRow[]> {
+  return all<UsageRow>(
+    env,
+    `SELECT ts, uid, model, realm, outcome, status, ms,
+            COALESCE(prompt_tokens, 0) AS prompt_tokens,
+            COALESCE(completion_tokens, 0) AS completion_tokens,
+            COALESCE(credits, 0) AS credits,
+            COALESCE(cache_read_tokens, 0) AS cache_read_tokens
+     FROM request_logs WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT 50000`,
+    [from, to],
+  ).catch(() => []);
+}
+
+/** oldestRequestLogTs 最早一条日志的时间戳（用量页「数据自 …」用），无数据返 0。 */
+export async function oldestRequestLogTs(env: Env): Promise<number> {
+  const r = await first<any>(env, "SELECT MIN(ts) AS t FROM request_logs").catch(() => null);
+  return Number(r?.t ?? 0) || 0;
+}
+
 export async function recordUsage(env: Env, model: string, realm: string, tokens: number, ts: number): Promise<void> {
   await run(
     env,

@@ -9,7 +9,8 @@ import { Chain, Fallbackable, NO_HEALTHY_ACCOUNT, type AutoModelConfig } from ".
 import { realModelExists, stripRealm } from "./resolveModel";
 import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from "./prompt";
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
-import { insertRequestLog } from "../storage/d1";
+import { insertRequestLog, updateRequestLogUsage } from "../storage/d1";
+import type { Usage } from "./sse";
 
 // 反向代理 + 多账号轮转 + 模型编排（替代 internal/server/handler.go 的
 // chatCompletions 主循环）。
@@ -250,15 +251,18 @@ export async function proxyChat(
       await poolRPC(env, "/internal/note", "POST", { uid, kind: "success" }).catch(() => {});
 
       const routed = chain[ci] !== rawModel;
-      // 成��即记（不论是否被编排路由）。流式分支此前只在 routed 时记，导致
-      // 「流式 + 未路由」（最常见的直连用法）一条日志都不写，面板日志页全空。
-      log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
 
       if (body.stream) {
-        // 流式：透传；成本台账在流结束后按 usage 记账（流内 usage 在末帧）。
+        // 成功即记（不论是否被编排路由）。流式分支此前只在 routed 时记，导致
+        // 「流式 + 未路由」（最常见的直连用法）一条日志都不写，面板日志页全空。
+        //
+        // 拿返回 id 是为了回填用量：流式的 usage 在末帧，必须等流走完才知道，
+        // 但日志又得在开局就落一行（客户端中途断开也要有记录），故「占位 + UPDATE」。
+        const logId = await log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
         const res = streamChat(up, request, {
           onEnd: (usage) => {
             void recordCost(env, uid, bareModel, usage);
+            void backfillUsage(env, logId, usage);
             if (keyRow) void consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0));
           },
         });
@@ -292,7 +296,8 @@ export async function proxyChat(
       await recordCost(env, uid, bareModel, payload?.usage);
       if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
       await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
-      if (!routed) log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
+      // 非流式此时才知道用量，日志在这里一次写清”——不 await，别把响应拖到 D1 之后。
+      void log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage);
       return new Response(JSON.stringify(payload), {
         status: 200,
         headers: {
@@ -354,6 +359,38 @@ export function parseRateReset(body: string): number {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - 8 * 3600_000;
 }
 
+/** dryUsage 把上游 usage 收敛成用量列。 Streaming 的 usage 字段名各家不统一：
+ *  prompt/completion 用 prompt_tokens/completion_tokens（OpenAI 口径），缓存读
+ *  命中则可能叫 prompt_tokens_details.cached_tokens 或 cache_read_input_tokens
+ *  ——取不到就当 0，不强凑。 */
+export function dryUsage(usage: Usage | null | undefined): {
+  prompt_tokens: number;
+  completion_tokens: number;
+  credits: number;
+  cache_read_tokens: number;
+} {
+  const u = usage as any;
+  const cached = Number(u?.prompt_tokens_details?.cached_tokens ?? u?.cache_read_input_tokens ?? 0);
+  return {
+    prompt_tokens: Math.max(0, Number(u?.prompt_tokens ?? 0) || 0),
+    completion_tokens: Math.max(0, Number(u?.completion_tokens ?? 0) || 0),
+    credits: Math.max(0, Number(u?.credit ?? 0) || 0),
+    cache_read_tokens: Number.isFinite(cached) ? Math.max(0, cached) : 0,
+  };
+}
+
+/** backfillUsage 把流式末帧的用量回填到开局那行占位日志。 */
+async function backfillUsage(env: Env, id: number, usage: Usage | null): Promise<void> {
+  if (!id || !usage) return;
+  await updateRequestLogUsage(env, id, dryUsage(usage)).catch(() => {});
+}
+
+/**
+ * log 写一条请求日志，返回该行自增 id（流式回填用量要用）。
+ *
+ * 失败一律吞掉：日志是观测设施，它挂了不应该让用户的对话请求失败。代价是丢日志，
+ * 这比让整个网关不可用划算得多。
+ */
 function log(
   env: Env,
   ip: string,
@@ -365,23 +402,21 @@ function log(
   outcome: string,
   status: number,
   start: number,
-): void {
-  // 最佳努力：不阻塞响应
-  Promise.resolve().then(() =>
-    insertRequestLog(env, {
-      ts: Date.now(),
-      channel: "chat",
-      client_ip: ip,
-      user_agent: ua,
-      uid,
-      model: actualModel || model,
-      realm,
-      outcome: outcome as any,
-      status,
-      ms: Date.now() - start,
-    }).catch(() => {}),
-  );
-  void model;
+  usage?: any,
+): Promise<number> {
+  return insertRequestLog(env, {
+    ts: Date.now(),
+    channel: "chat",
+    client_ip: ip,
+    user_agent: ua,
+    uid,
+    model: actualModel || model,
+    realm,
+    outcome: outcome as any,
+    status,
+    ms: Date.now() - start,
+    ...dryUsage(usage),
+  }).catch(() => 0);
 }
 
 /** 解析客户端 IP（尊重 X-Forwarded-For，当 trust_proxy）。 */

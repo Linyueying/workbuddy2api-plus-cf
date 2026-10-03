@@ -10,11 +10,11 @@ import {
   insertKey,
   patchKey,
   deleteKey,
-  queryUsage,
   maxKeySeq,
   quotaUsage,
   run,
 } from "../storage/d1";
+import { getUsage } from "../storage/usage";
 import { kvGetJSON, CACHE_KEY_OUTPUT_PROBES, cacheKV } from "../storage/kv";
 import { forEachAccount, runCreditReport, runTrialBatch, prettyReport } from "../services/tasks";
 import { creditPackages, getCredits } from "../services/upstream";
@@ -270,14 +270,30 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     return c.json({ ok: true, invalid });
   });
 
-  // 用量
+  // 用量：从 request_logs 实时聚合成面板「用量」页的视图模型。
+  //
+  // 这里曾是 `/panel/api/usage` 返回一张独立的 usage 表的原始行，而前端 renderUsage
+  // 期待的是 totals/series/by_*/credit_by_* 一整套——字段完全对不上，所以即便有数据
+  // 页面也只会是一片空。两套口径必须对齐，且只能有一套数据源。
   app.get("/panel/api/usage", async (c) => {
     const q = c.req.query();
     const to = Date.now();
+    // 前端 trangeQuery 传的是**秒**（自定义/固定区间）；滚动窗口传 hours。两者
+    // 都可能缺席，缺省给 24 小时——与前端 trangeState 的默认预设保持一致。
     const hours = Number(q.hours) || 24;
-    const from = q.from ? Number(q.from) : to - hours * 3600_000;
-    const rows = await queryUsage(c.env, from, q.to ? Number(q.to) : to).catch(() => []);
-    return c.json({ ok: true, from, to: q.to ? Number(q.to) : to, rows });
+    const toMs = q.to ? Number(q.to) * 1000 : to;
+    const fromMs = q.from ? Number(q.from) * 1000 : toMs - hours * 3600_000;
+
+    // 昵称是明细表的润色项，拿不到就降级显示 uid —— 不能因为它失败就整页空。
+    const accounts = ((await poolRPC(c.env, "/internal/list").catch(() => [])) as any[]) ?? [];
+    const nicknames: Record<string, string> = {};
+    for (const a of accounts) {
+      if (a?.uid && a?.nickname) nicknames[String(a.uid)] = String(a.nickname);
+    }
+
+    const snap = await getUsage(c.env, { from: fromMs, to: toMs, nicknames }).catch(() => null);
+    if (!snap) return c.json({ ok: false, buckets: 0, totals: {}, series: [], by_account: [], by_model: [], by_realm: [], credit_by_account: [], credit_by_model: [] });
+    return c.json({ ok: true, ...snap });
   });
   app.post("/panel/api/usage/save", async (c) => {
     return c.json({ ok: true });
