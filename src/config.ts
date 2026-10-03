@@ -151,8 +151,13 @@ export const DEFAULT_CONFIG: Config = {
   },
   global: {
     enabled: true,
-    chat_base: "https://copilot.tencent.com",
-    billing_base: "https://www.codebuddy.cn",
+    // ⚠️ 两个 base 必须留空：运行时由 basesFor 回落 GLOBAL 常量（workbuddy.ai）。
+    // 早期这里误填国内域（copilot.tencent.com / codebuddy.cn，从 CN 段复制未改），
+    // 非空默认值把 basesFor 的 `cfg.global.x || GLOBAL.x` 短路——国际版账号的
+    // chat/账单请求全被打到国内域，面板明明显示「国际版」却一直 401。
+    // KV 中已存的旧错误值在 getConfig 里做一次性迁移清空。
+    chat_base: "",
+    billing_base: "",
   },
   upstream: {
     timeout_seconds: 120,
@@ -254,6 +259,14 @@ export async function getConfig(env: Env): Promise<Config> {
     /* KV 未配置时使用默认配置 */
   }
   const cfg: Config = mergeDeep(DEFAULT_CONFIG, stored) as Config;
+
+  // 一次性迁移：早期 DEFAULT_CONFIG.global 误填国内域（复制 CN 段未改），且可能
+  // 已随「保存配置」写进 KV——mergeDeep 下 stored 覆盖默认，只改默认值救不了
+  // 已部署实例。国际版的 chat/billing 只可能是 workbuddy.ai（basesFor 里回落
+  // GLOBAL 常量），这里把已知错误值清空以回落。
+  const BAD_GLOBAL_BASES = ["https://copilot.tencent.com", "https://www.codebuddy.cn"];
+  if (BAD_GLOBAL_BASES.includes(cfg.global.chat_base)) cfg.global.chat_base = "";
+  if (BAD_GLOBAL_BASES.includes(cfg.global.billing_base)) cfg.global.billing_base = "";
 
   // 环境变量覆盖（敏感项也可从 Secrets 注入；Secrets 已挂在 env 上）。
   if (env.WB2A_API_KEY) cfg.api_key = env.WB2A_API_KEY;
