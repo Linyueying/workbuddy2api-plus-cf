@@ -21,6 +21,24 @@ import { run, first } from "../storage/d1";
 /** PREFIX 子密钥前缀（同时是「是否归本模块处理」的判据）。 */
 export const PREFIX = "wbk_";
 
+/**
+ * timingSafeEqual 常量时间字符串比较（凭据比对专用，勿用于其它场景）。
+ *
+ * 普通 `===` 在第一个不同字节处就短路返回，耗时随「猜对的前缀长度」单调上升，
+ * 理论上可据此逐字节试探。这里比较的是高熵随机串，实际可利用性很低，
+ * 但成本同样很低——既然要写鉴权分支，顺手把它关掉。
+ *
+ * 长度不同时会提前返回：这只泄露长度、不泄露内容，可接受。
+ */
+export function timingSafeEqual(a: string, b: string): boolean {
+  const x = String(a ?? "");
+  const y = String(b ?? "");
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return diff === 0;
+}
+
 /** KeyError 带 HTTP 状态与错误码的鉴权失败。 */
 export interface KeyError {
   status: 400 | 401 | 403 | 429;

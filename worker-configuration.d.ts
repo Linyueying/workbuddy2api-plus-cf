@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 // Cloudflare Pages + Durable Objects 绑定声明（单行来源）。
-// Secrets（WB2A_API_KEY / WB2A_DEVICE_TOKEN / WB2A_UPTASH_TOKEN）通过
+// Secrets（WB2A_API_KEY / WB2A_ADMIN_KEY / WB2A_DEVICE_TOKEN / WB2A_UPTASH_TOKEN）通过
 // `wrangler secret put` 注入，不会出现在仓库或本文件里。
 
 interface Env {
@@ -27,8 +27,10 @@ interface Env {
   ASSETS: Fetcher;
 
   // ---- Secrets（敏感，仅运行时可用）----
-  /** 管理面板 / API 的 Bearer api_key。 */
+  /** 调用主钥匙：/v1/* 客户端凭证（也可用面板配置页设置并存 KV）。 */
   WB2A_API_KEY: string;
+  /** 面板登录口令（可选）。留则由 admin_key 配置项决定；设了它会覆盖配置项。 */
+  WB2A_ADMIN_KEY?: string;
   /** 设备 token（可选，原 device_token_file / WB2A_DEVICE_TOKEN）。 */
   WB2A_DEVICE_TOKEN?: string;
   /** 原 Upstash token（可选；本项目已用纯 DO 替代，保留以备横向扩展）。 */

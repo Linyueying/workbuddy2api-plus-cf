@@ -874,6 +874,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
+              <label class="fld"><span class="lb">面板登录口令</span>
+                <div class="inline">
+                  <input id="cfgPanelKey" type="text" readonly placeholder="未设置 —— 当前与 API 密钥共用">
+                  <button type="button" class="xs" id="btnPanelKeyGen">生成</button>
+                  <button type="button" class="xs ghost" id="btnPanelKeyClear">清除</button>
+                </div>
+                <span class="hint">生成后<b>只有这把口令能进入面板</b>，原 API 密钥不再可用于登录；
+                  它<b>不能</b>调用任何接口。分离开是为了：把调用密钥发给下游时，不会连同账户池、
+                  用量流水和配置写权限一起交出去。明文只展示一次。</span></label>
             </div>
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
@@ -1327,10 +1336,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:420px">
     <header>
       <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
+      <div class="hint">输入面板登录口令。若尚未单独设置，填写 API 密钥即可（两者在「配置」页可分离）。</div>
     </header>
     <div class="body">
-      <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">
+      <input type="password" id="keyInput" placeholder="面板登录口令 / api_key" autocomplete="current-password">
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>

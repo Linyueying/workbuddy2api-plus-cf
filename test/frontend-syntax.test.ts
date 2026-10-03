@@ -43,4 +43,17 @@ describe("前端产物语法守卫", () => {
     expect(html).toContain('id="usDiagBox"');
     expect(html).toContain('id="usDiagBody"');
   });
+
+  it("面板口令控件：HTML 的 id 与 JS 的绑定必须对得上", () => {
+    // app.js 顶层写的是 `$('btnPanelKeyGen').onclick = …`。一旦 index.html 里少了
+    // 这个 id，`$()` 返回 null，赋值当场 TypeError —— 脚本从这里断掉，后面的
+    // 渲染与路由全部不执行，面板整屏白、控制台只有一行不那么显眼的错。
+    // 这类事故本项目出过（"修复面板白屏" 那个提交），这里把它钉住。
+    const html = readFileSync(resolve(root, "vendor/frontend/index.html"), "utf8");
+    const js = readFileSync(resolve(root, "vendor/frontend/app.js"), "utf8");
+    for (const id of ["cfgPanelKey", "btnPanelKeyGen", "btnPanelKeyClear"]) {
+      expect(html, `index.html 缺少 id="${id}"`).toContain(`id="${id}"`);
+      expect(js, `app.js 未引用 $('${id}')`).toContain(`$('${id}')`);
+    }
+  });
 });

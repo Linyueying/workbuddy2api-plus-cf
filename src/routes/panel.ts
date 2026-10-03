@@ -36,6 +36,31 @@ function genKey(): string {
   crypto.getRandomValues(b);
   return "wbk_" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
+
+/**
+ * keyPrefix 取明文前 12 字符做展示掩码（对齐 Go apikeys 里 `plain[:12]`）。
+ *
+ * 12 这个长度是刻意选的：够露出 `wbk_` + 足够区分同一账号下的多把钥匙，
+ * 又不足以让人拿它去猜剩下的 48 位。
+ */
+function keyPrefix(plain: string): string {
+  return String(plain ?? "").slice(0, 12);
+}
+/**
+ * genAdminKey 生成面板登录口令：`sk-` + base64url(18 字节随机)。
+ *
+ * 格式刻意对齐 Go cmd/server/config.go 的 WriteDefault（`"sk-" + base64.RawURLEncoding(18B)`），
+ * 与分发给下游的 `wbk_` 子密钥在**肉眼层面**就区分得开：一个管面板，一个管调用。
+ */
+function genAdminKey(): string {
+  const b = new Uint8Array(18);
+  crypto.getRandomValues(b);
+  let bin = "";
+  for (const x of b) bin += String.fromCharCode(x);
+  // btoa → 标准 base64，再换成 Go RawURLEncoding 的 URL 安全字符集（去 padding）。
+  return "sk-" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -191,6 +216,30 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     return c.json({ ok: true, restart_required: [] as string[] });
   });
 
+  // 面板登录口令：与调用主钥匙 api_key 分开的一把，只用来进面板。
+  //
+  // 为什么不再共用：共用时「给下游发一把调用密钥」等于把管理面板交出去。
+  // 生成是一次性的——明文只在响应里出现这一次，之后只读得到「已设置」，
+  // 忘了就得再生成一把（旧的立即失效），不做 recover。
+  app.post("/panel/api/admin/panel-key", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const cur = await getConfig(c.env);
+    // clear：退回「面板认 api_key」的老行为。手滑生成后想恢复时用这条路，
+    // 免得只剩一把没处记录的口令把自己关在外面。
+    if (body?.clear) {
+      await saveConfig(c.env, { ...cur, admin_key: "" });
+      return c.json({ ok: true, cleared: true });
+    }
+    const next = genAdminKey();
+    await saveConfig(c.env, { ...cur, admin_key: next });
+    return c.json({ ok: true, plain: next });
+  });
+  /** GET 面板口令是否已独立设置（不回照明文：忘了只能重生成）。 */
+  app.get("/panel/api/admin/panel-key", async (c) => {
+    const cfg = await getConfig(c.env);
+    return c.json({ ok: true, set: !!cfg.admin_key, shared_with_api_key: !cfg.admin_key });
+  });
+
   // 子密钥
   app.get("/panel/api/keys", async (c) => {
     const keys = await listKeys(c.env).catch(() => []);
@@ -205,6 +254,7 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       id: crypto.randomUUID(),
       key_hash: await sha256Hex(key),
       name: String(body.name || "key"),
+      prefix: keyPrefix(key),
       models: Array.isArray(body.models) ? body.models.map(String) : [],
       created_at: Date.now(),
       last_used: 0,
@@ -223,13 +273,17 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       seq: (await maxKeySeq(c.env).catch(() => 0)) + 1,
     };
     await insertKey(c.env, row).catch(() => {});
-    return c.json({ ok: true, key, id: row.id }); // 仅此刻明文返回
+    // key / plain **必须同时在**：这是 Go internal/panel/keys.go 的契约
+    //（`{"key": k, "plain": plain}`），前端 showIssued(r.plain) 读的是 plain。
+    // 只返回 key 会让「仅此刻可见」的明文框弹出一个空字符串——看似小错，
+    // 实际是用户永远拿不到自己刚创建的密钥。
+    return c.json({ ok: true, key, plain: key, id: row.id });
   });
   app.get("/panel/api/keys/:id", async (c) => {
     const k = await getKey(c.env, c.req.param("id")).catch(() => null);
     return c.json({ ok: true, key: k });
   });
-  // 改管控字段（停用/配额/IP/模型/有效期）。不接收 key_hash —— 轮换走 reset。
+  // 改管控字段（停用/配额/IP/模型/有效期）。不接收 key_hash —— 轮换走 /rotate。
   app.patch("/panel/api/keys/:id", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const bad = validateKeyInput(body, true);
@@ -242,20 +296,37 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     await deleteKey(c.env, c.req.param("id")).catch(() => {});
     return c.json({ ok: true });
   });
+  // POST /reset 语义**必须与 Go 一致**：清零已用额度，而不是换密钥
+  //（Go internal/panel/keys.go 的 keysReset 调的是 ResetUsage）。
+  // 此前这里做了密钥轮换，而前端按钮文案写的是「重置用量统计」——管理员以为
+  // 只是续期的无害操作，实际所有客户端瞬间 401，且新明文被丢弃、无处可寻。
+  // 轮换这种**不可逆且会打挂下游**的动作，必须走独立的 /rotate。
   app.post("/panel/api/keys/:id/reset", async (c) => {
-    const id = c.req.param("id");
-    const k = await getKey(c.env, id).catch(() => null);
-    if (!k) return c.json({ ok: false }, 404);
-    const key = genKey();
-    await insertKey(c.env, { ...k, key_hash: await sha256Hex(key), last_used: 0 }).catch(() => {});
-    return c.json({ ok: true, key });
+    const r = await run(
+      c.env,
+      "UPDATE apikeys SET used_tokens = 0, used_credit = 0, req_count = 0 WHERE id = ?",
+      [c.req.param("id")],
+    ).catch(() => null);
+    // 行不存在时不报错——幂等语义，调一次和调十次结果相同。
+    return c.json({ ok: true, changed: Number(r?.meta?.changes ?? 0) });
   });
-  // 清零已用额度（续期/加配额后免重建密钥）。
+  // 清零已用额度（续期/加配额后免重建密钥）。语义与 /reset 相同，保留用于兼容早期客户端。
   app.post("/panel/api/keys/:id/reset_usage", async (c) => {
     await run(c.env, "UPDATE apikeys SET used_tokens = 0, used_credit = 0, req_count = 0 WHERE id = ?", [
       c.req.param("id"),
     ]).catch(() => {});
     return c.json({ ok: true });
+  });
+  // Go 没有轮换能力，这是 CF 侧的增强：换一把新明文，**旧密钥立即失效**。
+  // 返回 plain 让前端一次性展示——轮换后不展示新密钥等于把用户锁在门外。
+  app.post("/panel/api/keys/:id/rotate", async (c) => {
+    const id = c.req.param("id");
+    const k = await getKey(c.env, id).catch(() => null);
+    if (!k) return c.json({ ok: false }, 404);
+    const key = genKey();
+    // prefix 必须跟着换：留在旧掩码上会让列表页继续显示一把已作废的钥匙。
+    await insertKey(c.env, { ...k, key_hash: await sha256Hex(key), prefix: keyPrefix(key) }).catch(() => {});
+    return c.json({ ok: true, key, plain: key });
   });
   // 配额概览（面板顶部：多少把钥匙、已用多少 token/积分、多少把已超额）。
   app.get("/panel/api/keys/quota", async (c) => {

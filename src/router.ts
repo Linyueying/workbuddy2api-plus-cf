@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Env } from "../worker-configuration.d.ts";
 import { getConfig } from "./config";
 import { getKeyByHash } from "./storage/d1";
-import { PREFIX, parseJSONArray, touchKey, verifyKey } from "./services/apikeys";
+import { PREFIX, parseJSONArray, timingSafeEqual, touchKey, verifyKey } from "./services/apikeys";
 import { registerApi } from "./routes/api";
 import { registerPanel } from "./routes/panel";
 import { registerLogin } from "./routes/login";
@@ -45,7 +45,27 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   if (!m) return c.json({ error: { message: "unauthorized", type: "api_error", code: "unauthorized" } }, 401);
   const token = m[1];
   const cfg = await getConfig(c.env);
-  if (token === cfg.api_key && cfg.api_key) {
+  const isPanel = path.startsWith("/panel/");
+
+  if (isPanel) {
+    // 面板凭据：admin_key 优先；未单独配置时回退 api_key。
+    // 回退是刻意的——老部署升级后若立刻只认 admin_key（默认为空），所有已保存
+    // 的会话都会 401，管理员等于把自己锁在门外。想真正隔离，去面板生成一次即可。
+    const ok = cfg.admin_key
+      ? timingSafeEqual(token, cfg.admin_key)
+      : !!(cfg.api_key && timingSafeEqual(token, cfg.api_key));
+    if (!ok) {
+      return c.json({ error: { message: "unauthorized", type: "api_error", code: "unauthorized" } }, 401);
+    }
+    c.set("role", "admin");
+    c.set("models", null);
+    c.set("keyRow", null);
+    return next();
+  }
+
+  // 接口凭据：只认调用主钥匙与 wbk_ 子密钥，**admin_key 在此一律不认**。
+  // 这是「登录与调用分离」的实质所在：面板口令泄露也换不来一次模型调用。
+  if (cfg.api_key && timingSafeEqual(token, cfg.api_key)) {
     c.set("role", "admin");
     c.set("models", null);
     c.set("keyRow", null);

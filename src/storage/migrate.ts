@@ -78,6 +78,13 @@ const COLS_0002: { name: string; ddl: string }[] = [
   { name: "seq", ddl: "seq INTEGER NOT NULL DEFAULT 0" },
 ];
 
+// 0004：子密钥展示掩码（与 migrations/0004_apikey_prefix.sql 保持同步）。
+// Go apikeys.Key.Prefix 存的是**明文前 12 字符**，供列表页显示 `wbk_1a2b3c…`，
+// 既不落明文也让管理员能认出是哪一把。CF 此前缺这一列，列表那格恒为空。
+const COLS_0004: { name: string; ddl: string }[] = [
+  { name: "prefix", ddl: "prefix TEXT NOT NULL DEFAULT ''" },
+];
+
 const INDEX_0002 = `CREATE INDEX IF NOT EXISTS idx_apikeys_seq ON apikeys(seq DESC)`;
 
 export type MigrateState =
@@ -129,7 +136,7 @@ async function migrate(env: Env): Promise<MigrateState> {
 
   // 2) 列：ADD COLUMN 不支持 IF NOT EXISTS，先探测再补。
   const cols = await columnsOf(d1, "apikeys");
-  for (const c of COLS_0002) {
+  for (const c of [...COLS_0002, ...COLS_0004]) {
     if (cols.has(c.name)) continue;
     try {
       await d1.prepare(`ALTER TABLE apikeys ADD COLUMN ${c.ddl}`).run();

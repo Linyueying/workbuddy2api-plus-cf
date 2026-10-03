@@ -1019,6 +1019,34 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
+
+// ── 面板登录口令（与调用密钥分离） ────────────────────────────────────
+// 只读 rpc 展示：不打印明文，只说有没有设置。生成后才一次展示，忘了只能重建。
+async function loadPanelKeyRow() {
+  const box = $('cfgPanelKey');
+  if (!box) return;
+  try {
+    const r = await keysApi('admin/panel-key', 'GET');
+    box.value = r.set ? '已设置（明文不回显，忘记请重新生成）' : '';
+    box.dataset.set = r.set ? '1' : '';
+  } catch (e) { /* 未登录时不打扰；登录成功后 start() 会重读 */ }
+}
+$('btnPanelKeyGen').onclick = async () => {
+  if (!confirm('生成后：\n· 只有这把新口令能进入面板，当前 API 密钥将无法登录\n· 该口令不能调用任何接口\n\n明文只显示这一次，是否继续？')) return;
+  try {
+    const r = await keysApi('admin/panel-key', 'POST', {});
+    showIssued(r.plain || '', true);
+    loadPanelKeyRow();
+  } catch (e) { toast('生成失败：' + (e.message || e), 'err'); }
+};
+$('btnPanelKeyClear').onclick = async () => {
+  if (!confirm('清除后将回到「用 API 密钥登录面板」的模式。确认？')) return;
+  try {
+    await keysApi('admin/panel-key', 'POST', { clear: true });
+    toast('已恢复为与 API 密钥共用', 'ok');
+    loadPanelKeyRow();
+  } catch (e) { toast('清除失败：' + (e.message || e), 'err'); }
+};
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
@@ -1168,6 +1196,7 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
+  loadPanelKeyRow();
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
@@ -2735,7 +2764,8 @@ async function loadKeys() {
       const ips = (x.ips || []).join(', ') || '—';
       return '<tr>' +
         '<td><b>' + esc(x.name) + '</b></td>' +
-        '<td><code style="font-size:11.5px">' + esc(x.prefix) + '…</code></td>' +
+        // 0004 之前创建的老行没有 prefix 列 → 显示占位符而不是孤零零一个省略号。
+        '<td><code style="font-size:11.5px">' + (x.prefix ? esc(x.prefix) + '…' : '—') + '</code></td>' +
         '<td>' + tag + '</td>' +
         '<td>' + realm + '</td>' +
         '<td style="font-size:11.5px">' + esc(credit) + '</td>' +
@@ -2748,6 +2778,7 @@ async function loadKeys() {
           '<button class="xs" data-kact="edit" data-id="' + x.id + '">编辑</button> ' +
           '<button class="xs" data-kact="toggle" data-id="' + x.id + '">' + (x.enabled ? '停用' : '启用') + '</button> ' +
           '<button class="xs" data-kact="reset" data-id="' + x.id + '">重置用量</button> ' +
+          '<button class="xs" data-kact="rotate" data-id="' + x.id + '">轮换密钥</button> ' +
           '<button class="xs danger" data-kact="del" data-id="' + x.id + '">删除</button>' +
         '</td></tr>';
     }).join('');
@@ -2760,7 +2791,15 @@ async function loadKeys() {
 async function keyAct(act, id) {
   try {
     if (act === 'del') { if (!confirm('确认删除该密钥？删除后使用该密钥的客户端将立即失效，且无法恢复。')) return; await keysApi('keys/' + id, 'DELETE'); }
+    // 只清已用额度（续期用），密钥本身不变，客户端无感。
     else if (act === 'reset') { if (!confirm('确认重置该密钥的用量统计（积分 / Token / 请求数）？来源 IP 记录将保留。')) return; await keysApi('keys/' + id + '/reset', 'POST'); }
+    // 换一把新明文：旧密钥**立即失效**，所有在用客户端都会 401。
+    // 因此必须二次确认，且拿到新明文后立刻展示——轮换后不展示等于把用户锁在门外。
+    else if (act === 'rotate') {
+      if (!confirm('轮换后旧密钥立即失效，使用该密钥的客户端将全部无法调用。确认继续？')) return;
+      const r = await keysApi('keys/' + id + '/rotate', 'POST');
+      showIssued(r.plain || '');
+    }
     else if (act === 'toggle') {
       const r = await keysApi('keys');
       const cur = (r.keys || []).find(x => x.id === id);
@@ -2871,8 +2910,11 @@ $('btnKfSave').onclick = async () => {
   }
 };
 
-function showIssued(plain) {
+function showIssued(plain, noBase) {
   $('kIssuedKey').value = plain;
+  // 面板登录口令不要展示 Base URL——它调不了接口，给了反而误导人去配客户端。
+  const wrap = $('kIssuedBase') && $('kIssuedBase').closest('label');
+  if (wrap) wrap.hidden = !!noBase;
   $('kIssuedBase').value = location.origin + '/v1';
   $('kIssuedVeil').classList.add('on');
 }

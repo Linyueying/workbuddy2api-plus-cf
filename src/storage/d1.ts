@@ -27,7 +27,7 @@ export async function first<T = any>(env: Env, sql: string, params: unknown[] = 
 // 免得每个调用点各写一遍 parse/stringify。见 migrations/0002_apikey_quota.sql。
 
 const KEY_COLS =
-  "id, key_hash, name, models, created_at, last_used, enabled, expires_at, realm, ip_allowlist, max_ips, ips, last_ip, req_count, quota, used_tokens, quota_credit, used_credit, seq";
+  "id, key_hash, name, prefix, models, created_at, last_used, enabled, expires_at, realm, ip_allowlist, max_ips, ips, last_ip, req_count, quota, used_tokens, quota_credit, used_credit, seq";
 
 /** decodeKeyRow 把 D1 行的 JSON 列解成数组（缺列按 0/'' 兜住，兼容 0001 老行）。 */
 export function decodeKeyRow(r: any): ApiKeyRow {
@@ -35,6 +35,8 @@ export function decodeKeyRow(r: any): ApiKeyRow {
     id: String(r?.id ?? ""),
     key_hash: String(r?.key_hash ?? ""),
     name: String(r?.name ?? ""),
+    // 0004 之前的老行没有 prefix 列 → 空串，前端按「未知」渲染而不报错。
+    prefix: String(r?.prefix ?? ""),
     models: decodeArr(r?.models),
     created_at: Number(r?.created_at ?? 0),
     last_used: Number(r?.last_used ?? 0),
@@ -85,12 +87,13 @@ export async function insertKey(env: Env, row: ApiKeyRow): Promise<void> {
   await run(
     env,
     `INSERT OR REPLACE INTO apikeys
-     (id, key_hash, name, models, created_at, last_used, enabled, expires_at, realm, ip_allowlist, max_ips, ips, last_ip, req_count, quota, used_tokens, quota_credit, used_credit, seq)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (id, key_hash, name, prefix, models, created_at, last_used, enabled, expires_at, realm, ip_allowlist, max_ips, ips, last_ip, req_count, quota, used_tokens, quota_credit, used_credit, seq)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.id,
       row.key_hash,
       row.name,
+      row.prefix ?? "",
       JSON.stringify(row.models ?? []),
       row.created_at,
       row.last_used ?? 0,

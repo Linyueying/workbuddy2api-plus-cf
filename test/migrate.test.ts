@@ -69,28 +69,31 @@ describe("D1 自动迁移", () => {
     resetSchemaCache();
   });
 
-  it("全新库：补齐 0002 的全部 13 个管控列", async () => {
+  it("全新库：补齐 0002 的管控列 + 0004 的展示掩码", async () => {
     const { d1, cols } = makeD1({ cols: [] });
     const r = await ensureSchema(envWith(d1));
     expect(r.status).toBe("ok");
+    // 这份清单刻意写死在此处、不从 src 导出：迁移漏加任何一列都应在这里抓到，
+    // 而不是跟着实现一起静默通过。
     expect(r.added_cols?.sort()).toEqual(
       [
         "enabled", "expires_at", "realm", "ip_allowlist", "max_ips", "ips",
         "last_ip", "req_count", "quota", "used_tokens", "quota_credit",
         "used_credit", "seq",
+        "prefix", // 0004：对齐 Go Key.Prefix（明文前 12 字符）
       ].sort(),
     );
-    expect(cols.size).toBe(13);
+    expect(cols.size).toBe(14);
   });
 
   it("已迁移的库：不重复加列（ADD COLUMN 无 IF NOT EXISTS，重跑会炸）", async () => {
-    const all13 = [
+    const allCols = [
       "id", "key_hash", "name", "models", "created_at", "last_used",
       "enabled", "expires_at", "realm", "ip_allowlist", "max_ips", "ips",
       "last_ip", "req_count", "quota", "used_tokens", "quota_credit",
-      "used_credit", "seq",
+      "used_credit", "seq", "prefix",
     ];
-    const { d1, executed } = makeD1({ cols: all13 });
+    const { d1, executed } = makeD1({ cols: allCols });
     const r = await ensureSchema(envWith(d1));
     expect(r.status).toBe("ok");
     expect(r.added_cols).toEqual([]);

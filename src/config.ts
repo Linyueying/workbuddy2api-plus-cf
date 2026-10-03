@@ -78,7 +78,19 @@ export interface LoggingConfig {
 }
 
 export interface Config {
+  /** 调用主钥匙：给 /v1/* 下游客户端用的全权凭证。 */
   api_key: string;
+  /**
+   * 面板登录口令：只用于进入 /panel/，**不可用于调用 /v1/***。
+   *
+   * 为什么要与 api_key 分开：原先两件事共用一把（router 里 `token === cfg.api_key`
+   * 既放行面板也放行接口），于是「把调用密钥交给下游」等于「把管理面板交出去」。
+   * 分离之后，即使面板口令泄露，攻击者改不了配置、导不出账号，也调不动接口。
+   *
+   * 空串 = 尚未单独设置 → 鉴权层回退到「面板也认 api_key」，保证老部署升级后
+   * 不会因为登不进去而把自己锁在门外。想真正隔离就在面板点一次「生成」。
+   */
+  admin_key: string;
   auth_dir: string;
   state_file: string;
   trust_proxy: boolean;
@@ -122,6 +134,8 @@ export interface Config {
 
 export const DEFAULT_CONFIG: Config = {
   api_key: "",
+  // 默认空 → 面板回退认 api_key（老部署行为不变）。见 Config.admin_key 注释。
+  admin_key: "",
   auth_dir: "auths",
   state_file: "state.json",
   trust_proxy: true,
@@ -270,6 +284,7 @@ export async function getConfig(env: Env): Promise<Config> {
 
   // 环境变量覆盖（敏感项也可从 Secrets 注入；Secrets 已挂在 env 上）。
   if (env.WB2A_API_KEY) cfg.api_key = env.WB2A_API_KEY;
+  if (env.WB2A_ADMIN_KEY) cfg.admin_key = env.WB2A_ADMIN_KEY;
   if (env.WB2A_DEVICE_TOKEN) cfg.upstream.device_token = env.WB2A_DEVICE_TOKEN;
   // prompt.mode 归一（对齐 Go normalizePrompt）：空串等同 passthrough，非法值
   // 回落 passthrough 而非抛错——Go 是启动期 fail fast，Workers 是每请求读配置，

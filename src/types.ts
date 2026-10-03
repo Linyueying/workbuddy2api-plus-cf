@@ -154,6 +154,12 @@ export interface ApiKeyRow {
   id: string;
   key_hash: string;
   name: string;
+  /**
+   * 展示掩码：明文的**前 12 字符**（对齐 Go apikeys.Key.Prefix 的 `plain[:12]`）。
+   * 目的是让列表页能显示 `wbk_1a2b3c…` —— 既不落明文，管理员又能认出是哪一把。
+   * 该字段在密钥轮换时必须同步更新：留在旧掩码上会指向一把已失效的钥匙。
+   */
+  prefix: string;
   models: string[];
   created_at: number;
   last_used: number;
