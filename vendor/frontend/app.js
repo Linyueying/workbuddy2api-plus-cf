@@ -1069,7 +1069,15 @@ document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
-  const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  // 防呆：不再静默默认 cn。选错域会让余额/签到一直 401（国内账单域 codebuddy.cn
+  // 与国际 workbuddy.ai 的额度不通用），所以未显式选择时直接拦下。
+  const picked = document.querySelector('input[name="addRealm"]:checked');
+  if (!picked) {
+    $('addErr').hidden = false;
+    $('addErr').textContent = '请先选择账号版本：国内版（CN）或国际版（Global）。国际站注册的账号必须选「国际版」，否则余额会一直 401。';
+    return;
+  }
+  const realm = picked.value;
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {

@@ -1274,11 +1274,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
           <div class="realm-row">
-            <span class="hint" style="font-size:12px">版本：</span>
-            <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
+            <span class="hint" style="font-size:12px">版本：<b style="color:var(--warn)">必选</b></span>
+            <label class="realm-opt"><input type="radio" name="addRealm" value="cn"> 国内版（CN）</label>
             <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
           </div>
           <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+          <div class="hint" style="font-size:12px;margin-top:2px;color:var(--warn)">⚠️ 选错会导致余额/签到一直 401：国内版账单走 codebuddy.cn，国际版走 workbuddy.ai，两者额度不通用。国际站注册的账号务必选「国际版」。</div>
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
