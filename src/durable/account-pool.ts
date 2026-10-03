@@ -9,6 +9,7 @@ import {
   healthyForModel as coreHealthyForModel,
   inFlightFull as coreInFlightFull,
   hardCooled,
+  floorBlocked,
   MODEL_COST_TTL,
   type PickCfg,
   type PickResult,
@@ -117,6 +118,10 @@ export class PoolDO {
    * pickOne 选出账号并写回 lastUsed/usedSeq（LRU 与防撞号的权威依据）。
    * 惰性清理过期的模型级冷却与成本台账（两张 map 都不无限膨胀）。
    */
+  /** ACQUIRE_TTL_MS 在途占用超时：超过此值仍未 release（客户端断连 / Worker 异常导致
+   *  onEnd 不触发）则强制回收，避免所有账号 inFlight 永久占满 → no_healthy_account。 */
+  private static readonly ACQUIRE_TTL_MS = 10 * 60_000;
+
   private async pickOne(
     realm: string,
     model: string | undefined,
@@ -126,6 +131,17 @@ export class PoolDO {
   ): Promise<{ uid: string; explored: boolean; fallback: boolean; fallbackKind: string } | null> {
     const accs = this._cache ?? [];
     for (const a of accs) this.prune(a, now);
+
+    // 超时回收：acquire 后长时间未 release 的在途占用强制清零（见 ACQUIRE_TTL_MS 说明）。
+    const recycled: AccountState[] = [];
+    for (const a of accs) {
+      if (a.inFlight > 0 && a.acquiredAt && now - a.acquiredAt > PoolDO.ACQUIRE_TTL_MS) {
+        a.inFlight = 0;
+        a.acquiredAt = 0;
+        recycled.push(a);
+      }
+    }
+    for (const a of recycled) await this.putAcct(a);
 
     const exploreLast = (await this.ctx.storage.get<Record<string, number>>(EXPLORE_KEY)) ?? {};
     const modelRateOf = await rateLookup(this.env);
@@ -167,6 +183,54 @@ export class PoolDO {
       if (a.status !== "disabled" && coreHealthy(a, now)) out[r].healthy++;
     }
     return out;
+  }
+
+  /**
+   * diagnose 逐账号列出「为什么不可选」，用于 no_healthy_account 时一锤定音。
+   * 若 sample 里出现 realize="pickable_but_unselected"，说明兜底逻辑本身有 bug
+   * （本应可选却没被选上）；若 total=0，说明 DO 里根本没加载到账号（绑定/加载问题）。
+   */
+  private async diagnose(
+    now: number,
+    realm: string,
+    model: string | undefined,
+    cfg: Config,
+  ): Promise<{ total: number; by_reason: Record<string, number>; sample: Array<Record<string, unknown>> }> {
+    const pcfg = await this.pickCfg(cfg);
+    const modelRateOf = await rateLookup(this.env);
+    const byReason: Record<string, number> = {};
+    const sample: Array<Record<string, unknown>> = [];
+    const pushReason = (r: string) => {
+      byReason[r] = (byReason[r] ?? 0) + 1;
+    };
+    for (const a of this._cache ?? []) {
+      const reasons: string[] = [];
+      if (realm && a.realm !== realm) reasons.push("realm_mismatch");
+      if (a.status === "disabled") reasons.push("disabled");
+      if (a.cooldownUntil > now) reasons.push("cooled");
+      if ((a.breakerUntil ?? 0) > now) reasons.push("breaker");
+      if ((a.degradeUntil ?? 0) > now) reasons.push("degraded");
+      if (hardCooled(a, now)) reasons.push("hard_cooled");
+      const m = model ?? "";
+      if (m && floorBlocked(a, m, pcfg, now, modelRateOf, realm)) reasons.push("floor_blocked");
+      if (coreInFlightFull(a, pcfg)) reasons.push("in_flight_full");
+      if (reasons.length === 0) reasons.push("pickable_but_unselected");
+      for (const r of reasons) pushReason(r);
+      if (sample.length < 8) {
+        sample.push({
+          uid: a.uid,
+          realm: a.realm,
+          status: a.status,
+          inFlight: a.inFlight,
+          credits: a.credits,
+          cooldownUntil: a.cooldownUntil,
+          breakerUntil: a.breakerUntil ?? 0,
+          degradeUntil: a.degradeUntil ?? 0,
+          reasons,
+        });
+      }
+    }
+    return { total: (this._cache ?? []).length, by_reason: byReason, sample };
   }
 
   /** prune 惰性清理过期的模型级冷却与成本台账条目（对齐 pruneExpiredModelCooldowns/Costs）。 */
@@ -250,7 +314,11 @@ export class PoolDO {
           // 选到的账号用自己的 realm 落到正确上游域。
           const relaxed = await this.pickOne("", model, exclude, now, cfg);
           if (!relaxed) {
-            return json({ error: "no_healthy_account", realm, model: model ?? "", byRealm: this.realmSnapshot(now) }, 503);
+            const diag = await this.diagnose(now, realm, model, cfg);
+            return json(
+              { error: "no_healthy_account", realm, model: model ?? "", byRealm: this.realmSnapshot(now), diagnose: diag },
+              503,
+            );
           }
           if (stickyKeyName) await bindSticky(this.ctx, stickyKeyName, relaxed.uid, cfg.session_sticky.ttl);
           const ra = await this.getAcct(relaxed.uid);
@@ -277,6 +345,7 @@ export class PoolDO {
         const a = await this.getAcct(body.uid);
         if (!a) return notFound();
         a.inFlight++;
+        a.acquiredAt = now;
         await this.putAcct(a);
         return json({ ok: true, inFlight: a.inFlight });
       }
@@ -285,6 +354,7 @@ export class PoolDO {
         const a = await this.getAcct(body.uid);
         if (!a) return notFound();
         a.inFlight = Math.max(0, a.inFlight - 1);
+        if (a.inFlight === 0) a.acquiredAt = 0;
         await this.putAcct(a);
         return json({ ok: true, inFlight: a.inFlight });
       }

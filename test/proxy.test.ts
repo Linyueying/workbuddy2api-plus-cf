@@ -17,11 +17,13 @@ function makeAuth(uid: string): Auth {
 }
 
 function fakeEnv(auth: Auth) {
+  let releaseCount = 0;
   const poolStub = {
     async fetch(req: Request) {
       const url = new URL(req.url);
       const p = url.pathname;
       if (p === "/internal/pick") return new Response(JSON.stringify({ uid: auth.uid, auth }), { status: 200, headers: { "content-type": "application/json" } });
+      if (p === "/internal/release") releaseCount++;
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
     },
   };
@@ -56,6 +58,7 @@ function fakeEnv(auth: Auth) {
     WB2A_DB: fakeDB,
     WB2A_LOGS: {},
     writes: sqlWrites,
+    releaseCount: () => releaseCount,
   } as any;
   return env;
 }
@@ -301,6 +304,15 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     // 非流式不需要回填
     expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
+
+  it("流式请求结束后必须 release（回归：此前只 acquire 从不 release → inFlight 泄漏 → 全账号占满 → no_healthy_account）", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    await res.text(); // 完整读完流才会触发 onEnd → release
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.releaseCount()).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe("proxyChat / 选号失败分类", () => {
@@ -329,20 +341,26 @@ describe("proxyChat / 选号失败分类", () => {
     expect(j.error.gateway_hint).toContain("Durable Object 绑定");
   });
 
-  it("DO 返回 no_healthy_account(503) → 还原为 'no healthy account available'，不被误判 unreachable", async () => {
+  it("DO 返回 no_healthy_account(503) → 还原为 'no healthy account available'，且带上诊断", async () => {
     const env = envWithPoolFetch(async () =>
-      new Response(JSON.stringify({ error: "no_healthy_account", realm: "cn", byRealm: { cn: { total: 0, healthy: 0 } } }), {
-        status: 503,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          error: "no_healthy_account",
+          realm: "cn",
+          byRealm: { cn: { total: 0, healthy: 0 } },
+          diagnose: { total: 0, by_reason: {}, sample: [] },
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      ),
     );
     const res = await proxyChat(env, req, "cn:hy3", body, "0.0.0.0", "");
     expect(res.status).toBe(503);
     const j = await res.json();
-    expect(j.error.message).toBe("no healthy account available");
+    expect(j.error.message).toContain("no healthy account available");
     expect(j.error.code).toBe("no_healthy_account");
-    // 还原到的 byRealm 分布应当透传给 hint（便于用户判断是真没号还是 realm 不对）
-    expect(j.error.gateway_hint).toContain("byRealm");
+    // 诊断信息应透传：message 含 reasons 摘要，hint 含「各不可选原因」明细
+    expect(j.error.message).toContain("reasons=");
+    expect(j.error.gateway_hint).toContain("各不可选原因");
   });
 
   it("DO 返回其它错误(500) → 'account pool DO error (HTTP 500)'", async () => {

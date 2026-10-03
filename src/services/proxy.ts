@@ -211,7 +211,7 @@ export async function proxyChat(
         message: unreachable
           ? `account pool unreachable (PoolDO RPC failed)${pickErr ? ` — ${pickErr}` : ""}`
           : pick.error === "no_healthy_account"
-            ? "no healthy account available"
+            ? `no healthy account available | total=${pick.diagnose?.total ?? "?"} reasons=${JSON.stringify(pick.diagnose?.by_reason ?? {})}`
             : `account pool DO error (HTTP ${pickStatus})${pickErr ? ` — ${pickErr}` : ""}`,
         note: "none",
         passthrough: false,
@@ -220,8 +220,7 @@ export async function proxyChat(
           ? "Pages 调不动 PoolDO（传输层失败）：检查 Pages 项目是否绑定 engine 的 POOL（Dashboard → Pages → Settings → Functions → Durable Object 绑定（bindings）→ 新增 POOL，class=PoolDO，script_name=workbuddy2api-engine），且 engine Worker 已部署、未报错。" +
             (pickErr ? ` | ${pickErr}` : "")
           : pick.error === "no_healthy_account"
-            ? `请求 realm=${realm}。DO 账号分布=${JSON.stringify(pick.byRealm ?? {})}（若账号都在另一 realm，已自动放宽选号；若 total=0 说明 POOL 里根本没账号，去面板添加）。` +
-              (pickErr ? ` | ${pickErr}` : "")
+            ? `请求 realm=${realm}。DO 账号总数=${pick.diagnose?.total ?? "?"}。各不可选原因=${JSON.stringify(pick.diagnose?.by_reason ?? {})}。明细=${JSON.stringify(pick.diagnose?.sample ?? [])}`
             : `PoolDO 自身返回了错误（HTTP ${pickStatus}）。${pickErr ?? ""}`,
       };
       break;
@@ -284,13 +283,25 @@ export async function proxyChat(
         // 拿返回 id 是为了回填用量：流式的 usage 在末帧，必须等流走完才知道，
         // 但日志又得在开局就落一行（客户端中途断开也要有记录），故「占位 + UPDATE」。
         const logId = await log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
+        // 在途回收双保险：流式请求此前只 acquire 从不 release，inFlight 只增不减，
+        // 几次请求后所有账号在途占满 → inFlightFull → no_healthy_account（真机「之前能用、
+        // 用着用着全空」的根因）。正常结束走 onEnd；客户端中途断连时 streamChat 的
+        // tap.flush 不触发，改由 request.signal 兜底。released 标志避免双重回收。
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          void poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
+        };
         const res = streamChat(up, request, {
           onEnd: (usage) => {
             void recordCost(env, uid, bareModel, usage);
             void backfillUsage(env, logId, usage);
             if (keyRow) void consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0));
+            release();
           },
         });
+        request.signal.addEventListener("abort", release);
         if (routed) res.headers.set("X-WB2A-Routed-Model", chain[ci]);
         return res;
       }

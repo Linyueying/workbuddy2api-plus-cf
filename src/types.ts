@@ -64,6 +64,8 @@ export interface AccountState {
   disabledReason: string;
   /** 在途请求数（max_in_flight 上限判定）。 */
   inFlight: number;
+  /** 最近一次 acquire 的墙钟时间戳；用于超时自动回收在途占用（避免泄漏占满账号池）。 */
+  acquiredAt?: number;
   /** 最近一次选中使用（idleWeight 计算）。 */
   lastUsed: number;
   /** 最近一次成功时刻。 */
