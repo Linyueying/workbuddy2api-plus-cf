@@ -293,10 +293,18 @@ export async function proxyChat(
           released = true;
           void poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
         };
+        // 诊断：把上游真实返回的 usage 原文暂存，随回填一起写进日志 msg，
+        // 便于面板日志页直接看到「上游到底回了什么 usage」（token 恒 0 时最关键）。
+        let rawUsage: string | undefined;
         const res = streamChat(up, request, {
+          onUsageRaw: (raw) => {
+            rawUsage = raw;
+          },
           onEnd: (usage) => {
             void recordCost(env, uid, bareModel, usage);
-            void backfillUsage(env, logId, usage);
+            // 上游若整条流都没给 usage，rawUsage 为空——写明确标记，便于区分
+            // 「上游没回 usage」与「解析器认不出字段」这两种完全不同的原因。
+            void backfillUsage(env, logId, usage, rawUsage ?? (usage ? undefined : "上游流内无 usage 帧"));
             if (keyRow) void consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0));
             release();
           },
@@ -401,9 +409,11 @@ export function parseRateReset(body: string): number {
 }
 
 /** dryUsage 把上游 usage 收敛成用量列。 Streaming 的 usage 字段名各家不统一：
- *  prompt/completion 用 prompt_tokens/completion_tokens（OpenAI 口径），缓存读
- *  命中则可能叫 prompt_tokens_details.cached_tokens 或 cache_read_input_tokens
- *  ——取不到就当 0，不强凑。 */
+ *  OpenAI 用 prompt_tokens/completion_tokens/total_tokens，Anthropic 风格用
+ *  input_tokens/output_tokens——上游（workbuddy.ai）实测两类都可能出现，故全兼容；
+ *  缓存读命中可能叫 prompt_tokens_details.cached_tokens 或 cache_read_input_tokens。
+ *  若上游不给 prompt/completion 拆分（只给 total_tokens），则把总量记到 prompt 侧，
+ *  保证「合计」不为 0（宁可少拆分，也不要让面板显示全 0）。 */
 export function dryUsage(usage: Usage | null | undefined): {
   prompt_tokens: number;
   completion_tokens: number;
@@ -411,19 +421,29 @@ export function dryUsage(usage: Usage | null | undefined): {
   cache_read_tokens: number;
 } {
   const u = usage as any;
-  const cached = Number(u?.prompt_tokens_details?.cached_tokens ?? u?.cache_read_input_tokens ?? 0);
+  const cached = Number(u?.prompt_tokens_details?.cached_tokens ?? u?.cache_read_input_tokens ?? u?.cache_creation_input_tokens ?? 0);
+  let prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0) || 0;
+  let completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0) || 0;
+  const total = Number(u?.total_tokens ?? 0) || 0;
+  // 兜底：上游只给 total_tokens、没给拆分 → 记到 prompt 侧，至少合计不为 0。
+  if (prompt === 0 && completion === 0 && total > 0) prompt = total;
+  // 反向兜底：给了拆分但没给 total 时，补一个（成本台账/前端「合计」用得到）。
+  if (completion === 0 && total > prompt && prompt > 0) completion = total - prompt;
   return {
-    prompt_tokens: Math.max(0, Number(u?.prompt_tokens ?? 0) || 0),
-    completion_tokens: Math.max(0, Number(u?.completion_tokens ?? 0) || 0),
+    prompt_tokens: Math.max(0, prompt),
+    completion_tokens: Math.max(0, completion),
     credits: Math.max(0, Number(u?.credit ?? 0) || 0),
     cache_read_tokens: Number.isFinite(cached) ? Math.max(0, cached) : 0,
   };
 }
 
-/** backfillUsage 把流式末帧的用量回填到开局那行占位日志。 */
-async function backfillUsage(env: Env, id: number, usage: Usage | null): Promise<void> {
-  if (!id || !usage) return;
-  await updateRequestLogUsage(env, id, dryUsage(usage)).catch(() => {});
+/** backfillUsage 把流式末帧的用量回填到开局那行占位日志。
+ *  rawUsage 为上游原始 usage 文本或诊断标记，写进 msg 供排查（可为空）。 */
+async function backfillUsage(env: Env, id: number, usage: Usage | null, rawUsage?: string): Promise<void> {
+  if (!id) return;
+  // usage 缺失但带了诊断标记时也要写（否则「上游无 usage」这种关键信息会丢）。
+  if (!usage && !rawUsage) return;
+  await updateRequestLogUsage(env, id, dryUsage(usage), rawUsage).catch(() => {});
 }
 
 /**

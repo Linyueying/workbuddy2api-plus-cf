@@ -214,4 +214,25 @@ describe("dryUsage 字段收敛", () => {
       for (const v of Object.values(d)) expect(Number.isNaN(v)).toBe(false);
     }
   });
+
+  it("Anthropic 风格 input/output_tokens 也能识别（上游字段名不统一）", () => {
+    expect(dryUsage({ input_tokens: 30, output_tokens: 12, credit: 2 } as any)).toEqual({
+      prompt_tokens: 30, completion_tokens: 12, credits: 2, cache_read_tokens: 0,
+    });
+  });
+
+  it("上游只给 total_tokens 不给拆分 → 兜底记到 prompt 侧，合计不为 0", () => {
+    // 回归：真机「有日志但 prompt/completion 全 0」。上游若只回 total_tokens，
+    // 旧实现会全丢，面板显示 0。
+    const d = dryUsage({ total_tokens: 150, credit: 1 } as any);
+    expect(d.prompt_tokens).toBe(150);
+    expect(d.completion_tokens).toBe(0);
+    expect(d.credits).toBe(1);
+  });
+
+  it("给了 prompt/total 缺 completion → 用 total 反推补齐", () => {
+    const d = dryUsage({ prompt_tokens: 100, total_tokens: 150 } as any);
+    expect(d.prompt_tokens).toBe(100);
+    expect(d.completion_tokens).toBe(50);
+  });
 });

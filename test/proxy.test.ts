@@ -283,8 +283,11 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
 
     const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
     expect(upd).toBeTruthy();
-    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, id
-    expect(upd!.params).toEqual([100, 50, 1.5, 0, 42]);
+    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, msg, id
+    // msg 记录上游原始 usage（诊断用，便于面板看到上游到底回了什么）。
+    expect(upd!.params.slice(0, 4)).toEqual([100, 50, 1.5, 0]);
+    expect(String(upd!.params[4])).toContain("usage=");
+    expect(upd!.params[5]).toBe(42);
   });
 
   it("非流式也写且只写一条：token/credit 随 INSERT 一次落清，无需回填", async () => {

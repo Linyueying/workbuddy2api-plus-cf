@@ -55,6 +55,9 @@ export interface Usage {
   total_tokens?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  /** Anthropic 风格字段名（上游可能用这套）。 */
+  input_tokens?: number;
+  output_tokens?: number;
 }
 
 /** extractUsage 从一条 SSE 事件文本里取 usage（无则 null）。 */
@@ -73,6 +76,27 @@ export function extractUsage(evt: string): Usage | null {
 export interface StreamOpts {
   /** 流结束（正常或异常）回调，收到末帧捕获的 usage，用于成本台账记账。 */
   onEnd?: (usage: Usage | null) => void;
+  /**
+   * onUsageRaw 调试用：收到任意一帧原始 usage（JSON 文本）时回调，便于在日志里
+   * 记录上游真实返回的 usage 结构（排查「有日志但 token 全 0」时最关键的一环）。
+   */
+  onUsageRaw?: (raw: string) => void;
+}
+
+/** hasTokens usage 是否带真实 token 字段（用于跳过空对象 {} / 占位帧）。 */
+function hasTokens(u: any): boolean {
+  if (!u || typeof u !== "object") return false;
+  const n = (v: any) => Number(v) > 0;
+  return (
+    n(u.prompt_tokens) ||
+    n(u.completion_tokens) ||
+    n(u.total_tokens) ||
+    n(u.input_tokens) ||
+    n(u.output_tokens) ||
+    n(u.credit) ||
+    n(u.cache_read_input_tokens) ||
+    n(u.prompt_tokens_details?.cached_tokens)
+  );
 }
 
 /** 逐块规范化透传上游 SSE；客户端断开清理上游；旁路捕获 usage 供成本记账。 */
@@ -84,16 +108,19 @@ export function streamChat(upstreamRes: Response, request: Request, opts: Stream
   const tap = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       controller.enqueue(chunk);
-      if (usage) return;
       tail += decode(chunk);
       const parts = tail.split(/\n\n/);
       tail = parts.pop() ?? "";
       for (const p of parts) {
         const u = extractUsage(p);
-        if (u) {
-          usage = u;
-          return;
-        }
+        if (!u) continue;
+        // 记录原始 usage 文本（调试：面板日志 msg 里能看到上游到底回了什么）。
+        if (hasTokens(u)) opts.onUsageRaw?.(JSON.stringify(u));
+        // ⚠️ 取「最后一个带真实 token 的 usage」，而不是第一个：上游可能在中途帧
+        // 先给一个全 0 / 空的 usage（如首帧快照），旧实现 `if (usage) return` 会
+        // 让首个空对象把真正的末帧 usage 挡在外面 → token 恒为 0。
+        if (hasTokens(u)) usage = u;
+        else if (!usage) usage = u; // 全是空对象时至少留个占位，flush 再兜底
       }
     },
     flush() {

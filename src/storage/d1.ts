@@ -265,18 +265,20 @@ export interface UsagePatch {
   cache_read_tokens?: number;
 }
 
-/** updateRequestLogUsage 把末帧用量回填到流式开始时的占位日志行。 */
-export async function updateRequestLogUsage(env: Env, id: number, u: UsagePatch): Promise<void> {
+/** updateRequestLogUsage 把末帧用量回填到流式开始时的占位日志行。
+ *  rawUsage 为上游原始 usage 文本，写进 msg 供排查（可为空）。 */
+export async function updateRequestLogUsage(env: Env, id: number, u: UsagePatch, rawUsage?: string): Promise<void> {
   if (!id) return;
   await run(
     env,
-    `UPDATE request_logs SET prompt_tokens = ?, completion_tokens = ?, credits = ?, cache_read_tokens = ?
+    `UPDATE request_logs SET prompt_tokens = ?, completion_tokens = ?, credits = ?, cache_read_tokens = ?, msg = ?
      WHERE id = ?`,
     [
       Number(u.prompt_tokens ?? 0) || 0,
       Number(u.completion_tokens ?? 0) || 0,
       Number(u.credits ?? 0) || 0,
       Number(u.cache_read_tokens ?? 0) || 0,
+      rawUsage ? `usage=${rawUsage.slice(0, 400)}` : null,
       id,
     ],
   );
