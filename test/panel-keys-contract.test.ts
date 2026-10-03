@@ -58,4 +58,22 @@ describe("密钥明文契约（静态守卫）", () => {
     expect(resetBody, "/reset 不得调用 genKey（轮换请走 /rotate）").not.toMatch(/genKey\s*\(/);
     expect(resetBody, "/reset 必须是清零已用额度").toMatch(/used_tokens\s*=\s*0/);
   });
+
+  it("前端对单个密钥的改动只能走 PATCH（后端没注册 POST /keys/:id，发 POST 就是 404）", () => {
+    // 2026-10 事故：编辑弹窗保存发的是 POST keys/<id>，面板报「保存失败: 404」，
+    // 但创建（POST /keys）、reset、rotate 三个 POST 是真实存在的端点，不能误伤。
+    const posts = appJs.match(/keysApi\(\s*'keys\/[^)]*'POST'/g) ?? [];
+    const allowed = posts.filter((s) => /\/(reset|rotate|check-models)'/.test(s));
+    expect(allowed.length, "keys/:id 上的 POST 只允许 reset / rotate 这两个既有子端点").toBe(posts.length);
+    // 编辑保存与停用/启用开关都必须是 PATCH
+    expect(appJs).toMatch(/keysApi\('keys\/' \+ k\.id, 'PATCH'/);
+    expect(appJs).toMatch(/keysApi\('keys\/' \+ id, 'PATCH', \{ enabled/);
+    // 后端守卫：PATCH 路由必须继续存在
+    expect(panelSrc).toContain('app.patch("/panel/api/keys/:id"');
+  });
+
+  it("expires_at 必须传毫秒时间戳——后端 Number() 直收，传 ISO 字符串会静默归零成永久有效", () => {
+    expect(appJs).not.toMatch(/expires_at\s*=[^;]*toISOString/);
+    expect(appJs).toMatch(/body\.expires_at = Date\.now\(\) \+ days \* 86400000/);
+  });
 });

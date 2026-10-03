@@ -2803,7 +2803,7 @@ async function keyAct(act, id) {
     else if (act === 'toggle') {
       const r = await keysApi('keys');
       const cur = (r.keys || []).find(x => x.id === id);
-      await keysApi('keys/' + id, 'POST', { enabled: !cur.enabled });
+      await keysApi('keys/' + id, 'PATCH', { enabled: !cur.enabled });
     } else if (act === 'edit') {
       const r = await keysApi('keys');
       const cur = (r.keys || []).find(x => x.id === id);
@@ -2881,12 +2881,12 @@ $('btnKfSave').onclick = async () => {
   // 新建：填了天数才设过期（0 = 长期有效）
   // 编辑：按显式选择处理，避免「打开就保存」把有效期重置；never 传 null
   if (!k) {
-    if (days > 0) body.expires_at = new Date(Date.now() + days * 86400000).toISOString();
+    if (days > 0) body.expires_at = Date.now() + days * 86400000; // 后端按毫秒时间戳存取，传 ISO 会被 Number() 归零
   } else {
     const mode = $('kfExpMode').value;
     if (mode === 'days') {
       if (days <= 0) { kfError('选择了「自当前时间起 N 天」，请填写有效天数', 'kfDays'); return; }
-      body.expires_at = new Date(Date.now() + days * 86400000).toISOString();
+      body.expires_at = Date.now() + days * 86400000;
     } else if (mode === 'never') {
       body.expires_at = null;
     }
@@ -2894,7 +2894,7 @@ $('btnKfSave').onclick = async () => {
   $('btnKfSave').disabled = true;
   try {
     if (k) {
-      await keysApi('keys/' + k.id, 'POST', body);
+      await keysApi('keys/' + k.id, 'PATCH', body);
       closeKeyForm();
       loadKeys();
     } else {
