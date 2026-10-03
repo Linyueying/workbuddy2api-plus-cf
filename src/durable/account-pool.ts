@@ -816,9 +816,14 @@ function isModelRateLimit(body: string): boolean {
 }
 
 function next4AMChina(now: number): number {
-  const d = new Date(now + 8 * 3600_000); // 转 UTC+8 本地
+  // now+8h 是「把北京时间当 UTC 看」的伪时间，全程必须用它比较，
+  // 不能拿它和真实 epoch 的 now 比（差 8 小时）——否则每天北京 04:00 之后
+  // 判定为「未过今日 4 点」而不再 +1 天，差值变负、被 Math.max(0,…) 吃成 0，
+  // 硬积分耗尽冷却彻底失效（账号不冷却、持续被选中）。
+  const shifted = now + 8 * 3600_000;
+  const d = new Date(shifted);
   d.setUTCHours(4, 0, 0, 0);
-  if (d.getTime() <= now) d.setUTCDate(d.getUTCDate() + 1);
+  if (d.getTime() <= shifted) d.setUTCDate(d.getUTCDate() + 1);
   return d.getTime() - 8 * 3600_000;
 }
 

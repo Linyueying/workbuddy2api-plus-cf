@@ -158,7 +158,10 @@ export const DEFAULT_CONFIG: Config = {
     timeout_seconds: 120,
     header_timeout_seconds: 30,
     idle_timeout_seconds: 60,
-    user_agent: "WorkBuddy/2.0.0 CLI/2.0.0",
+    // 对齐原版 converter._KIND_UA["workbuddy"] 的真实客户端 UA 口径。
+    // 原版注释明确：自造 UA（如 WorkBuddy/2.0.0 CLI/2.0.0）属「画像不自洽」，
+    // 是风控网关的拒单依据之一。可用 WB2A_USER_AGENT 覆盖。
+    user_agent: "CLI/5.3.14 WorkBuddy/5.3.14",
     client_version: "2.0.0",
     cli_version: "2.0.0",
     client_name: "workbuddy2api",

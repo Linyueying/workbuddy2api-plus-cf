@@ -536,17 +536,14 @@ export async function postBillingResource(
     //   2) Origin / Referer / X-Requested-With（Go commonHeaders）——登录链路
     //      当初就是缺 Origin 直接 4xx，账单域同一套网关，同样校验。Origin 取
     //      账单域自身，同域，不会触发跨域拒绝。
+    const h = billingHeaders(auth, env, {
+      Accept: "application/json",
+      Origin: base.billing,
+      Referer: base.billing + "/",
+      "X-Requested-With": "XMLHttpRequest",
+    });
     const res = await withTimeout(
-      new Request(base.billing + p, {
-        method: "POST",
-        headers: billingHeaders(auth, env, {
-          Accept: "application/json",
-          Origin: base.billing,
-          Referer: base.billing + "/",
-          "X-Requested-With": "XMLHttpRequest",
-        }),
-        body,
-      }),
+      new Request(base.billing + p, { method: "POST", headers: h, body }),
       timeout,
     );
     if (res.ok) {
@@ -579,10 +576,29 @@ export async function postBillingResource(
     res.headers.forEach((v, k) => rh.push(`${k}=${v}`.slice(0, 60)));
     const tok = String(auth.accessToken ?? "");
     err.respHeaders = rh.slice(0, 8);
+    // 把「实际送出了哪些头」打全：区分「头缺失」与「头有但被拒」的分水岭。
+    // 值只打长度/前缀，不落明文（含 token 与 uid）。
+    const probe = (k: string) => {
+      const v = h.get(k);
+      return `${k}=${v === null ? "缺失" : v === "" ? "空" : `${String(v).length}位/${String(v).slice(0, 4)}…`}`;
+    };
+    const sent = [
+      probe("X-User-Id"),
+      probe("X-Enterprise-Id"),
+      probe("X-Domain"),
+      probe("X-Machine-ID"),
+      probe("X-Session-ID"),
+      probe("X-Request-ID"),
+      probe("Origin"),
+      probe("Referer"),
+      probe("User-Agent"),
+    ].join(", ");
     err.diag =
+      `base=${base.billing} path=${p} ` +
       `token=${tok.length}位/${tok.slice(0, 6)}… ` +
       `ua=${String(getConfigCached(env).upstream.user_agent ?? "").slice(0, 40)} ` +
       `hasDeviceToken=${Boolean(auth.device_token || getConfigCached(env).upstream.device_token)} ` +
+      `sent=[${sent}] ` +
       `respHeaders=[${rh.slice(0, 8).join("; ")}]`;
     console.error(
       `[${tag}] 上游拒绝 uid=${auth.uid} realm=${auth.realm} base=${base.billing} ` +
