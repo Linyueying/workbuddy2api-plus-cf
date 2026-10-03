@@ -293,7 +293,11 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
 
     const snap = await getUsage(c.env, { from: fromMs, to: toMs, nicknames }).catch(() => null);
     if (!snap) return c.json({ ok: false, buckets: 0, totals: {}, series: [], by_account: [], by_model: [], by_realm: [], credit_by_account: [], credit_by_model: [] });
-    return c.json({ ok: true, ...snap });
+    // raw_latest：最近 5 条日志的原始行（含 msg 里的上游 usage 原文）。
+    // 用途单一——当 token 全 0 时，用户能一眼看到「库里到底存了什么」，
+    // 区分「上游没回 usage」与「回了解析/写库失败」，不必再靠猜。
+    const rawLatest = await queryRequestLogs(c.env, { limit: 5, from: fromMs, to: toMs }).catch(() => []);
+    return c.json({ ok: true, ...snap, raw_latest: rawLatest });
   });
   app.post("/panel/api/usage/save", async (c) => {
     return c.json({ ok: true });

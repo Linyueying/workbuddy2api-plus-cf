@@ -1776,9 +1776,34 @@ function usStat(v, k, cls) {
          '</div><div class="k">' + esc(k) + '</div></div>';
 }
 
-/* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
-   放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
-function usKpi(v, k, cls, sub, bar) {
+/* renderUsageDiag 用量诊断块：仅当「有请求但 token 全 0」时显示库内原始记录。
+   目的单一——让用户一眼看出 token 为 0 是「上游没回 usage」还是「写库失败」，
+   而不是只能看到一片 0 去猜。raw_latest 由 /panel/api/usage 附带返回。 */
+function renderUsageDiag(d) {
+  const box = $('usDiagBox');
+  const body = $('usDiagBody');
+  if (!box || !body) return;
+  const rows = (d && d.raw_latest) || [];
+  const t = (d && d.totals) || {};
+  const totalTok = Number(t.total_tokens || 0);
+  // 只在这种「矛盾」场景显示：有请求、但一个 token 都没统计到。
+  const suspicious = rows.length > 0 && totalTok === 0;
+  if (!suspicious) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  body.innerHTML = rows.map(e => {
+    const ts = e && e.ts ? new Date(Number(e.ts)).toLocaleString('zh-CN', { hour12: false }) : '—';
+    const raw = String(e && e.msg || '').trim();
+    return '<tr>' +
+      '<td class="num">' + esc(ts) + '</td>' +
+      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td class="num">' + esc(String(Number(e && e.prompt_tokens || 0))) + '</td>' +
+      '<td class="num">' + esc(String(Number(e && e.completion_tokens || 0))) + '</td>' +
+      '<td class="num">' + esc(String(Number(e && e.credits || 0))) + '</td>' +
+      '<td class="clip" title="' + esc(raw) + '">' + esc(raw || '（无原始 usage；可能是修复前的旧记录）') + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
   return '<div class="kpi ' + (cls || '') + '">' +
     '<div class="k">' + esc(k) + '</div>' +
     '<div class="v">' + esc(v) + '</div>' +
@@ -1994,6 +2019,8 @@ function renderUsage(d) {
     (usageData.file_bytes ? ' · 文件 ' + (usageData.file_bytes / 1024).toFixed(1) + ' KB' : '');
   $('usNote').textContent = note;
   $('usNote').title = note; // 窄屏单行截断时靠悬停看全
+
+  renderUsageDiag(usageData);
 
   // 积分扣除的四张卡片与说明。
   $('usCreditStats').innerHTML =

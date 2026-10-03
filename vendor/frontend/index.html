@@ -826,6 +826,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
+      <div class="box" id="usDiagBox" style="display:none">
+        <header>
+          <h3>用量诊断</h3>
+          <span class="grow"></span>
+          <span class="note">有请求但 token 全 0 时显示：库内最近几条原始记录</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead><tr><th>时间</th><th>模型</th><th>输入</th><th>输出</th><th>积分</th><th>原始 usage / 备注</th></tr></thead>
+            <tbody id="usDiagBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>积分扣除历史</h3>
