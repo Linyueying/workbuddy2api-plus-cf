@@ -302,3 +302,59 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 });
+
+describe("proxyChat / 选号失败分类", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // 用一个可定制的 POOL.fetch 覆盖默认成功实现。
+  function envWithPoolFetch(poolFetch: (req: Request) => Promise<Response>) {
+    const env = fakeEnv(makeAuth("u1"));
+    (env as any).POOL = { get: () => ({ fetch: poolFetch }), idFromName: () => ({}) } as any;
+    return env;
+  }
+
+  const body = { model: "cn:hy3", stream: false, messages: [{ role: "user", content: "hi" }] };
+  const req = new Request("https://x/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  it("POOL 传输层连不上 → 'account pool unreachable' 且 hint 指向绑定", async () => {
+    const env = envWithPoolFetch(async () => { throw new Error("Cannot read properties of undefined (reading 'get')"); });
+    const res = await proxyChat(env, req, "cn:hy3", body, "0.0.0.0", "");
+    expect(res.status).toBe(503);
+    const j = await res.json();
+    expect(j.error.message).toContain("account pool unreachable");
+    expect(j.error.gateway_hint).toContain("Durable Object 绑定");
+  });
+
+  it("DO 返回 no_healthy_account(503) → 还原为 'no healthy account available'，不被误判 unreachable", async () => {
+    const env = envWithPoolFetch(async () =>
+      new Response(JSON.stringify({ error: "no_healthy_account", realm: "cn", byRealm: { cn: { total: 0, healthy: 0 } } }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const res = await proxyChat(env, req, "cn:hy3", body, "0.0.0.0", "");
+    expect(res.status).toBe(503);
+    const j = await res.json();
+    expect(j.error.message).toBe("no healthy account available");
+    expect(j.error.code).toBe("no_healthy_account");
+    // 还原到的 byRealm 分布应当透传给 hint（便于用户判断是真没号还是 realm 不对）
+    expect(j.error.gateway_hint).toContain("byRealm");
+  });
+
+  it("DO 返回其它错误(500) → 'account pool DO error (HTTP 500)'", async () => {
+    const env = envWithPoolFetch(async () =>
+      new Response(JSON.stringify({ error: "internal", msg: "boom" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const res = await proxyChat(env, req, "cn:hy3", body, "0.0.0.0", "");
+    expect(res.status).toBe(500);
+    const j = await res.json();
+    expect(j.error.message).toContain("account pool DO error (HTTP 500)");
+  });
+});

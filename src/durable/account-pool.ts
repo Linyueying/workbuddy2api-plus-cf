@@ -889,6 +889,13 @@ export async function poolRPC(env: Env, path: string, method = "GET", body?: unk
   });
   const res = await stub.fetch(req);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(JSON.stringify(data));
+  if (!res.ok) {
+    // 把 DO 的真实状态码挂到错误上，让调用方区分「传输层连不上」与「DO 返回了错误」。
+    // 否则 no_healthy_account(503) 会被 poolRPC 的 throw 吞掉、被 proxy 误判成 pool_unavailable，
+    // 把「没账号」伪装成「池连不上」，排查时完全误导。
+    const err: any = new Error(JSON.stringify(data));
+    err.poolStatus = res.status;
+    throw err;
+  }
   return data;
 }

@@ -182,30 +182,47 @@ export async function proxyChat(
 
     let pick: any;
     let pickErr: string | undefined;
+    let pickStatus: number | undefined;
     try {
       pick = await poolRPC(env, "/internal/pick", "POST", { realm, model: bareModel, exclude: tried, stickyKey: sticky });
-    } catch (e) {
-      pick = { error: "pool_unavailable" };
-      pickErr = String((e as any)?.message ?? e);
+    } catch (e: any) {
+      pickErr = String(e?.message ?? e);
+      pickStatus = e?.poolStatus;
+      // 还原 DO 真实返回的错误（如 no_healthy_account + byRealm 分布），不让它
+      // 被「poolRPC 抛异常」这件事掩盖成 pool_unavailable。
+      let parsed: any = {};
+      try { parsed = JSON.parse(e?.message ?? "{}"); } catch {}
+      if (pickStatus !== undefined && parsed?.error) pick = { error: parsed.error, ...parsed };
+      else pick = { error: "pool_unavailable" };
     }
-    if (pick.error === "no_healthy_account" || pick.error === "pool_unavailable") {
-      // 该模型在池里已无可用账号：换号已穷尽，有候选就降级换模型。
+    if (pick.error) {
+      // 该模型在池里已无可用账号（或 DO 直接报错）：换号已穷尽才降级换模型。
       if (Fallbackable(autoCfg, NO_HEALTHY_ACCOUNT) && advance()) continue;
+      // 区分三类故障：
+      //   pool_unavailable      → 传输层连不上（POOL 未绑 / engine 未部署）
+      //   no_healthy_account    → DO 正常响应，但本模型确实无健康账号（附 byRealm 分布）
+      //   其它错误码（含 500）  → DO 自身报错，原样回传 HTTP 状态
       const unreachable = pick.error === "pool_unavailable";
       lastErr = {
         kind: "ErrClient",
         kindName: NO_HEALTHY_ACCOUNT,
-        status: 503,
-        code: unreachable ? "pool_unavailable" : "no_healthy_account",
-        message: unreachable ? "account pool unreachable (PoolDO RPC failed)" : "no healthy account available",
+        status: unreachable ? 503 : pickStatus ?? 503,
+        code: unreachable ? "pool_unavailable" : pick.error,
+        message: unreachable
+          ? `account pool unreachable (PoolDO RPC failed)${pickErr ? ` — ${pickErr}` : ""}`
+          : pick.error === "no_healthy_account"
+            ? "no healthy account available"
+            : `account pool DO error (HTTP ${pickStatus})${pickErr ? ` — ${pickErr}` : ""}`,
         note: "none",
         passthrough: false,
         rotate: false,
         hint: unreachable
-          ? "Pages 调不动 PoolDO：检查 Pages 项目是否绑定 engine 的 POOL（script_name=workbuddy2api-engine），且 engine 已部署、未报错。" +
+          ? "Pages 调不动 PoolDO（传输层失败）：检查 Pages 项目是否绑定 engine 的 POOL（Dashboard → Pages → Settings → Functions → Durable Object 绑定（bindings）→ 新增 POOL，class=PoolDO，script_name=workbuddy2api-engine），且 engine Worker 已部署、未报错。" +
             (pickErr ? ` | ${pickErr}` : "")
-          : `请求 realm=${realm}。DO 账号分布=${JSON.stringify(pick.byRealm ?? {})}（若账号都在另一 realm，已自动放宽选号）` +
-            (pickErr ? ` | ${pickErr}` : ""),
+          : pick.error === "no_healthy_account"
+            ? `请求 realm=${realm}。DO 账号分布=${JSON.stringify(pick.byRealm ?? {})}（若账号都在另一 realm，已自动放宽选号；若 total=0 说明 POOL 里根本没账号，去面板添加）。` +
+              (pickErr ? ` | ${pickErr}` : "")
+            : `PoolDO 自身返回了错误（HTTP ${pickStatus}）。${pickErr ?? ""}`,
       };
       break;
     }

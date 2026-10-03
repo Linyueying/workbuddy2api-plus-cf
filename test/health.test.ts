@@ -56,17 +56,18 @@ function makeEnv(opts: {
 
   const pool = {
     idFromName: (n: string) => n,
-    get: () => {
-      if (poolThrows) throw new Error("do down");
-      return {};
-    },
+    get: () => ({
+      fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    }),
   };
 
   return {
     WB2A_CONFIG: cfgKV,
     WB2A_CACHE: cacheKV,
     WB2A_DB: d1,
-    POOL: pool,
+    // poolThrows 模拟「Pages 项目未绑定 POOL」→ env.POOL 为 undefined，
+    // 触发 health.ts 的 unbound 分支（提示「Durable Object 绑定缺失」）。
+    POOL: poolThrows ? (undefined as unknown as typeof pool) : pool,
   } as unknown as Env;
 }
 
@@ -134,7 +135,7 @@ describe("health /部署自检", () => {
   it("账号池 DO 不可用 → ready:false", async () => {
     const { ready, checks } = await runHealthChecks(makeEnv({ poolThrows: true }));
     expect(ready).toBe(false);
-    expect(byName(checks, "pool_do")?.hint).toContain("migrations");
+    expect(byName(checks, "pool_do")?.hint).toContain("Durable Object 绑定");
   });
 
   it("读配置抛错 → getConfig 回落默认配置，故报「钥匙空」而非 config_readable", async () => {

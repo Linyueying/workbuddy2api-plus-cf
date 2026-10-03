@@ -111,15 +111,26 @@ export async function runHealthChecks(env: Env): Promise<{ ready: boolean; check
     });
   }
 
-  // 4. 账号池：空池不算故障（新部署本来就没有号），但要能连上 DO
+  // 4. 账号池：空池不算故障（新部署本来就没有号），但要真能连上 DO 并拿到响应。
+  //    注意：只调 env.POOL.get(...) 取 stub 不算验证——stub 取到了 DO 也可能 fetch 失败。
+  //    这里直接 fetch /internal/status，能区分「绑定没配」与「engine 没部署/报错」。
   try {
-    await env.POOL.get(env.POOL.idFromName("main"));
+    if (!env.POOL) throw new Error("env.POOL 未绑定（Pages 项目未配置 PoolDO 绑定）");
+    const stub = env.POOL.get(env.POOL.idFromName("main"));
+    const res = await stub.fetch("https://pool/internal/status");
+    if (!res.ok) throw new Error(`POOL DO /internal/status 返回 HTTP ${res.status}`);
     checks.push({ name: "pool_do", ok: true });
   } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    const unbound = /Cannot read|undefined|is not a function|not bound|未绑定/i.test(msg);
     checks.push({
       name: "pool_do",
       ok: false,
-      hint: `账号池 DO 不可用：${String(e?.message ?? e)}（engine worker 的 [[migrations]] 是否用 new_sqlite_classes 注册了 PoolDO？）`,
+      hint:
+        `账号池 DO 不可达：${msg}。` +
+        (unbound
+          ? " 多半是 Pages 项目的 Durable Object 绑定缺失：Cloudflare Dashboard → Pages(workbuddy2api-pages) → Settings → Functions → Durable Object bindings → 新增 POOL（class=PoolDO，script_name=workbuddy2api-engine），保存后重新部署 Pages。"
+          : " 绑定在，但 engine Worker 调不通：确认 workbuddy2api-engine 已部署且无报错（Dashboard → Workers → workbuddy2api-engine → 查看最近一次部署；若失败多半是 wrangler.toml 里 KV/D1 的 id 还是 REPLACE_WITH_* 占位符，需在 Dashboard 对应 Worker 的 Variables 里补齐）。"),
     });
   }
 
