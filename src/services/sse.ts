@@ -9,24 +9,37 @@ function encode(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
+/**
+ * sseSplit 从累积缓冲里按空行切出完整 SSE 事件，返回事件数组与剩余缓冲。
+ * 独立成纯函数：核心切分逻辑可测（沙箱 Node 的 TransformStream 不稳定，
+ * 此前 sseTransform 零覆盖，死循环 bug 直 上生产）。
+ * ⚠️ 每切一个事件都要基于「最新 buf」重新找分隔符——旧实现在循环外算一次
+ * norm 且循环内不更新，while 永远命中第一个 \n\n，同一帧被无限 enqueue，
+ * Worker 内存爆掉被杀，客户端表现为「200 + SSE 头但没有任何回复」。
+ */
+export function sseSplit(buf: string): { events: string[]; rest: string } {
+  const events: string[] = [];
+  for (;;) {
+    const norm = buf.replace(/\r\n/g, "\n"); // 兼容 \r\n\r\n
+    const idx = norm.indexOf("\n\n");
+    if (idx < 0) return { events, rest: norm };
+    events.push(norm.slice(0, idx));
+    buf = norm.slice(idx + 2);
+  }
+}
+
 export function sseTransform(): TransformStream<Uint8Array, Uint8Array> {
   let buf = "";
   let seenDone = false;
   return new TransformStream({
     transform(chunk, controller) {
       buf += decode(chunk);
-      let idx: number;
-      // 以 \n\n 切分事件（兼容 \r\n\r\n）
-      const norm = buf.replace(/\r\n/g, "\n");
-      while ((idx = norm.indexOf("\n\n")) >= 0) {
-        const evt = norm.slice(0, idx);
-        buf = norm.slice(idx + 2);
+      const { events, rest } = sseSplit(buf);
+      buf = rest;
+      for (const evt of events) {
         if (/\[DONE\]/.test(evt)) seenDone = true;
         controller.enqueue(encode(evt + "\n\n"));
       }
-      // 暂存未完成的尾部
-      // (上面已消费 buf，剩余尾部在下次或 flush 处理)
-      void buf;
     },
     flush(controller) {
       const tail = buf.trim();
