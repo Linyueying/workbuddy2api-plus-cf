@@ -9,6 +9,20 @@ import { VirtualIDs } from "../services/autoroute";
 import { healthReport } from "../services/health";
 import type { CtxVars } from "../types";
 
+/**
+ * waitUntilOf 取当前请求的生命周期延长钩子（Workers ExecutionContext）。
+ *
+ * Hono 把它挂在 c.executionCtx 上。它的作用是让「响应已经返回、但后台还要写 D1」
+ * 这类收尾任务继续跑完——proxyChat 的用量回填正是这种情况，缺了它会表现为
+ * 「有请求数有延迟、token 却全 0」，而且本地完全测不出来，只有真机才炸。
+ * 取不到（测试环境 / 非 Workers 运行时）时降级为立即执行，不影响既有断言。
+ */
+function waitUntilOf(c: any): (p: Promise<unknown>) => void {
+  const wait = c?.executionCtx?.waitUntil;
+  if (typeof wait !== "function") return (p) => { void p; };
+  return (p) => wait.call(c.executionCtx, p);
+}
+
 export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
   // /v1/chat/completions
   app.post("/v1/chat/completions", async (c) => {
@@ -18,7 +32,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     const req = c.req.raw;
     // 系统提示词改写不在这里做：它必须与降级重试共享同一份状态，由 proxyChat
     // 在轮转循环内统一裁决（对齐 Go handler.go 的改写位置）。
-    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null);
+    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
   });
 
   // /v1/responses (OpenAI Responses API -> chat)
@@ -27,7 +41,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     const chat = responsesToChat(body);
     const cfg = await getConfig(c.env);
     const req = c.req.raw;
-    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null);
+    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
   });
 
   // /v1/messages (Anthropic Messages API -> chat)
@@ -36,7 +50,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     const chat = anthropicToChat(body);
     const cfg = await getConfig(c.env);
     const req = c.req.raw;
-    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null);
+    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
   });
 
   // /v1/models

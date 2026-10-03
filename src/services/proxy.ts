@@ -128,6 +128,25 @@ export async function proxyChat(
   clientIP: string,
   userAgent: string,
   keyRow?: { id: string } | null,
+  /**
+   * waitUntil 把「响应返回之后的异步收尾」挂到 Workers 生命周期上。
+   *
+   * ⚠️ 这不是可选优化，而是流式用量能不能落库的决定性一环。Cloudflare Workers 的
+   * 语义是：handler 返回 Response 后，只有被 ctx.waitUntil 显式延寿的 promise 才
+   * 保证跑完，其余会在 isolate 回收时被**静默丢弃**。而流式请求的收尾天生躲在
+   * 这个空档里——Response 立刻返回给客户端，用量回填却发生在上游流读完之后的
+   * tap.flush 中；那句 UPDATE 落进 unprotected 窗口就会被吞掉，症状正是
+   * 「有请求数、有延迟，但 token / credits / msg 全 0」，且没有任何报错。
+   *
+   * 本地 vitest 完全测不出这个问题（Node 没有 isolate 回收），Go 版更是天然免疫
+   * ——它跑在常驻进程里，chatStat.done() 与 usage.Recorder.Add() 都是进程内写入，
+   * 请求结束不等于进程结束。移植到 Workers 时这一环极易漏掉，这里是显式补偿。
+   *
+   * 缺省值保留「立即执行」语义，便于单测在没有 ExecutionContext 时照常断言写入。
+   */
+  waitUntil: (p: Promise<unknown>) => void = (p) => {
+    void p;
+  },
 ): Promise<Response> {
   await primeConfig(env);
   const cfg = await getConfig(env);
@@ -260,7 +279,7 @@ export async function proxyChat(
         }
 
         if (c.passthrough || c.kind === "ErrContentBlocked") {
-          log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "blocked", c.status, start);
+          waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "blocked", c.status, start));
           return openAIError(c.status, c.code, c.message, c.hint);
         }
         // 模型级降级：换号解决不了的错误 → 切下一个候选模型。
@@ -291,7 +310,7 @@ export async function proxyChat(
         const release = () => {
           if (released) return;
           released = true;
-          void poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
+          waitUntil(poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {}));
         };
         // 诊断：把上游真实返回的 usage 原文暂存，随回填一起写进日志 msg，
         // 便于面板日志页直接看到「上游到底回了什么 usage」（token 恒 0 时最关键）。
@@ -301,11 +320,11 @@ export async function proxyChat(
             rawUsage = raw;
           },
           onEnd: (usage) => {
-            void recordCost(env, uid, bareModel, usage);
+            waitUntil(recordCost(env, uid, bareModel, usage));
             // 上游若整条流都没给 usage，rawUsage 为空——写明确标记，便于区分
             // 「上游没回 usage」与「解析器认不出字段」这两种完全不同的原因。
-            void backfillUsage(env, logId, usage, rawUsage ?? (usage ? undefined : "上游流内无 usage 帧"));
-            if (keyRow) void consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0));
+            waitUntil(backfillUsage(env, logId, usage, rawUsage ?? (usage ? undefined : "上游流内无 usage 帧")));
+            if (keyRow) waitUntil(consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0)));
             release();
           },
         });
@@ -317,7 +336,8 @@ export async function proxyChat(
       const merged = await aggregateChat(up);
       if (!merged.ok) {
         await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
-        log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", merged.status, start);
+        // 「响应返回后还要写库」一律交给 waitUntil，否则 isolate 回收会把日志吞掉。
+        waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", merged.status, start));
         return merged;
       }
       const payload: any = await merged.json().catch(() => null);
@@ -333,15 +353,16 @@ export async function proxyChat(
           continue;
         }
         await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
-        log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", 502, start);
+        waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", 502, start));
         return openAIError(502, "empty_completion", "upstream returned empty completion");
       }
 
       await recordCost(env, uid, bareModel, payload?.usage);
       if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
       await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
-      // 非流式此时才知道用量，日志在这里一次写清”——不 await，别把响应拖到 D1 之后。
-      void log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage);
+      // 非流式此时才知道用量，日志在这里一次写清——不 await，别把响应拖到 D1 之后；
+      // 但必须 waitUntil，否则响应一返回 Worker 就可能回收、这行日志永远落不了地。
+      waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage));
       return new Response(JSON.stringify(payload), {
         status: 200,
         headers: {
@@ -368,7 +389,7 @@ export async function proxyChat(
     }
   }
 
-  log(env, clientIP, userAgent, undefined, rawModel, chain[ci], stripRealm(chain[ci]).realm, "error", lastErr?.status ?? 503, start);
+  waitUntil(log(env, clientIP, userAgent, undefined, rawModel, chain[ci], stripRealm(chain[ci]).realm, "error", lastErr?.status ?? 503, start));
   return openAIError(
     lastErr?.status ?? 503,
     lastErr?.code ?? "no_healthy_account",
@@ -453,7 +474,13 @@ export function dryUsage(usage: Usage | null | undefined): {
 /** backfillUsage 把流式末帧的用量回填到开局那行占位日志。
  *  rawUsage 为上游原始 usage 文本或诊断标记，写进 msg 供排查（可为空）。 */
 async function backfillUsage(env: Env, id: number, usage: Usage | null, rawUsage?: string): Promise<void> {
-  if (!id) return;
+  if (!id) {
+    // 拿不到行 id 就无从定位回填——id<=0 意味着 INSERT 失败，或 D1 没返回 last_row_id。
+    // 这一步必须留声：静默 return 会让「有请求数、有延迟，但 token 全 0」变成无头案，
+    // 日志里看不到任何线索。（`wrangler tail` 能看到本行。）
+    console.error("[usage] 跳过回填：未取到日志行 id（INSERT 失败或 D1 未返回 last_row_id）");
+    return;
+  }
   // usage 缺失但带了诊断标记时也要写（否则「上游无 usage」这种关键信息会丢）。
   if (!usage && !rawUsage) return;
   await updateRequestLogUsage(env, id, dryUsage(usage), rawUsage).catch(() => {});
@@ -490,7 +517,12 @@ function log(
     status,
     ms: Date.now() - start,
     ...dryUsage(usage),
-  }).catch(() => 0);
+  }).catch((e: any) => {
+    // 失败一律吞掉：日志是观测设施，它挂了不应该让用户的对话请求失败。
+    // 但不能连声响都没有——写不进日志正是「用量页空」最容易被忽略的一环。
+    console.error("[reqlog] 请求日志写入失败，该请求用量将丢失:", String(e?.message ?? e));
+    return 0;
+  });
 }
 
 /** 解析客户端 IP（尊重 X-Forwarded-For，当 trust_proxy）。 */
