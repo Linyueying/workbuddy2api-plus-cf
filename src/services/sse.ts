@@ -58,14 +58,61 @@ export interface Usage {
   /** Anthropic 风格字段名（上游可能用这套）。 */
   input_tokens?: number;
   output_tokens?: number;
+  /**
+   * prompt_cache_hit_tokens 前缀缓存**读命中** Token。
+   *
+   * 上游（/v2/chat/completions）实测就叫这个名字——见 services/cachekey.ts 顶部的
+   * 逆向注记「带 key → prompt_cache_hit_tokens=7808, credit≈0.02」。此前本文件只认
+   * OpenAI 口径的 prompt_tokens_details.cached_tokens / cache_read_input_tokens，
+   * 结果上游唯一真在返回的字段被整个忽略，命中率维度恒为 0。
+   */
+  prompt_cache_hit_tokens?: number;
+  /**
+   * prompt_cache_miss_tokens 前缀缓存**未命中** Token。
+   *
+   * ⚠️ 目前只声明、不消费：request_logs 只有 cache_read_tokens 一列（见 migrations
+   * /0003_usage_metrics.sql），未命中无处落库，由 usage-agg 按 prompt - hit 推导，
+   * 与 Go 版 CacheTokens 的口径一致。留在这里是为了让上游 usage 的原貌可读可调，
+   * 将来若加列再改为直接采信。
+   */
+  prompt_cache_miss_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/**
+ * dataPayloadOf 从一条 SSE 事件文本里还原 data 载荷（无 data 行则 null）。
+ *
+ * ⚠️ 必须**逐行**扫描，不能对整个事件串做 `replace(/^data:\s?/, "")`：SSE 事件允许
+ * 多行（`event:` / `id:` / `retry:` / 注释行），而 `^` 只锚定字符串开头——一旦首行
+ * 不是 data（最常见的情形就是上游发 `event: message`），整块 JSON.parse 直接失败、
+ * usage 被静默丢弃，最终表现为「用量页 token 恒为 0」。
+ *
+ * Go 版 parseSSELine（internal/server/logging.go）正是逐行 HasPrefix("data: ") 判决，
+ * 这里对齐它的语义，并额外兼容无空格写法（`data:{...}`）与多条 data 行的拼接
+ * （SSE 规范：多 data 行以 \n 连接成一个载荷）。
+ */
+export function dataPayloadOf(evt: string): string | null {
+  const lines = String(evt ?? "").replace(/\r\n/g, "\n").split("\n");
+  const payload: string[] = [];
+  for (const raw of lines) {
+    if (!raw.startsWith("data:")) continue;
+    // `data:` 后的单个空格可选（RFC 允许紧接内容）；只剥一个，别吃掉正文里的缩进。
+    payload.push(raw.slice(5).replace(/^ /, ""));
+  }
+  if (!payload.length) return null;
+  // 只剥尾部空白（行尾残留），**不能用 trim()**：那会把首行 data 内容的前导空格一起
+  // 吃掉，让「只剥一个空格」的承诺落空。空载荷（data: 后面什么都没有）在此判为 null。
+  return payload.join("\n").replace(/\s+$/, "") || null;
 }
 
 /** extractUsage 从一条 SSE 事件文本里取 usage（无则 null）。 */
 export function extractUsage(evt: string): Usage | null {
-  const line = evt.replace(/^data:\s?/, "").trim();
-  if (!line || line === "[DONE]") return null;
+  const payload = dataPayloadOf(evt);
+  if (!payload || payload === "[DONE]") return null;
   try {
-    const j = JSON.parse(line);
+    const j = JSON.parse(payload);
     const u = j?.usage;
     return u && typeof u === "object" ? (u as Usage) : null;
   } catch {
@@ -95,6 +142,7 @@ function hasTokens(u: any): boolean {
     n(u.output_tokens) ||
     n(u.credit) ||
     n(u.cache_read_input_tokens) ||
+    n(u.prompt_cache_hit_tokens) ||
     n(u.prompt_tokens_details?.cached_tokens)
   );
 }
@@ -108,7 +156,13 @@ export function streamChat(upstreamRes: Response, request: Request, opts: Stream
   const tap = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       controller.enqueue(chunk);
-      tail += decode(chunk);
+      // ⚠️ 必须先把 CRLF 规范化再切分：上游若以 \r\n\r\n 分隔，`split(/\n\n/)` 永远
+      // 切不开（\r 夹在两个 \n 中间），所有帧会堆进 tail、flush 时整块 JSON.parse
+      // 失败 → usage 全丢。而下游的 sseTransform 独立做了同样的规范化，用户侧对话
+      // 依旧正常——于是症状就是「回复好好的、用量页却全 0」。
+      // 归一化的对象必须是**累积后的整串**而非单个 chunk：\r\n 可能正好跨在
+      // 两个 chunk 的边界上，只处理新块会漏掉那一例。
+      tail = (tail + decode(chunk)).replace(/\r\n/g, "\n");
       const parts = tail.split(/\n\n/);
       tail = parts.pop() ?? "";
       for (const p of parts) {
@@ -124,7 +178,17 @@ export function streamChat(upstreamRes: Response, request: Request, opts: Stream
       }
     },
     flush() {
-      opts.onEnd?.(usage ?? extractUsage(tail));
+      // 流末尾最后一帧常常没有空行终结，会留在 tail 里；它位置最晚，理应优先于
+      // transform 期间捕获到的任何一帧。这里逐帧扫（而非对整个 tail 直接 JSON.parse），
+      // 免得异常残留多帧时整块解析失败、把末帧用量吞掉。
+      let last = usage;
+      for (const p of tail.split(/\n\n/)) {
+        const u = extractUsage(p);
+        if (!u) continue;
+        if (hasTokens(u)) last = u;
+        else if (!last) last = u;
+      }
+      opts.onEnd?.(last);
     },
   });
   // tap 的 flush 需在主流读完后触发：用主流的取消/结束都无法直接拿到 tap 的 flush，
@@ -150,14 +214,22 @@ export async function aggregateChat(upstreamRes: Response): Promise<Response> {
     return errorBody("empty stream", 502, "empty_stream");
   }
   const text = await upstreamRes.text();
-  const events = text.split(/\n\n/).map((e) => e.trim()).filter(Boolean);
+  // 与流式 tap 同理：CRLF 先归一化，否则 \r\n\r\n 分隔的上游响应切不出任何事件，
+  // 整条流被当成一坨、聚合结果与 usage 一并丢失。
+  const events = text
+    .replace(/\r\n/g, "\n")
+    .split(/\n\n/)
+    .map((e) => e.trim())
+    .filter(Boolean);
   let merged: any = null;
   for (const ev of events) {
     if (/\[DONE\]/.test(ev)) continue;
-    const line = ev.replace(/^data:\s?/, "");
-    if (!line) continue;
+    // 逐行取 data 载荷——不能用 replace(/^data:/)：它锚定整个事件的开头，帧里只要
+    // 先出现 `event:` / `id:` 行就会使 JSON.parse 失败，把这一帧连同 usage 一起丢掉。
+    const payload = dataPayloadOf(ev);
+    if (!payload) continue;
     try {
-      const j = JSON.parse(line);
+      const j = JSON.parse(payload);
       if (!merged) merged = j;
       mergeDelta(merged, j);
     } catch {

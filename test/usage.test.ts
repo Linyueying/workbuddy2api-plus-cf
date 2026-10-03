@@ -235,4 +235,24 @@ describe("dryUsage 字段收敛", () => {
     expect(d.prompt_tokens).toBe(100);
     expect(d.completion_tokens).toBe(50);
   });
+
+  it("只给输出侧与总量 → 输入侧按差值反推，不再显示 0", () => {
+    const d = dryUsage({ completion_tokens: 50, total_tokens: 150 } as any);
+    expect(d.prompt_tokens).toBe(100);
+    expect(d.completion_tokens).toBe(50);
+  });
+
+  it("识别上游实测的 prompt_cache_hit_tokens（旧实现整列忽略 → 命中率恒 0）", () => {
+    // services/cachekey.ts 顶部逆向实证：/v2/chat/completions 只会回这个名字
+    // 「带 key → prompt_cache_hit_tokens=7808, credit≈0.02」。
+    expect(dryUsage({ prompt_cache_hit_tokens: 7808, credit: 0.02 } as any).cache_read_tokens).toBe(7808);
+  });
+
+  it("多种命中写法并存时以上游实测字段为准", () => {
+    expect(dryUsage({ prompt_cache_hit_tokens: 12, cache_read_input_tokens: 99 } as any).cache_read_tokens).toBe(12);
+  });
+
+  it("命中显式为 0 时不回落到其它兜底字段（0 是有效值，不是缺失）", () => {
+    expect(dryUsage({ prompt_cache_hit_tokens: 0, cache_read_input_tokens: 99 } as any).cache_read_tokens).toBe(0);
+  });
 });

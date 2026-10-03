@@ -237,15 +237,20 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     'data: {"choices":[{"delta":{"content":" there"}}],"usage":{"credit":1.5,"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}\n\n' +
     "data: [DONE]\n\n";
 
-  function envFor() {
+  /** envForWith 用指定的上游流构造 env；envFor 沿用理想形态（既有断言依赖它）。 */
+  function envForWith(streamBody: string) {
     const env = fakeEnv(makeAuth("u1"));
     vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
       if (new URL((req as any).url).pathname.includes("/chat/completions")) {
-        return new Response(STREAM_WITH_USAGE, { status: 200, headers: { "content-type": "text/event-stream" } });
+        return new Response(streamBody, { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     }));
     return env;
+  }
+
+  function envFor() {
+    return envForWith(STREAM_WITH_USAGE);
   }
 
   function reqFor() {
@@ -315,6 +320,51 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     await res.text(); // 完整读完流才会触发 onEnd → release
     await new Promise((r) => setTimeout(r, 0));
     expect(env.releaseCount()).toBeGreaterThanOrEqual(1);
+  });
+
+  // 真实上游的 SSE 帧往往带 event: 行、且以 \r\n\r\n 分隔。旧实现的
+  // replace(/^data:\s?/) 与 tail.split(/\n\n/) 在这两种形态下都会把 usage 静默丢掉，
+  // 而下游 sseTransform 仍能把正文完好转发给用户——于是症状就是
+  // 「对话一切正常，唯独用量页的输入/输出 Token 全是 0」。
+  const STREAM_REAL_SHAPE =
+    "event: message\r\n" +
+    'data: {"choices":[{"delta":{"content":"你"}}]}\r\n\r\n' +
+    "event: message\r\n" +
+    'data: {"choices":[{"delta":{"content":"好"}}],"usage":{"credit":2.5,"prompt_tokens":200,"completion_tokens":80,"total_tokens":280,"prompt_cache_hit_tokens":64}}\r\n\r\n' +
+    "data: [DONE]\r\n\r\n";
+
+  it("真实帧形态（event: 行 + CRLF）：末帧用量照样回填，token 不再是 0", async () => {
+    const env = envForWith(STREAM_REAL_SHAPE);
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    // 顺带锁死「用户侧回复完好」——修用量不能把转发赔进去。
+    const text = await res.text();
+    expect(text).toContain("你");
+    expect(text).toContain("好");
+    await new Promise((r) => setTimeout(r, 0));
+
+    const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
+    expect(upd).toBeTruthy();
+    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, msg, id
+    expect(upd!.params.slice(0, 4)).toEqual([200, 80, 2.5, 64]);
+  });
+
+  it("真实帧形态 + 非流式：用量随 INSERT 一次落清（含缓存命中列）", async () => {
+    const env = envForWith(STREAM_REAL_SHAPE);
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+    });
+    const res = await proxyChat(env, req, "cn:hy3", { model: "cn:hy3", stream: false, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(inserts).toHaveLength(1);
+    // 末四列：prompt_tokens, completion_tokens, credits, cache_read_tokens
+    expect(inserts[0].params.slice(-4)).toEqual([200, 80, 2.5, 64]);
+    expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 });
 

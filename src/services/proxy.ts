@@ -421,7 +421,17 @@ export function dryUsage(usage: Usage | null | undefined): {
   cache_read_tokens: number;
 } {
   const u = usage as any;
-  const cached = Number(u?.prompt_tokens_details?.cached_tokens ?? u?.cache_read_input_tokens ?? u?.cache_creation_input_tokens ?? 0);
+  // prompt_cache_hit_tokens 排第一：它是上游（/v2/chat/completions）**实测唯一会返回**
+  // 的命中字段——见 services/cachekey.ts 顶部逆向注记「带 key → prompt_cache_hit_tokens
+  // =7808, credit≈0.02」。原先只认 OpenAI 口径的三种写法，于是这列真实数据被整体忽略、
+  // 面板缓存维度恒为 0；其余写法仍保留兜底，别的兼容层走这条链路时不至于退化。
+  const cached = Number(
+    u?.prompt_cache_hit_tokens ??
+      u?.prompt_tokens_details?.cached_tokens ??
+      u?.cache_read_input_tokens ??
+      u?.cache_creation_input_tokens ??
+      0,
+  );
   let prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0) || 0;
   let completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0) || 0;
   const total = Number(u?.total_tokens ?? 0) || 0;
@@ -429,6 +439,9 @@ export function dryUsage(usage: Usage | null | undefined): {
   if (prompt === 0 && completion === 0 && total > 0) prompt = total;
   // 反向兜底：给了拆分但没给 total 时，补一个（成本台账/前端「合计」用得到）。
   if (completion === 0 && total > prompt && prompt > 0) completion = total - prompt;
+  // 对称情形：上游只给了输出侧与总量，输入侧同样由差值反推——否则「输入 Token」
+  // 会显示 0，而实际上只是没单独汇报。
+  if (prompt === 0 && completion > 0 && total > completion) prompt = total - completion;
   return {
     prompt_tokens: Math.max(0, prompt),
     completion_tokens: Math.max(0, completion),
