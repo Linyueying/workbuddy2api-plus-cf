@@ -29,7 +29,7 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import { getConfig } from "../../src/config";
 import { runScheduledJobs } from "../../src/alarms";
-import { queryRequestLogs } from "../../src/storage/d1";
+import { queryRequestLogs, deleteRequestLogsBefore } from "../../src/storage/d1";
 import { archiveLogs } from "../../src/storage/r2";
 import { PoolDO } from "../../src/durable/account-pool";
 
@@ -90,9 +90,19 @@ async function runHourlyJobs(env: Env): Promise<void> {
  * 刻意**不删 D1 源数据**：归档是只读副本，误删无法恢复。清理留给人工。
  */
 async function archiveRequestLogs(env: Env): Promise<void> {
-  // R2 是可选绑定：没桶就不绑，这里直接跳过，别白查一次 D1
+  // R2 是可选绑定：没桶时不归档，但**不能什么都不做**——否则 D1 的
+  // request_logs 只增不减，长期顶到容量上限。改为到期直接从 D1 清理，
+  // 保留天数语义不变，代价是没有冷备份（不用 R2 的必然取舍）。
   if (!env.WB2A_LOGS) {
-    console.log("[scheduler] 未绑定 R2（WB2A_LOGS），跳过日志归档");
+    const cutoff = Date.now() - ARCHIVE_OLDER_THAN_DAYS * 86400_000;
+    try {
+      const n = await deleteRequestLogsBefore(env, cutoff);
+      console.log(
+        `[scheduler] 未绑定 R2：改为清理 D1 ${ARCHIVE_OLDER_THAN_DAYS} 天前日志，删除 ${n} 行`,
+      );
+    } catch (e: any) {
+      console.log(`[scheduler] 日志清理失败：${String(e?.message ?? e)}`);
+    }
     return;
   }
   try {

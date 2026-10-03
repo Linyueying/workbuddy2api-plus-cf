@@ -221,6 +221,18 @@ export async function queryRequestLogs(env: Env, q: RequestLogQuery): Promise<Re
   return all<RequestLogEntry>(env, sql, params);
 }
 
+/**
+ * deleteRequestLogsBefore 删除 ts 严格早于 cutoff 的请求日志，返回删除行数。
+ *
+ * 存在理由：无 R2 绑定时（R2 为可选资源）归档链路会整体跳过，D1 的
+ * request_logs 只增不减、迟早顶到容量上限。此时改为「到期即从 D1 清理」，
+ * 保留天数语义与归档一致，只是没有冷备份——这是不用 R2 的必然取舍。
+ */
+export async function deleteRequestLogsBefore(env: Env, cutoff: number): Promise<number> {
+  const r = await run(env, "DELETE FROM request_logs WHERE ts < ?", [cutoff]);
+  return Number(r?.meta?.changes ?? 0);
+}
+
 // ---------- 用量聚合（按模型+小时窗口）----------
 export async function recordUsage(env: Env, model: string, realm: string, tokens: number, ts: number): Promise<void> {
   await run(

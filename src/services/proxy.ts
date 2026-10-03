@@ -250,7 +250,9 @@ export async function proxyChat(
       await poolRPC(env, "/internal/note", "POST", { uid, kind: "success" }).catch(() => {});
 
       const routed = chain[ci] !== rawModel;
-      if (routed) log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
+      // 成��即记（不论是否被编排路由）。流式分支此前只在 routed 时记，导致
+      // 「流式 + 未路由」（最常见的直连用法）一条日志都不写，面板日志页全空。
+      log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
 
       if (body.stream) {
         // 流式：透传；成本台账在流结束后按 usage 记账（流内 usage 在末帧）。
