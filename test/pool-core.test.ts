@@ -391,4 +391,33 @@ describe("pool-core 选号主流程", () => {
       expect(r.uid).toBe("c1"); // 候选仅 c1（g1 被 realm 过滤），稳定选中
     }
   });
+
+  it("单账号在途占满仍可被选中（inFlight 是软计数，不能当硬门槛）", () => {
+    // 回归：真机 no_healthy_account, reasons={in_flight_full:1}。单账号被泄漏的
+    // inFlight 卡死时，若 inFlightFull 是硬过滤就会永久无号可选。
+    const one = [acct("solo", { inFlight: 99 })]; // 远超 max_in_flight=2
+    const r = pick(one, {
+      realm: "cn", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+      modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(3),
+    });
+    expect(r.uid).toBe("solo");
+  });
+
+  it("多账号高负载：优先选空闲号，全满时才放宽", () => {
+    const busy = acct("busy", { inFlight: 2 }); // 已满
+    const idle = acct("idle", { inFlight: 0 }); // 空闲
+    for (let i = 0; i < 10; i++) {
+      const r = pick([busy, idle], {
+        realm: "cn", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+        modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(6),
+      });
+      expect(r.uid).toBe("idle"); // 有空闲号时绝不选满号
+    }
+    // 仅剩满号时仍能选到（放宽）
+    const r2 = pick([busy], {
+      realm: "cn", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+      modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(3),
+    });
+    expect(r2.uid).toBe("busy");
+  });
 });

@@ -214,14 +214,22 @@ export interface PickResult {
 export function pick(candsIn: AccountState[], inp: PickInput): PickResult {
   const { realm, model, exclude, now, cfg } = inp;
   const healthyOf = model ? (a: AccountState) => healthyForModel(a, model, now) : (a: AccountState) => healthy(a, now);
-  let cands = candsIn.filter((a) => {
+  const baseOk = (a: AccountState) => {
     if (exclude.has(a.uid)) return false;
     if (realm && a.realm !== realm) return false;
     if (!healthyOf(a)) return false;
     if (floorBlocked(a, model, cfg, now, inp.modelRateOf, realm)) return false;
-    if (inFlightFull(a, cfg)) return false;
     return true;
-  });
+  };
+  // 首选：健康 + 在途未满（负载均衡）。
+  let cands = candsIn.filter((a) => baseOk(a) && !inFlightFull(a, cfg));
+  if (cands.length === 0) {
+    // 在途全满时放宽 inFlight 限制：inFlight 是「无状态 Workers 下会泄漏的软计数」
+    // （客户端断连/Worker 被驱逐/RPC 丢失都会让它只增不减），不能当硬门槛——
+    // 否则单账号泄漏一次就永久锁死（no_healthy_account, reasons={in_flight_full:1}）。
+    // 这里只保留健康/冷却/保底等真实约束，靠池内并发自然限流。
+    cands = candsIn.filter(baseOk);
+  }
   if (cands.length === 0) {
     // 全冷却兜底：从软冷却/熔断/降权的账号里选到期最早者（禁用与硬冷却除外）。
     let best: AccountState | null = null;
@@ -231,7 +239,6 @@ export function pick(candsIn: AccountState[], inp: PickInput): PickResult {
       if (a.status === "disabled") continue;
       if (hardCooled(a, now)) continue;
       if (floorBlocked(a, model, cfg, now, inp.modelRateOf, realm)) continue;
-      if (inFlightFull(a, cfg)) continue;
       const exp = expiry(a, now);
       if (exp === 0) continue;
       if (!best || exp < expiry(best, now)) best = a;

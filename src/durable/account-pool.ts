@@ -133,9 +133,11 @@ export class PoolDO {
     for (const a of accs) this.prune(a, now);
 
     // 超时回收：acquire 后长时间未 release 的在途占用强制清零（见 ACQUIRE_TTL_MS 说明）。
+    // 注意 acquiredAt 缺失也回收：那是升级前留下的泄漏计数（老版本 acquire 不写时间戳），
+    // 不回收会永远卡死（no_healthy_account, reasons={in_flight_full:1}）。
     const recycled: AccountState[] = [];
     for (const a of accs) {
-      if (a.inFlight > 0 && a.acquiredAt && now - a.acquiredAt > PoolDO.ACQUIRE_TTL_MS) {
+      if (a.inFlight > 0 && (!a.acquiredAt || now - a.acquiredAt > PoolDO.ACQUIRE_TTL_MS)) {
         a.inFlight = 0;
         a.acquiredAt = 0;
         recycled.push(a);
