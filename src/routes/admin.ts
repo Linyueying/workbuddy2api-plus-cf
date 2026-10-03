@@ -48,11 +48,15 @@ async function creditsOrReason(
     // diag 里带 token 长度前缀/UA/hasDeviceToken/响应头，面板直接可见，
     // 用户手机上开不了实时日志流也能一次定位（token 不落明文）。
     // hint 带根因说明（如「缺 X-Device-Token」），优先展示。
-    const why =
-      String(e?.hint ?? "") ||
-      String(e?.message ?? e) +
-        (e?.detail ? ` | ${String(e.detail).slice(0, 160)}` : "") +
-        (e?.diag ? ` | ${e.diag}` : "");
+    // ⚠️ 不能写成 hint || (message + detail + diag)：`||` 优先级低于 `+`，
+    // 只要 hint 非空就会把 diag（含 sent/token 长度/UA/响应头）整段丢掉，
+    // 面板永远看不到诊断信息。这里改为全部拼接。
+    const parts: string[] = [];
+    if (e?.hint) parts.push(String(e.hint));
+    parts.push(String(e?.message ?? e));
+    if (e?.detail) parts.push(String(e.detail).slice(0, 160));
+    if (e?.diag) parts.push(String(e.diag));
+    const why = parts.join(" | ");
     console.error(`[admin] 余额查询失败 uid=${a?.uid ?? ""} realm=${a?.realm ?? ""} ${why}`);
     return { cr: null, why };
   }
