@@ -118,7 +118,7 @@ export class PoolDO {
    * 惰性清理过期的模型级冷却与成本台账（两张 map 都不无限膨胀）。
    */
   private async pickOne(
-    realm: Realm,
+    realm: string,
     model: string | undefined,
     exclude: string[],
     now: number,
@@ -155,6 +155,18 @@ export class PoolDO {
     await this.ctx.storage.put(PICK_SEQ_KEY, a.usedSeq);
     await this.putAcct(a);
     return { uid: a.uid, explored: res.explored, fallback: res.fallback, fallbackKind: res.fallbackKind };
+  }
+
+  /** realmSnapshot 各 realm 的 total/healthy 分布，用于 no_healthy_account 诊断。 */
+  private realmSnapshot(now: number): Record<string, { total: number; healthy: number }> {
+    const out: Record<string, { total: number; healthy: number }> = {};
+    for (const a of this._cache ?? []) {
+      const r = a.realm || "unknown";
+      out[r] ??= { total: 0, healthy: 0 };
+      out[r].total++;
+      if (a.status !== "disabled" && coreHealthy(a, now)) out[r].healthy++;
+    }
+    return out;
   }
 
   /** prune 惰性清理过期的模型级冷却与成本台账条目（对齐 pruneExpiredModelCooldowns/Costs）。 */
@@ -229,7 +241,27 @@ export class PoolDO {
         }
 
         const chosen = await this.pickOne(realm, model, exclude, now, cfg);
-        if (!chosen) return json({ error: "no_healthy_account" }, 503);
+        if (!chosen) {
+          // 本 realm 无健康账号：放宽 realm 限制再试一次。账号自带 realm，出站按
+          // 账号自身 realm 打上游（basesFor(auth.realm)），放宽选号不会跨域错打。
+          // 修复：单域用户——如国际版账号 realm=global，但请求模型未带 global:
+          // 前缀导致 stripRealm 默认算成 cn——此前会被 a.realm !== "cn" 全量过滤，
+          // 永远 no_healthy_account，尽管池里有可用账号。请求仍按裸模型名出站，
+          // 选到的账号用自己的 realm 落到正确上游域。
+          const relaxed = await this.pickOne("", model, exclude, now, cfg);
+          if (!relaxed) {
+            return json({ error: "no_healthy_account", realm, model: model ?? "", byRealm: this.realmSnapshot(now) }, 503);
+          }
+          if (stickyKeyName) await bindSticky(this.ctx, stickyKeyName, relaxed.uid, cfg.session_sticky.ttl);
+          const ra = await this.getAcct(relaxed.uid);
+          return json({
+            uid: relaxed.uid,
+            auth: ra?.auth,
+            explored: relaxed.explored,
+            fallback: true,
+            fallback_kind: "realm_relaxed",
+          });
+        }
         if (stickyKeyName) await bindSticky(this.ctx, stickyKeyName, chosen.uid, cfg.session_sticky.ttl);
         const a = await this.getAcct(chosen.uid);
         return json({

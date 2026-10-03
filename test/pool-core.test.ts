@@ -363,4 +363,32 @@ describe("pool-core 选号主流程", () => {
     }
     expect(coldHits).toBeGreaterThan(150);
   });
+
+  it("realm 不匹配时本 realm 选不到，但 realm=\"\" 放宽后能选到另一 realm 的账号", () => {
+    // 复现「国际版账号 realm=global，请求模型未带 global: 前缀 → stripRealm 默认算成 cn」：
+    // 此前会被 a.realm !== "cn" 全量过滤返回 null，永远 no_healthy_account，尽管池里有可用账号。
+    const onlyGlobal = [acct("g1", { realm: "global" }), acct("g2", { realm: "global" })];
+    const rCn = pick(onlyGlobal, {
+      realm: "cn", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+      modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(4),
+    });
+    expect(rCn.uid).toBeNull(); // 本 realm 无号 → 兜底前返回 null
+    const rAny = pick(onlyGlobal, {
+      realm: "", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+      modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(4),
+    });
+    expect(rAny.uid).not.toBeNull(); // 放宽 realm 限制 → 能选到 global 账号
+    expect(["g1", "g2"]).toContain(rAny.uid);
+  });
+
+  it("realm 匹配时仍严格隔离：cn 请求不应选到 global 账号", () => {
+    const mixed = [acct("c1", { realm: "cn" }), acct("g1", { realm: "global" })];
+    for (let i = 0; i < 10; i++) {
+      const r = pick(mixed, {
+        realm: "cn", model: "m", exclude: new Set(), now: NOW, cfg: CFG,
+        modelRateOf: noRate(), exploreLast: {}, rnd: seqRnd(6),
+      });
+      expect(r.uid).toBe("c1"); // 候选仅 c1（g1 被 realm 过滤），稳定选中
+    }
+  });
 });

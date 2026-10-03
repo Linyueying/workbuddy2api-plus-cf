@@ -181,23 +181,31 @@ export async function proxyChat(
     const { realm, model: bareModel } = stripRealm(chain[ci]);
 
     let pick: any;
+    let pickErr: string | undefined;
     try {
       pick = await poolRPC(env, "/internal/pick", "POST", { realm, model: bareModel, exclude: tried, stickyKey: sticky });
-    } catch {
+    } catch (e) {
       pick = { error: "pool_unavailable" };
+      pickErr = String((e as any)?.message ?? e);
     }
     if (pick.error === "no_healthy_account" || pick.error === "pool_unavailable") {
       // 该模型在池里已无可用账号：换号已穷尽，有候选就降级换模型。
       if (Fallbackable(autoCfg, NO_HEALTHY_ACCOUNT) && advance()) continue;
+      const unreachable = pick.error === "pool_unavailable";
       lastErr = {
         kind: "ErrClient",
         kindName: NO_HEALTHY_ACCOUNT,
         status: 503,
-        code: "no_healthy_account",
-        message: "no healthy account available",
+        code: unreachable ? "pool_unavailable" : "no_healthy_account",
+        message: unreachable ? "account pool unreachable (PoolDO RPC failed)" : "no healthy account available",
         note: "none",
         passthrough: false,
         rotate: false,
+        hint: unreachable
+          ? "Pages 调不动 PoolDO：检查 Pages 项目是否绑定 engine 的 POOL（script_name=workbuddy2api-engine），且 engine 已部署、未报错。" +
+            (pickErr ? ` | ${pickErr}` : "")
+          : `请求 realm=${realm}。DO 账号分布=${JSON.stringify(pick.byRealm ?? {})}（若账号都在另一 realm，已自动放宽选号）` +
+            (pickErr ? ` | ${pickErr}` : ""),
       };
       break;
     }
@@ -325,7 +333,12 @@ export async function proxyChat(
   }
 
   log(env, clientIP, userAgent, undefined, rawModel, chain[ci], stripRealm(chain[ci]).realm, "error", lastErr?.status ?? 503, start);
-  return openAIError(lastErr?.status ?? 503, lastErr?.code ?? "no_healthy_account", lastErr?.message ?? "no healthy account available");
+  return openAIError(
+    lastErr?.status ?? 503,
+    lastErr?.code ?? "no_healthy_account",
+    lastErr?.message ?? "no healthy account available",
+    lastErr?.hint,
+  );
 }
 
 /** note 把分类结果落到账号池（含 6004 模型级冷却所需的重置时间解析）。 */
