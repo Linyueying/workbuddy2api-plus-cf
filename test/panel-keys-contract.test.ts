@@ -76,4 +76,31 @@ describe("密钥明文契约（静态守卫）", () => {
     expect(appJs).not.toMatch(/expires_at\s*=[^;]*toISOString/);
     expect(appJs).toMatch(/body\.expires_at = Date\.now\(\) \+ days \* 86400000/);
   });
+
+  it("overview 的账号序列化必须对齐前端（Go 版）snake_case 契约——否则账号池整列空白", () => {
+    // 2026-10 事故：后端 overview 只映射了 7 个基础字段，前端 renderAccounts
+    // 读的 success_count/err_total/last_success/breaker_until/degrade_until/
+    // cool_remaining_sec/cool_kind/disabled/reason/checkin_done/model_costs 全空，
+    // 账号池行能画出来但运营数据列全空，看起来像「不显示任何数据」。
+    const overview = handlerOf(panelSrc, 'app.get("/panel/api/overview"');
+    for (const f of [
+      "success_count",
+      "err_total",
+      "last_success",
+      "breaker_until",
+      "degrade_until",
+      "cool_remaining_sec",
+      "cool_kind",
+      "disabled",
+      "reason",
+      "checkin_done",
+      "model_costs",
+    ]) {
+      expect(overview, `overview 漏了账号字段 ${f}（前端 renderAccounts 在读它）`).toContain(f);
+    }
+    // 禁用账号必须靠 disabled 布尔暴露，不能只回 status（前端用 s.disabled 判定标签）。
+    expect(overview).toMatch(/disabled:\s*a\.status\s*===\s*"disabled"/);
+    // 不能用「只回 7 字段」的旧形态蒙混——基础字段仍在，但必须扩出上面的运行时字段。
+    expect(overview).not.toMatch(/uid:\s*a\.uid,\s*\n\s*nickname:\s*a\.nickname,\s*\n\s*realm:\s*a\.realm,\s*\n\s*status:\s*a\.status,\s*\n\s*credits:\s*a\.credits,\s*\n\s*credits_total:\s*a\.creditsTotal,\s*\n\s*in_flight:\s*a\.inFlight,\s*\n\s*\}\)/);
+  });
 });

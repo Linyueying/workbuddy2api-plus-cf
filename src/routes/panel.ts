@@ -97,11 +97,12 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
   // 概览
   app.get("/panel/api/overview", async (c) => {
     const cfg = await getConfig(c.env);
+    const now = Date.now();
     const st = await poolRPC(c.env, "/internal/status").catch(() => null);
     const accounts = (await poolRPC(c.env, "/internal/list").catch(() => [])) as any[];
     return c.json({
       version: VERSION,
-      uptime_sec: Math.floor((Date.now() - STARTED_AT) / 1000),
+      uptime_sec: Math.floor((now - STARTED_AT) / 1000),
       auth_required: true,
       redis_mode: false,
       sticky_sessions: st?.sticky_sessions ?? 0,
@@ -110,14 +111,35 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       cooling: st?.cooling ?? 0,
       disabled: st?.disabled ?? 0,
       in_flight_full: st?.in_flight_full ?? 0,
+      // 序列化对齐前端（Go 版）契约：前端 renderAccounts/renderPackages/groupItems
+      // 读的是 snake_case 字段名，且需要 success_count/err_total/last_success/
+      // breaker_until/degrade_until/cool_remaining_sec/cool_kind/disabled/reason/
+      // checkin_done/model_costs 等运行时字段——后端此前只映射了 7 个基础字段，
+      // 导致账号池整列空白（行能画、但成功/失败/用量/状态标签全空）。
       accounts: (accounts ?? []).map((a) => ({
         uid: a.uid,
         nickname: a.nickname,
         realm: a.realm,
         status: a.status,
-        credits: a.credits,
-        credits_total: a.creditsTotal,
-        in_flight: a.inFlight,
+        disabled: a.status === "disabled",
+        reason: a.disabledReason ?? "",
+        credits: a.credits ?? 0,
+        credits_total: a.creditsTotal ?? 0,
+        in_flight: a.inFlight ?? 0,
+        success_count: a.successCount ?? 0,
+        err_total: a.errTotal ?? 0,
+        last_success: a.lastSuccess ?? 0,
+        breaker_until: a.breakerUntil ?? 0,
+        degrade_until: a.degradeUntil ?? 0,
+        cool_remaining_sec: a.cooldownUntil > now ? Math.max(0, Math.floor((a.cooldownUntil - now) / 1000)) : 0,
+        cool_kind: a.cooldownKind ?? "",
+        checkin_done: a.checkinDone ?? false,
+        rate_limited_models: [],
+        model_costs: Object.entries(a.modelCost ?? {}).map(([model, c]) => ({
+          model,
+          cost_per_1k: (c as { costPer1k?: number })?.costPer1k ?? 0,
+        })),
+        token_usage: {},
       })),
     });
   });
