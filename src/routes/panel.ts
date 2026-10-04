@@ -38,6 +38,39 @@ import type { CtxVars } from "../types";
 const VERSION = "1.0.0-pages";
 const STARTED_AT = Date.now();
 
+/** outcome 的中文口径（与前端 reqOutcomeTag 的标签一致；「错误/失败」会被
+ *  前端 loadLogs 的关键词规则染成红色级别，映射时不要改成不含关键词的词）。 */
+const OUTCOME_CN: Record<string, string> = {
+  success: "成功",
+  http_error: "HTTP 错误",
+  stream_error: "流错误",
+  interrupted: "中断",
+};
+
+/**
+ * requestLogLine 把一条 request_logs 行拼成日志正文。
+ *
+ * cf 版没有 Go 版的进程内日志环，/panel/api/logs 的条目全部来自 request_logs，
+ * 这里负责把它压成一行人能读的文本：结果 · 模型 · 账号 · 状态 · 耗时 · token · 积分。
+ * uid 截前 8 位（面板场景够定位，又不至于把窄屏一行占满）。
+ */
+export function requestLogLine(e: {
+  outcome?: string; model?: string | null; uid?: string | null; status?: string | number | null;
+  ms?: number | null; prompt_tokens?: number | null; completion_tokens?: number | null; credits?: number | null;
+}): string {
+  const parts: string[] = [OUTCOME_CN[String(e.outcome || "")] || String(e.outcome || "请求")];
+  if (e.model) parts.push(String(e.model));
+  if (e.uid) parts.push("uid=" + String(e.uid).slice(0, 8));
+  if (e.status) parts.push("HTTP " + e.status);
+  const ms = Number(e.ms || 0);
+  if (ms > 0) parts.push(ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : Math.round(ms) + "ms");
+  const tok = Number(e.prompt_tokens || 0) + Number(e.completion_tokens || 0);
+  if (tok > 0) parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + "k tok" : tok + " tok");
+  const cr = Number(e.credits || 0);
+  if (cr > 0) parts.push("积分 " + cr.toFixed(2));
+  return parts.join(" · ");
+}
+
 /**
  * 账号池「成功/失败」「用量」列的数据源：request_logs 窗口聚合（口径与用量页一致）。
  *
@@ -217,10 +250,13 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     });
   });
 
-  // 日志环形缓冲（读 D1 最近 entries）
+  // 日志环形缓冲（读 D1 最近 entries）。
+  // 字段口径必须与 Go 版面板一致：{ ts, ch, text }，ch ∈ chat/task/sys——
+  // 前端 vendor 的 loadLogs 按 e.ch 筛频道、e.text 渲染正文并按关键词着色。
+  // 之前返回 { channel, msg }，前端全部渲染成 "undefined"（真机截图实锤）。
   app.get("/panel/api/logs", async (c) => {
     const entries = await queryRequestLogs(c.env, { limit: 200 }).catch(() => []);
-    return c.json({ entries: entries.map((e) => ({ ts: e.ts, channel: e.channel, msg: `${e.outcome} ${e.model ?? ""} uid=${e.uid ?? "-"} ${e.status}` })) });
+    return c.json({ entries: entries.map((e) => ({ ts: e.ts, ch: e.channel || "sys", text: requestLogLine(e) })) });
   });
 
   app.get("/panel/api/request_metrics", async (c) => {

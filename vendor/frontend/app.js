@@ -500,7 +500,7 @@ function probeDays(ts) {
   return isNaN(d) ? null : Math.floor(d);
 }
 function outCell(m, pr) {
-  if (!pr) return '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
+  if (!pr) return '<td class="num dtl">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
   const tip = '声称 ' + (pr.claimed ? fmtK(pr.claimed) : '?') + ' · 实测 ' + (pr.measured ? fmtK(pr.measured) : '?') +
     (pr.note ? ' · ' + pr.note : '') + (pr.tested_at ? ' · 探测于 ' + pr.tested_at : '');
   const days = probeDays(pr.tested_at);
@@ -509,15 +509,15 @@ function outCell(m, pr) {
     if (pr.claimed && pr.measured < pr.claimed) {
       const x = pr.claimed / pr.measured;
       const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
-      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+      return '<td class="num dtl" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
         fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
     }
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+    return '<td class="num dtl" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
       (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
   }
   if (pr.verdict === 'at_least' && pr.measured)
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
-  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+    return '<td class="num dtl" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num dtl" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
 /* rateCell 倍率列：牌价 vs 生效价。上游 credits 是牌价（转正后基准倍率），
@@ -636,11 +636,17 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  // 详细信息（默认档 / 支持档位 / 上下文 / 输出上限 / 描述全文）默认折叠：
+  // 移动端卡片给 tr 打 .open 才显示（td.dtl 的显隐由 CSS 控制，桌面端始终全显）。
+  // 模型代码 .nm.cp 点击即复制（桌面/移动都可用）。
+  const desc = m.description ? '<div class="md-desc">' + esc(m.description) + '</div>' : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"' + tip + '><div class="nm cp" data-mid="' + esc(m.id) + '" title="点击复制模型代码">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + desc +
+    '<button class="xs ghost md-toggle" type="button">详情 ▾</button></td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
-    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
-    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    '<td class="dtl">' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
+    '<td class="efs dtl" style="white-space:normal">' + effs + '</td>' +
+    '<td class="num dtl">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
     outCell(m, pr) + '</tr>';
 }
 
@@ -658,6 +664,42 @@ function renderModels() {
     : mdAll.length + ' 个模型';
   $('mdCount').className = filtered ? 'note src-off' : 'note';
 }
+
+/* 模型卡交互（事件委托，行是 innerHTML 重建的不能逐行绑）：
+   ① 点模型代码 → 复制到剪贴板（桌面/移动都可用）；
+   ② 点「详情」→ 折叠/展开该卡的详细信息（td.dtl 的显隐由 CSS 接管，
+      只在移动卡片模式生效，桌面端点它没副作用——按钮本身也是隐藏的）。 */
+$('mdBody').addEventListener('click', async ev => {
+  const tg = ev.target.closest('.md-toggle');
+  if (tg) {
+    const open = tg.closest('tr').classList.toggle('open');
+    tg.textContent = open ? '收起 ▴' : '详情 ▾';
+    return;
+  }
+  const nm = ev.target.closest('.nm.cp');
+  if (!nm || !nm.dataset.mid) return;
+  const mid = nm.dataset.mid;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(mid);
+    } else {
+      // 非 secure context（http 面板）兜底：隐藏 textarea + execCommand
+      const ta = document.createElement('textarea');
+      ta.value = mid;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    nm.classList.add('copied');
+    setTimeout(() => nm.classList.remove('copied'), 1200);
+    toast('已复制模型代码：' + mid, 'ok');
+  } catch (e) {
+    toast('复制失败：' + (e && e.message || e), 'err');
+  }
+});
 
 function resetModelFilter() {
   mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };

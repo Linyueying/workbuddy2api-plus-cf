@@ -233,6 +233,15 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 模型代码可点击复制（app.js 在 #mdBody 上做委托）；描述全文默认只在 title 里，
+   .md-desc / .md-toggle 仅在移动卡片模式由 CSS 打开，桌面保持零改动。 */
+.nm.cp { cursor: pointer; }
+.nm.cp:hover { color: var(--accent); }
+.nm.cp.copied { color: var(--ok); }
+.nm.cp::after { content: '⧉'; font-size: 10px; color: var(--ink-3); margin-left: 4px; vertical-align: 1px; }
+.nm.cp.copied::after { content: '✓'; color: var(--ok); }
+.md-desc { display: none; }
+.md-toggle { display: none; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -638,7 +647,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .topbar .grow { flex: none; }
   .topbar button { padding: 6px 11px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
-  .view { padding: 12px 12px 20px; }
+  .view { padding: 10px 10px 18px; }
 
   /* ③ 统计条 / KPI → 横向吸附条（纵向 3 行压到 1 行） */
   .stats, .kpis, .kpis.k4 {
@@ -654,10 +663,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     flex: 0 0 auto; scroll-snap-align: start;
     border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
   }
-  .stat { min-width: 104px; padding: 9px 12px; }
-  .stat .v { font-size: 18px; }
-  .stat .k { font-size: 11px; margin-top: 3px; }
-  .kpi { min-width: 126px; padding: 9px 12px 10px 14px; background: var(--surface-2); }
+  .stat { min-width: 104px; padding: 7px 11px; }
+  .stat .v { font-size: 17px; }
+  .stat .k { font-size: 10.5px; margin-top: 2px; }
+  .kpi { min-width: 126px; padding: 7px 11px 8px 13px; background: var(--surface-2); }
   .kpi .v { font-size: 17px; }
   .kpi .k { font-size: 11px; }
   .kpi .s { font-size: 10.5px; }
@@ -669,24 +678,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .acc.is-carded { display: block; width: 100%; }
   .acc.is-carded thead { display: none; }
   .acc.is-carded tbody { display: block; }
+  /* 卡片上下留白砍半（真机反馈"卡片太高"）：行内边距 6px→2.5px、行高 1.5→1.3、
+     卡片外边距 10px→7px。这些只动卡片模式，桌面表格不受影响。 */
   .acc.is-carded tr {
-    display: block; margin: 10px 12px; border: 1px solid var(--line);
+    display: block; margin: 7px 10px; border: 1px solid var(--line);
     border-left: 3px solid var(--ok); border-radius: 10px;
     background: var(--surface-2); overflow: hidden;
   }
   .acc.is-carded tr.cool { border-left-color: var(--warn); }
   .acc.is-carded tr.off { border-left-color: var(--bad); }
   .acc.is-carded td {
-    display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 10px;
-    padding: 6px 12px; border-bottom: 1px solid var(--line-soft);
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px;
+    padding: 2.5px 10px; border-bottom: 1px solid var(--line-soft);
+    line-height: 1.3;
     overflow-wrap: break-word; min-width: 0;
   }
   .acc.is-carded tr > td:last-child { border-bottom: 0; }
   /* 列名贴左、值整组贴右（margin-right:auto 吸收中间空隙）：右侧留白被用掉，
      且多段子值（成功 9 / 失败 0）保持挨在一起，不会被撑到整行两端。 */
   .acc.is-carded td[data-l]::before {
-    content: attr(data-l); flex: 0 0 74px; margin-right: auto;
-    color: var(--ink-3); font-size: 11.5px; font-weight: 500;
+    content: attr(data-l); flex: 0 0 64px; margin-right: auto;
+    color: var(--ink-3); font-size: 10.5px; font-weight: 500;
   }
   .acc.is-carded td[data-l] > * { flex: 0 1 auto; min-width: 0; }
   /* 只有真正"自成一块"的内容才独占整行垫到列名下方：账号名+ID（身份头）、
@@ -717,9 +729,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .acc.is-carded .efs { min-width: 0; }
   .acc.is-carded .usage-line { white-space: normal; flex-wrap: wrap; }
 
+  /* 密度收尾：徽标 / 按钮 / 身份字号同步收紧一档（同上，只作用卡片模式）。 */
+  .acc.is-carded .tag { padding: 1.5px 7px; font-size: 10.5px; }
+  .acc.is-carded td:not([data-l]) button { padding: 4px 9px; font-size: 11.5px; }
+  .acc.is-carded .who .nm { font-size: 12.5px; }
+  .acc.is-carded .who .id { font-size: 10.5px; margin-top: 0; }
+  .acc.is-carded .usage-item b { font-size: 11.5px; }
+
+  /* 模型卡（table.acc.md）：详细信息（默认档 / 思考档位 / 上下文 / 最大输出 /
+     描述全文）默认折叠，点「详情」给 tr 打 .open 展开。收起时只剩
+     模型代码 + 名称 + 能力徽标 + 积分倍率，一行一模型；分隔线一并去掉，
+     视觉上是紧凑的列表而不是一张张厚卡片。桌面端始终全显。 */
+  .acc.is-carded.md tr:not(.open) td.dtl { display: none; }
+  .acc.is-carded.md tr:not(.open) td { border-bottom: 0; }
+  .acc.is-carded.md .md-toggle { display: inline-block; margin: 4px 0 2px; }
+  .acc.is-carded.md tr.open td.dtl { border-bottom: 1px solid var(--line-soft); }
+  .acc.is-carded.md tr.open .md-desc {
+    display: block; flex: 0 0 100%;
+    font-size: 11px; color: var(--ink-3); line-height: 1.45; margin-top: 2px;
+  }
+
   /* ⑤ 块头：按钮换行、说明独占一行 */
   .box { margin-bottom: 14px; border-radius: 10px; box-shadow: none; }
-  .box > header { flex-wrap: wrap; gap: 8px; padding: 11px 13px; }
+  .box > header { flex-wrap: wrap; gap: 7px; padding: 9px 12px; }
   .box > header h3 { white-space: normal; font-size: 13px; }
   .box > header > .note { flex: 1 1 100%; order: 5; white-space: normal; line-height: 1.5; }
   .box > header select, .box > header input { max-width: 100%; }
@@ -786,7 +818,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .stat .v { font-size: 16.5px; }
   .kpi { min-width: 112px; }
   .kpi .v { font-size: 16px; }
-  .acc.is-carded td[data-l]::before { flex: 0 0 62px; font-size: 11px; }
+  .acc.is-carded td[data-l]::before { flex: 0 0 56px; font-size: 10px; }
   .topbar { padding: 8px 10px; gap: 6px; }
   .topbar button { padding: 5px 9px; font-size: 12px; }
 }
@@ -1569,6 +1601,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<script src="app.js?v=20261004a"></script>
+<script src="app.js?v=20261004b"></script>
 </body>
 </html>
