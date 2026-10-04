@@ -413,6 +413,9 @@ export interface AccountUsageAgg {
   requests: number;
   errors: number;
   total_tokens: number;
+  /** completion_tokens 单独聚合：吐字速率的分子只能是 completion（prompt 是输入，
+   *  不参与吐字）。拿 total_tokens 当分子会把长上下文账号的速率放大一个数量级。 */
+  completion_tokens: number;
   ms_sum: number;
 }
 
@@ -424,6 +427,7 @@ export async function usageByAccountWindow(env: Env, from: number, to: number): 
             COUNT(*) AS requests,
             SUM(CASE WHEN outcome IS NULL OR outcome != 'ok' THEN 1 ELSE 0 END) AS errors,
             SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) AS total_tokens,
+            SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
             SUM(COALESCE(ms, 0)) AS ms_sum
      FROM request_logs
      WHERE ts >= ? AND ts <= ? AND uid IS NOT NULL AND uid != ''

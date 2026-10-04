@@ -35,6 +35,10 @@ export interface GroupStats {
   /** _latSum / _durSum 累加过程中的中间槽位（finalize 折算后删除，不出现在响应里）。 */
   _latSum?: number;
   _durSum?: number;
+  /** _tpsSum / _tpsN 速率的中间槽位：逐请求「吐字/耗时」的累加与样本数。
+   *  速率必须逐请求累加再平均，不能拿总量与总耗时相除——见 finalize。 */
+  _tpsSum?: number;
+  _tpsN?: number;
 }
 
 /** UsageSnapshot 面板用量页的视图模型，字段名与前端 renderUsage 一一对应。 */
@@ -62,6 +66,24 @@ function num(v: unknown): number {
 function uKey(v: unknown): string {
   const s = String(v ?? "").trim();
   return s || "unknown";
+}
+
+/** canonicalUsageModel 剥掉 cn:/global: 前缀，把「同一个模型」归并成一行。
+ *
+ *  对齐 Go usage.go 的 canonicalUsageModel：积分表若按带前缀的原始名分组，
+ *  cn:claude 与 global:claude 会变成两行，各自的「积分 / 1M Token」都只统计了
+ *  一半样本——看起来像两个性价比不同的模型，实际是同一模型的两个域。
+ *  by_model 仍保留原始名（与 Go 的 modelAgg 一致，那里也是用 b.Model 原值）。
+ */
+function canonicalUsageModel(v: unknown): string {
+  let m = String(v ?? "").trim();
+  for (const prefix of ["cn:", "global:"]) {
+    if (m.startsWith(prefix)) {
+      m = m.slice(prefix.length);
+      break;
+    }
+  }
+  return m || "unknown";
 }
 
 /** emptyGroup 零值分组（累加器的初值）。 */
@@ -96,14 +118,37 @@ function accumulate(g: GroupStats, r: UsageRow): GroupStats {
   const tt = pt + ct;
   const cr = num(r.credits);
   const hit = num(r.cache_read_tokens);
+  const ms = num(r.ms);
   g.requests++;
   if (r.outcome !== "ok") g.errors++;
   g.prompt_tokens += pt;
   g.completion_tokens += ct;
   g.total_tokens += tt;
-  g._latSum = num(g._latSum) + num(r.ms);
-  g._durSum = num(g._durSum) + num(r.ms);
-  if (cr > 0) {
+  g._latSum = num(g._latSum) + ms;
+  g._durSum = num(g._durSum) + ms;
+  // 速率：逐请求记「吐字 / 该次耗时」，最后按样本平均（对齐 Go usage.go 的
+  // TPS/TPSN 与 handler.go 的 TokensPerSecond=completion*1000/latencyMs）。
+  //
+  // 两个必须同时改掉的历史错误：
+  //   1) 分子只算 completion。prompt 是**输入**，不参与吐字；把它算进来会让
+  //      长上下文请求（prompt 数千、completion 数百）的速率被放大一个数量级
+  //      ——实测单条 pt=8000/ct=500/30s 的请求，错误口径 283 tok/s，真实 16.7。
+  //   2) 必须逐请求再平均，不是「总 token / 总耗时」。后者是按耗时加权的，
+  //      一次慢请求会把整体均值拽向自己（辛普森悖论的另一种形态）。
+  // 分母兜底 1ms：ms 为 0 的行（未计时/时钟异常）不能产出 Infinity。
+  // token 全 0 的行代表「上游没回 usage」，没有吐字可测，不产生样本。
+  if (tt > 0) {
+    g._tpsSum = num(g._tpsSum) + (ct * 1000) / Math.max(1, ms);
+    g._tpsN = num(g._tpsN) + 1;
+  }
+  // 积分：样本资格是「上游是否回了 usage」（有 token 或 credit 任一观测），
+  // **不是**「这次是否花了钱」。对齐 Go 的 HasCredit（bucket 注释：CRN 用于
+  // 「区分缺字段与真实 0」）——真实 0 积分的请求同样是一次有效观测，把它排除
+  // 在分母外等于假装它不存在，于是「平均积分 / 1M Token」被系统性高估。
+  // credit=0 的行不贡献积分，但会把它的 token 带进分母——这正是要的稀释效果：
+  // 它确实没花钱，就该把平均单价拉低。token 与 credit 同出自上游同一个 usage
+  // 对象，故任一个有值即可判定「这次回过 usage」。
+  if (tt > 0 || cr > 0) {
     g.credits += cr;
     g.credit_tokens += tt;
     g.credit_samples++;
@@ -119,12 +164,15 @@ function accumulate(g: GroupStats, r: UsageRow): GroupStats {
 function finalize(g: GroupStats): GroupStats {
   const latSum = num((g as any)._latSum);
   g.avg_latency_ms = g.requests ? latSum / g.requests : 0;
-  // 速率按「总 Token / 总耗时」而不是逐个请求速率再平均——同上，避免长请求被稀释。
-  const seconds = latSum / 1000;
-  g.avg_tokens_per_second = seconds > 0 ? g.total_tokens / seconds : 0;
+  // 速率 = 逐请求「吐字/耗时」的算术平均（Go: tpsSum/tpsSamples）。
+  // 不再是 total_tokens / 总耗时：那条式子把 prompt 当成了吐字，且按耗时加权。
+  const tpsN = num((g as any)._tpsN);
+  g.avg_tokens_per_second = tpsN ? num((g as any)._tpsSum) / tpsN : 0;
   g.credits_per_1m_tokens = g.credit_tokens > 0 ? (g.credits / g.credit_tokens) * 1_000_000 : 0;
   delete (g as any)._latSum;
   delete (g as any)._durSum;
+  delete (g as any)._tpsSum;
+  delete (g as any)._tpsN;
   return g;
 }
 
@@ -212,6 +260,10 @@ export function buildUsageSnapshot(rows: UsageRow[], q: UsageQuery): UsageSnapsh
   const byAccountRaw = groupBy(rows, (r) => uKey(r.uid));
   const byModel = groupBy(rows, (r) => uKey(r.model));
   const byRealm = groupBy(rows, (r) => uKey(r.realm));
+  // 积分维度单独按「规范化模型名」分组（剥掉 cn:/global:），见 canonicalUsageModel。
+  // 代价是多扫一遍 rows（万级线性扫描，与已有三次分组同量级），换的是积分表
+  // 不再把同一个模型拆成两行、各自给出半样本的平均积分。
+  const byModelCanonical = groupBy(rows, (r) => canonicalUsageModel(r.model));
 
   // 账号的 realm 取该 uid 出现最多的那个（同一个号可以同时在 cn/global 被用）。
   const realmOf = new Map<string, string>();
@@ -240,7 +292,7 @@ export function buildUsageSnapshot(rows: UsageRow[], q: UsageQuery): UsageSnapsh
     credit_by_account: byAccountRaw
       .filter((g) => g.credits > 0)
       .map((g) => ({ ...g, nickname: q.nicknames?.[g.key] ?? "", realm: realmOf.get(g.key) ?? "unknown" })),
-    credit_by_model: byModel
+    credit_by_model: byModelCanonical
       .filter((g) => g.credits > 0)
       .map((g) => ({ ...g, rate: q.rates?.[g.key] ?? "" })),
   };

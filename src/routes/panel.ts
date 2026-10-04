@@ -169,13 +169,18 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       // checkin_done/model_costs 等运行时字段——后端此前只映射了 7 个基础字段，
       // 导致账号池整列空白（行能画、但成功/失败/用量/状态标签全空）。
       accounts: (accounts ?? []).map((a) => {
-        // 聚合行口径与 usage-agg.ts 一致：requests 含失败；均值延迟/速率在展示层折算
-        // （总耗时/请求数、总 token/总秒），避免逐行平均的辛普森悖论。
+        // 聚合行口径与 usage-agg.ts 一致：requests 含失败；均值延迟在展示层折算
+        // （总耗时/请求数），避免逐行平均的辛普森悖论。
+        //
+        // 速率的分子**只能是 completion**：prompt 是输入、不参与吐字，把它算进来
+        // 会让长上下文账号的速率放大一个数量级（与 usage-agg.ts 同一处修复，
+        // 对齐 Go 的 TokensPerSecond = completion*1000/latencyMs）。
         const u = usageByUid.get(String(a.uid));
         const requests = Number(u?.requests ?? 0) || 0;
         const errors = Math.min(Number(u?.errors ?? 0) || 0, requests);
         const msSum = Number(u?.ms_sum ?? 0) || 0;
         const totalTokens = Number(u?.total_tokens ?? 0) || 0;
+        const completionTokens = Number(u?.completion_tokens ?? 0) || 0;
         return {
           uid: a.uid,
           nickname: a.nickname,
@@ -203,7 +208,9 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
             request_count: requests,
             total_tokens: totalTokens,
             last_latency_ms: requests > 0 ? msSum / requests : 0,
-            last_tokens_per_second: msSum > 0 ? totalTokens / (msSum / 1000) : 0,
+            // 吐字速率 = completion / 窗口总耗时。不是 total_tokens——那会把输入
+            // token 算成吐字（详见上方注释与 usage-agg.ts 的同类修复）。
+            last_tokens_per_second: msSum > 0 ? completionTokens / (msSum / 1000) : 0,
           },
         };
       }),

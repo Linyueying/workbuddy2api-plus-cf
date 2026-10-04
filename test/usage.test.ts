@@ -91,24 +91,93 @@ describe("用量聚合数值口径", () => {
     expect(s.totals.avg_latency_ms).toBe(2000);
   });
 
-  it("速率按总 token/总秒，避免长请求被稀释", () => {
+  it("速率只算 completion：prompt 是输入，不算吐字", () => {
     const s = buildUsageSnapshot([row({ ms: 2000, prompt_tokens: 100, completion_tokens: 100 })], {
       from: 0, to: 24 * H, since: 0,
     });
-    expect(s.totals.avg_tokens_per_second).toBeCloseTo(100); // 200 tok / 2s
+    // Go: TokensPerSecond = completion*1000/latencyMs = 100*1000/2000 = 50。
+    // 旧实现是 (100+100)/(2000/1000)=100，把输入 token 当成了吐字。
+    expect(s.totals.avg_tokens_per_second).toBeCloseTo(50);
   });
 
-  it("credits 为 0 的行不计入 credit_tokens/samples（不伪造性价比）", () => {
+  it("长上下文请求不被 prompt 放大（旧口径会放大一个数量级）", () => {
+    // pt=8000 是输入、ct=500 是吐字，真实吐字速率 500/30s ≈ 16.7 tok/s。
+    // 旧口径 (8000+500)/30 ≈ 283 tok/s —— 17 倍虚高，正是「均速率异常偏大」。
+    const s = buildUsageSnapshot([row({ ms: 30_000, prompt_tokens: 8000, completion_tokens: 500 })], {
+      from: 0, to: 24 * H, since: 0,
+    });
+    expect(s.totals.avg_tokens_per_second).toBeCloseTo(500 / 30, 1);
+  });
+
+  it("速率是逐请求速率的算术平均，不是总量/总耗时", () => {
+    // A: 1000 tok 用 1s → 1000 tok/s；B: 100 tok 用 10s → 10 tok/s。
+    // 算术平均 = 505；「总 token / 总耗时」= 1100/11 = 100（被慢请求主导）。
+    const s = buildUsageSnapshot(
+      [
+        row({ ms: 1000, prompt_tokens: 0, completion_tokens: 1000 }),
+        row({ ms: 10_000, prompt_tokens: 0, completion_tokens: 100 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.totals.avg_tokens_per_second).toBeCloseTo(505);
+  });
+
+  it("上游没回 usage 的行不产生速率样本（没有吐字可测）", () => {
+    const s = buildUsageSnapshot(
+      [row({ ms: 3000, prompt_tokens: 0, completion_tokens: 0 }), row({ ms: 2000, completion_tokens: 100 })],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    // 只有第二行是样本：100*1000/2000 = 50
+    expect(s.totals.avg_tokens_per_second).toBeCloseTo(50);
+  });
+
+  it("ms 为 0 不产生 Infinity（时钟未计时时兜底 1ms）", () => {
+    const s = buildUsageSnapshot([row({ ms: 0, completion_tokens: 100 })], { from: 0, to: 24 * H, since: 0 });
+    expect(Number.isFinite(s.totals.avg_tokens_per_second)).toBe(true);
+  });
+
+  it("credit=0 但回了 usage 的行计入样本（真实 0 消耗不能排除在分母外）", () => {
+    // 对齐 Go 的 HasCredit：bucket 注释写明 CRN 用于「区分缺字段与真实 0」。
+    // 旧实现按 credits>0 过滤，把 0 积分的观测整行丢掉，分母只剩花了钱的请求
+    // ——于是「平均积分 / 1M Token」被系统性高估（假装免费的请求不存在）。
     const s = buildUsageSnapshot(
       [row({ credits: 0.02, prompt_tokens: 1000 }), row({ credits: 0, prompt_tokens: 500 })],
       { from: 0, to: 24 * H, since: 0 },
     );
     expect(s.totals.credits).toBeCloseTo(0.02);
-    // credit_tokens 只算有 credit 那行的 total_tokens（1000+50）——另一行的 550 不计入
-    // 「匹配 Token」，但 total_tokens 是全局口径，两行的 1050+550 都要算。
-    expect(s.totals.credit_tokens).toBe(1050);
-    expect(s.totals.credit_samples).toBe(1);
+    // 两行都回过 usage（第二行 pt=500/ct=50），故都计入「匹配 Token」：
+    // (1000+50) + (500+50) = 1600
+    expect(s.totals.credit_tokens).toBe(1600);
+    expect(s.totals.credit_samples).toBe(2);
     expect(s.totals.total_tokens).toBe(1600);
+  });
+
+  it("上游没回 usage 的行不算积分样本（缺字段不能当成 0 消耗）", () => {
+    // token 与 credit 全 0 = 这次压根没拿到 usage，不该稀释性价比。
+    const s = buildUsageSnapshot(
+      [row({ credits: 0.02, prompt_tokens: 1000 }), row({ credits: 0, prompt_tokens: 0, completion_tokens: 0 })],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.totals.credit_samples).toBe(1);
+    expect(s.totals.credit_tokens).toBe(1050);
+    expect(s.totals.credits_per_1m_tokens).toBeCloseTo((0.02 / 1050) * 1_000_000);
+  });
+
+  it("积分表按规范化模型名归并：cn:/global: 前缀不拆成两行", () => {
+    // 对齐 Go 的 canonicalUsageModel：否则同一模型在积分表里变成两行，
+    // 各自的「积分 / 1M Token」都只有一半样本，读起来像两个性价比不同的模型。
+    const s = buildUsageSnapshot(
+      [
+        row({ model: "cn:claude-sonnet-4", credits: 0.02, prompt_tokens: 1000 }),
+        row({ model: "global:claude-sonnet-4", credits: 0.01, prompt_tokens: 1000 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.credit_by_model).toHaveLength(1);
+    expect(s.credit_by_model[0].key).toBe("claude-sonnet-4");
+    expect(s.credit_by_model[0].credits).toBeCloseTo(0.03);
+    // by_model 仍保留原始名（与 Go 的 modelAgg 用 b.Model 原值一致）
+    expect(s.by_model).toHaveLength(2);
   });
 
   it("credits_per_1m_tokens 折算正确", () => {
