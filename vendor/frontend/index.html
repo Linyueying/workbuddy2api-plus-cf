@@ -625,16 +625,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .nav .sig .row + .row { display: none; }
   .main { padding-bottom: calc(var(--navh) + env(safe-area-inset-bottom, 0px)); }
 
-  /* ② 顶栏瘦身：标题 + 状态 + 三个按钮；状态可截断但保留 */
+  /* ② 顶栏瘦身：标题 + 状态 + 三个按钮；状态可截断但保留。
+     标题与按钮必须 nowrap + flex:none——360px 真机上它们会被 flex 压缩，
+     「账号池」折成两行、「刷新」竖着断字，正是截图里那种碎掉的样子。 */
   .topbar { padding: 9px 13px; gap: 8px; }
-  .topbar h2 { font-size: 14.5px; }
+  .topbar h2 { font-size: 14.5px; white-space: nowrap; flex: none; }
   .topbar .sep { display: none; }
   .topbar .meta {
     flex: 1 1 auto; min-width: 0; font-size: 11.5px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .topbar .grow { flex: none; }
-  .topbar button { padding: 6px 11px; font-size: 12.5px; }
+  .topbar button { padding: 6px 11px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
   .view { padding: 12px 12px 20px; }
 
@@ -675,23 +677,35 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .acc.is-carded tr.cool { border-left-color: var(--warn); }
   .acc.is-carded tr.off { border-left-color: var(--bad); }
   .acc.is-carded td {
-    display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px;
-    padding: 7px 12px; border-bottom: 1px solid var(--line-soft);
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 10px;
+    padding: 6px 12px; border-bottom: 1px solid var(--line-soft);
     overflow-wrap: break-word; min-width: 0;
   }
   .acc.is-carded tr > td:last-child { border-bottom: 0; }
+  /* 列名贴左、值整组贴右（margin-right:auto 吸收中间空隙）：右侧留白被用掉，
+     且多段子值（成功 9 / 失败 0）保持挨在一起，不会被撑到整行两端。 */
   .acc.is-carded td[data-l]::before {
-    content: attr(data-l); flex: 0 0 74px;
+    content: attr(data-l); flex: 0 0 74px; margin-right: auto;
     color: var(--ink-3); font-size: 11.5px; font-weight: 500;
   }
-  /* 值不放大铺开：多个子元素（成功 1284 / 失败 12）要挨在一起，别被 flex:1
-     拉到整行两端；块级子元素（积分值+进度条、状态标签+原因、账号名+ID）
-     独占整行竖排，才是移动卡片的正常形态。 */
   .acc.is-carded td[data-l] > * { flex: 0 1 auto; min-width: 0; }
-  .acc.is-carded td[data-l] > div { flex: 0 0 100%; }
+  /* 只有真正"自成一块"的内容才独占整行垫到列名下方：账号名+ID（身份头）、
+     状态原因/限流框、积分进度条。其余一律与列名同行靠右，卡片不再虚高。 */
+  .acc.is-carded td.who > div,
+  .acc.is-carded td > .hint,
+  .acc.is-carded td > .rate-limits,
+  .acc.is-carded td.cred > .bar { flex: 0 0 100%; }
   .acc.is-carded .mark { display: none; }
-  .acc.is-carded td:not([data-l]) { justify-content: flex-end; }
+  /* .c-acts 的 width:1px 是桌面端「操作列=内容宽」的技巧；卡片模式下不改回
+     auto，操作格只有 1px 宽，按钮整排溢出、被卡片 overflow:hidden 裁成细条
+     ——密钥页「编辑」按钮消失就是这个原因。 */
+  .acc.is-carded .c-acts { width: auto; white-space: normal; }
+  /* 无列名的单元格 = 操作列：按钮换行并等分撑满整行——既修掉密钥页按钮被
+     overflow:hidden 裁掉的问题（按钮不再溢出），也让操作区吃满宽度好点按。 */
+  .acc.is-carded td:not([data-l]) { justify-content: flex-start; gap: 6px 6px; }
+  .acc.is-carded td:not([data-l]) button { flex: 1 1 auto; }
   .acc.is-carded td.empty { justify-content: center; }
+  .acc.is-carded td.empty button { flex: 0 0 auto; }
   .acc.is-carded tr.is-solo { border-left-color: var(--line); }
   /* 卡片里放开截断：账号名 / ID / 用量的省略号在窄屏正是"看不清"的来源 */
   .acc.is-carded .who { max-width: none; min-width: 0; }
@@ -702,7 +716,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .acc.is-carded .cred,
   .acc.is-carded .efs { min-width: 0; }
   .acc.is-carded .usage-line { white-space: normal; flex-wrap: wrap; }
-  .acc.is-carded .c-acts .acts { flex-wrap: wrap; }
 
   /* ⑤ 块头：按钮换行、说明独占一行 */
   .box { margin-bottom: 14px; border-radius: 10px; box-shadow: none; }
