@@ -236,6 +236,69 @@ describe("用量聚合数值口径", () => {
   });
 });
 
+describe("免费模型剔除：平均积分只算需要消耗积分的模型", () => {
+  it("免费模型的 token 不计入平均积分分母（只算付费 token 的积分）", () => {
+    // 付费模型花 0.5 积分换 1M token；免费模型有 9M token 但 credits 恒 0。
+    // 旧逻辑会把 10M token 一起除，得出 0.05；正确应是 0.5 / 1M。
+    const s = buildUsageSnapshot(
+      [
+        row({ model: "gpt-4o", credits: 0.5, prompt_tokens: 1_000_000, completion_tokens: 0 }),
+        row({ model: "free-model", credits: 0, prompt_tokens: 9_000_000, completion_tokens: 0 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.totals.credits).toBeCloseTo(0.5);
+    expect(s.totals.credit_tokens).toBe(1_000_000);
+    expect(s.totals.credits_per_1m_tokens).toBeCloseTo(0.5);
+    // 免费模型不进分母，也不进样本数
+    expect(s.totals.credit_samples).toBe(1);
+  });
+
+  it("同模型出现一次付费即视为付费模型，不整模型剔除", () => {
+    // 同一模型 m：第一次 credit=0、第二次 credit=0.02。它不是免费模型，
+    // 两次 token 都应计入分母。
+    const s = buildUsageSnapshot(
+      [
+        row({ model: "m", credits: 0, prompt_tokens: 1000, completion_tokens: 0 }),
+        row({ model: "m", credits: 0.02, prompt_tokens: 1000, completion_tokens: 0 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.totals.credit_tokens).toBe(2000);
+    expect(s.totals.credit_samples).toBe(2);
+    expect(s.totals.credits_per_1m_tokens).toBeCloseTo((0.02 / 2000) * 1_000_000);
+  });
+
+  it("免费模型不出现在积分维度表，但仍在主用量表可见", () => {
+    const s = buildUsageSnapshot(
+      [
+        row({ model: "paid", credits: 0.02, prompt_tokens: 1000, completion_tokens: 0 }),
+        row({ model: "free", credits: 0, prompt_tokens: 1000, completion_tokens: 0 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.credit_by_model.map((g) => g.key)).toEqual(["paid"]);
+    expect(s.by_model.map((g) => g.key).sort()).toEqual(["free", "paid"]);
+    // 主用量表的 total_tokens 仍包含两个模型（免费模型只是不进积分分母）
+    expect(s.totals.total_tokens).toBe(2000);
+  });
+
+  it("按比例混合：1M 付费 + 1M 免费，平均积分只由付费部分决定", () => {
+    // 付费：1M token / 0.3 积分；免费：1M token / 0 积分。
+    // 期望 0.3 / 1M，而非 0.3 / 2M = 0.15（被免费稀释的结果）。
+    const s = buildUsageSnapshot(
+      [
+        row({ model: "paid", credits: 0.3, prompt_tokens: 1_000_000, completion_tokens: 0 }),
+        row({ model: "free", credits: 0, prompt_tokens: 1_000_000, completion_tokens: 0 }),
+        row({ model: "free", credits: 0, prompt_tokens: 500_000, completion_tokens: 0 }),
+      ],
+      { from: 0, to: 24 * H, since: 0 },
+    );
+    expect(s.totals.credit_tokens).toBe(1_000_000);
+    expect(s.totals.credits_per_1m_tokens).toBeCloseTo(0.3);
+  });
+});
+
 describe("时序分桶", () => {
   it("短窗口用小时桶（前端按 HH:00 显示），长窗口自动切日桶", () => {
     expect(bucketOf(24 * H).scope).toBe("hour");

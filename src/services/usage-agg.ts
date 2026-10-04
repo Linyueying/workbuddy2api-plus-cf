@@ -25,8 +25,9 @@ export interface GroupStats {
   avg_latency_ms: number;
   avg_tokens_per_second: number;
   credits: number;
-  /** credit_tokens 有 credit 的那些请求对应的 Token——「匹配 Token」。
-   *  升级前或缺字段的历史请求不计，避免假装它们不花钱。 */
+  /** credit_tokens 需要消耗积分的模型所产生 Token——「匹配 Token」（分母）。
+   *  免费模型（出现过 token 但从不产生积分的模型）的 Token 不计入，否则会把
+   *  单价虚低、读起来像付费模型更便宜。判定逻辑见 freeModelSet。 */
   credit_tokens: number;
   credit_samples: number;
   credits_per_1m_tokens: number;
@@ -107,18 +108,45 @@ function emptyGroup(key: string): GroupStats {
 }
 
 /**
+ * freeModelSet 扫描整批行，挑出「免费模型」——出现过 token 但**从不**产生
+ * `credits > 0` 消耗的模型。
+ *
+ * 计算「平均积分 / 1M Token」时，需要把免费模型的 token 从分母里剔除：免费模型
+ * 本来就不花积分，把它们算进分母只会把单价虚低，读起来像「付费模型更便宜」。
+ * 这是 cf 专属的口径（与 Go 版无关，是业务方自己的口径）。
+ *
+ * 判定以原始 model 名（uKey）为身份，与 by_model 分组、accumulate 里的逐行判定
+ * 保持一致；credit_by_model 走规范化名（canonicalUsageModel），但免费模型在那张
+ * 表本来就被 `credits > 0` 过滤掉了，所以不会露出。
+ */
+function freeModelSet(rows: UsageRow[]): Set<string> {
+  const hasTokens = new Set<string>();
+  const everCharged = new Set<string>();
+  for (const r of rows) {
+    const k = uKey(r.model);
+    const tt = num(r.prompt_tokens) + num(r.completion_tokens);
+    if (tt > 0) hasTokens.add(k);
+    if (tt > 0 && num(r.credits) > 0) everCharged.add(k);
+  }
+  const free = new Set<string>();
+  for (const k of hasTokens) if (!everCharged.has(k)) free.add(k);
+  return free;
+}
+
+/**
  * accumulate 累加一行到分组累加器。
  *
  * 延迟/速率这类**比值**必须在最后统一算，不能逐行平均再平均（辛普森悖论：
  * 1 次 10 秒长请求与 99 次 100ms 请求，逐行均值是 199ms，真实均值是 100ms）。
  */
-function accumulate(g: GroupStats, r: UsageRow): GroupStats {
+function accumulate(g: GroupStats, r: UsageRow, freeModels: Set<string>): GroupStats {
   const pt = num(r.prompt_tokens);
   const ct = num(r.completion_tokens);
   const tt = pt + ct;
   const cr = num(r.credits);
   const hit = num(r.cache_read_tokens);
   const ms = num(r.ms);
+  const isFreeModel = freeModels.has(uKey(r.model));
   g.requests++;
   if (r.outcome !== "ok") g.errors++;
   g.prompt_tokens += pt;
@@ -148,7 +176,13 @@ function accumulate(g: GroupStats, r: UsageRow): GroupStats {
   // credit=0 的行不贡献积分，但会把它的 token 带进分母——这正是要的稀释效果：
   // 它确实没花钱，就该把平均单价拉低。token 与 credit 同出自上游同一个 usage
   // 对象，故任一个有值即可判定「这次回过 usage」。
-  if (tt > 0 || cr > 0) {
+  //
+  // 但「免费模型」是另一回事：它**整模型**都不花积分（免费模型判定见
+  // freeModelSet）。这种整模型的 token 必须从积分分母里剔除——否则免费模型
+  // 的海量 token 会把「付费模型的真实单价」稀释掉。注意区分：credit=0 的零散
+  // 行（同模型也常花积分）仍计入分母（它稀释得对）；只有「从不花钱的模型」才
+  // 整模型剔除。免费模型的 credits 恒为 0，剔除它不改变分子，只清掉分母的虚低。
+  if ((tt > 0 || cr > 0) && !isFreeModel) {
     g.credits += cr;
     g.credit_tokens += tt;
     g.credit_samples++;
@@ -177,13 +211,13 @@ function finalize(g: GroupStats): GroupStats {
 }
 
 /** groupBy 按 keyOf 分组后 finalize，并按 key 排序保证输出稳定。 */
-function groupBy(rows: UsageRow[], keyOf: (r: UsageRow) => string): GroupStats[] {
+function groupBy(rows: UsageRow[], keyOf: (r: UsageRow) => string, freeModels: Set<string>): GroupStats[] {
   const map = new Map<string, GroupStats>();
   for (const r of rows) {
     const k = keyOf(r);
     let g = map.get(k);
     if (!g) map.set(k, (g = emptyGroup(k)));
-    accumulate(g, r);
+    accumulate(g, r, freeModels);
   }
   return [...map.values()].map(finalize).sort((a, b) => a.key.localeCompare(b.key));
 }
@@ -256,14 +290,16 @@ export interface UsageQuery {
 
 /** buildUsageSnapshot 聚合入口：行数组 → 面板视图模型。 */
 export function buildUsageSnapshot(rows: UsageRow[], q: UsageQuery): UsageSnapshot {
-  const totals = finalize(rows.reduce(accumulate, emptyGroup("all")));
-  const byAccountRaw = groupBy(rows, (r) => uKey(r.uid));
-  const byModel = groupBy(rows, (r) => uKey(r.model));
-  const byRealm = groupBy(rows, (r) => uKey(r.realm));
+  // 免费模型集合（出现过 token 但从不花积分的模型）——平均积分的分母要剔除它们。
+  const freeModels = freeModelSet(rows);
+  const totals = finalize(rows.reduce((g, r) => accumulate(g, r, freeModels), emptyGroup("all")));
+  const byAccountRaw = groupBy(rows, (r) => uKey(r.uid), freeModels);
+  const byModel = groupBy(rows, (r) => uKey(r.model), freeModels);
+  const byRealm = groupBy(rows, (r) => uKey(r.realm), freeModels);
   // 积分维度单独按「规范化模型名」分组（剥掉 cn:/global:），见 canonicalUsageModel。
   // 代价是多扫一遍 rows（万级线性扫描，与已有三次分组同量级），换的是积分表
   // 不再把同一个模型拆成两行、各自给出半样本的平均积分。
-  const byModelCanonical = groupBy(rows, (r) => canonicalUsageModel(r.model));
+  const byModelCanonical = groupBy(rows, (r) => canonicalUsageModel(r.model), freeModels);
 
   // 账号的 realm 取该 uid 出现最多的那个（同一个号可以同时在 cn/global 被用）。
   const realmOf = new Map<string, string>();
