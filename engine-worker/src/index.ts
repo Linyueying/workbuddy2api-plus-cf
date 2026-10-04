@@ -29,18 +29,19 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import { getConfig } from "../../src/config";
 import { runScheduledJobs } from "../../src/alarms";
-import { queryRequestLogs, deleteRequestLogsBefore } from "../../src/storage/d1";
+import { queryRequestLogs, deleteRequestLogsBefore, deleteRequestLogsByIds } from "../../src/storage/d1";
 import { archiveLogs } from "../../src/storage/r2";
 import { PoolDO } from "../../src/durable/account-pool";
+import type { RequestLogEntry } from "../../src/types";
 
 export { PoolDO };
 
-/** 归档多少天前的请求日志（留近期数据在 D1 供面板查询）。 */
+/** 保留天数回落值（配置缺失时用，与 config.ts 默认值一致）。 */
 const ARCHIVE_OLDER_THAN_DAYS = 7;
-/** 单次归档上限。受 queryRequestLogs 的 LIMIT 上限（1000）约束，别调更大。 */
+/** 单轮归档上限。受 queryRequestLogs 的 LIMIT 上限（1000）约束，别调更大。 */
 const ARCHIVE_BATCH = 1000;
-/** KV 水位键：已归档到的最老时间戳（ms）。 */
-const WATERMARK_KEY = "log_archive_watermark";
+/** 单次 cron 最多跑几轮（crons 每天一次，积压过多时次日继续搬）。 */
+const ARCHIVE_MAX_ROUNDS = 5;
 
 export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -78,57 +79,72 @@ async function runHourlyJobs(env: Env): Promise<void> {
 }
 
 /**
- * 把 N 天前的请求日志从 D1 搬到 R2。
+ * 把 N 天前的请求日志从 D1 搬走（有 R2 就搬到 R2，没有就直接删）。
  *
- * 存在理由：D1 日志只增不减，长期会顶到容量上限；R2 便宜得多，适合放冷数据。
- * 此前 archiveLogs 写了却无任何调用点（死代码），R2 桶绑定了却从不写入。
+ * 存在理由：D1 日志只增不减，长期会顶到容量上限。
  *
- * 为什么需要水位：queryRequestLogs 固定 `ORDER BY ts DESC LIMIT 1000`，
- * 且不删 D1 源数据——若每轮都按同一个条件查，会反复归档同一批。
- * 所以记一个水位，每轮从水位继续向更早推进。
+ * ── 为什么废弃水位（旧实现靠 KV 记「已归档到的最老 ts」）───────────────
+ * 旧实现归档后**不删 D1**，靠水位（upper = min(wm, cutoff)）向更早推进。
+ * 一旦某个 cutoff 之前的日志全部归档完，水位就停在那个最老值不再前进，
+ * 于是每轮都查到同一批、反复 append 进同一个 R2 分片——文件无限重复累积；
+ * 更要命的是 D1 里的数据从来没被删过。
  *
- * 刻意**不删 D1 源数据**：归档是只读副本，误删无法恢复。清理留给人工。
+ * 新实现让「删除」本身充当水位：已归档的行从 D1 消失，下轮取到的必然是
+ * 还没归档的。水位、重复归档、以及「绑了 R2 就永不清理」三个问题一并消失。
  */
 async function archiveRequestLogs(env: Env): Promise<void> {
-  // R2 是可选绑定：没桶时不归档，但**不能什么都不做**——否则 D1 的
-  // request_logs 只增不减，长期顶到容量上限。改为到期直接从 D1 清理，
-  // 保留天数语义不变，代价是没有冷备份（不用 R2 的必然取舍）。
-  if (!env.WB2A_LOGS) {
-    const cutoff = Date.now() - ARCHIVE_OLDER_THAN_DAYS * 86400_000;
+  const cfg = await getConfig(env).catch(() => null);
+  const days = retentionDays(cfg);
+  const cutoff = Date.now() - days * 86400_000;
+
+  // 归档开关关掉 / 没绑 R2：直接删。没有冷备份是不用 R2 的必然取舍，
+  // 但容量保护不能停——否则 D1 只增不减，迟早顶到配额。
+  const archiveOn = !!env.WB2A_LOGS && cfg?.logging?.request_archive_enabled !== false;
+  if (!archiveOn) {
     try {
       const n = await deleteRequestLogsBefore(env, cutoff);
-      console.log(
-        `[scheduler] 未绑定 R2：改为清理 D1 ${ARCHIVE_OLDER_THAN_DAYS} 天前日志，删除 ${n} 行`,
-      );
+      console.log(`[scheduler] 日志清理（保留 ${days} 天，无冷备份）：删除 ${n} 行`);
     } catch (e: any) {
-      console.log(`[scheduler] 日志清理失败：${String(e?.message ?? e)}`);
+      console.error(`[scheduler] 日志清理失败：${String(e?.message ?? e)}`);
     }
     return;
   }
+
   try {
-    const cutoff = Date.now() - ARCHIVE_OLDER_THAN_DAYS * 86400_000;
-    const raw = await env.WB2A_CONFIG.get(WATERMARK_KEY).catch(() => null);
-    const wm = Number(raw) || 0;
-    // 水位存在时以它为准（向更早推进），否则从 cutoff 开始
-    const upper = wm > 0 ? Math.min(wm, cutoff) : cutoff;
+    let archived = 0;
+    let removed = 0;
+    for (let round = 0; round < ARCHIVE_MAX_ROUNDS; round++) {
+      const rows = await queryRequestLogs(env, { to: cutoff, limit: ARCHIVE_BATCH });
+      if (!rows?.length) break;
 
-    const rows = await queryRequestLogs(env, { to: upper, limit: ARCHIVE_BATCH });
-    if (!rows?.length) {
-      console.log("[scheduler] 无可归档日志（水位=" + (wm || "无") + "）");
-      return;
+      // 按日志自身日期分片：一批 1000 条往往跨好几天，整批塞进「最老那天」
+      // 的分片会让文件名与内容日期不符，事后无法按日期定位。
+      const byDay = new Map<string, RequestLogEntry[]>();
+      for (const r of rows) {
+        const day = new Date(Number(r.ts) || Date.now()).toISOString().slice(0, 10);
+        const list = byDay.get(day);
+        if (list) list.push(r);
+        else byDay.set(day, [r]);
+      }
+      for (const [day, list] of byDay) await archiveLogs(env, list, day);
+
+      // 只删确认已写入 R2 的行（按 id 精确删），漏删最多是下轮重搬，误删就是真丢。
+      const ids = rows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n) && n > 0);
+      removed += await deleteRequestLogsByIds(env, ids);
+      archived += rows.length;
+      if (rows.length < ARCHIVE_BATCH) break; // 该 cutoff 之前的都搬完了
     }
-
-    const stamps = rows.map((r) => Number(r.ts) || 0).filter((t) => t > 0);
-    const oldest = Math.min(...stamps);
-    const day = new Date(oldest).toISOString().slice(0, 10);
-
-    await archiveLogs(env, rows, day);
-    await env.WB2A_CONFIG.put(WATERMARK_KEY, String(oldest)).catch(() => {});
     console.log(
-      `[scheduler] 已归档 ${rows.length} 条 → logs/${day}.jsonl` +
-        `（最老 ${new Date(oldest).toISOString()}，新水位 ${oldest}）`,
+      `[scheduler] 日志归档（保留 ${days} 天）：归档 ${archived} 条 → R2，D1 删除 ${removed} 行`,
     );
-  } catch (e) {
-    console.error("[scheduler] 日志归档失败:", String(e));
+  } catch (e: any) {
+    // 归档失败**不删**：宁可 D1 多留几天，也不能删掉没进 R2 的数据。下一轮重试。
+    console.error(`[scheduler] 日志归档失败，本轮不删除：${String(e?.message ?? e)}`);
   }
+}
+
+/** retentionDays 保留天数：读配置，缺失或非法回落 7 天（与 config.ts 默认值一致）。 */
+function retentionDays(cfg: { logging?: { request_retention_days?: number } } | null): number {
+  const n = Number(cfg?.logging?.request_retention_days);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : ARCHIVE_OLDER_THAN_DAYS;
 }

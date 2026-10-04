@@ -189,6 +189,8 @@ export interface ApiKeyRow {
 
 /** 请求日志条目（落 D1 request_logs，可归档到 R2）。 */
 export interface RequestLogEntry {
+  /** D1 自增主键。写入侧不填；查询（SELECT *）会带出，归档后按 id 精确删除已归档行。 */
+  id?: number;
   ts: number;
   channel: "chat" | "task" | "sys";
   client_ip?: string;

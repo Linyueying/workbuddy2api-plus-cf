@@ -327,6 +327,30 @@ export async function deleteRequestLogsBefore(env: Env, cutoff: number): Promise
   return Number(r?.meta?.changes ?? 0);
 }
 
+/**
+ * D1 单条语句的绑定参数上限（实测 100）。批量删除必须按此切块。
+ */
+const D1_PARAM_CHUNK = 100;
+
+/**
+ * deleteRequestLogsByIds 按 id 精确删除**已确认归档成功**的日志行。
+ *
+ * 为什么不用「按时间删一段」：归档每轮只搬 BATCH 条（受 queryRequestLogs 的
+ * LIMIT 约束），若按 ts 区间删，会把本轮**没搬走**的更老数据一起删掉——
+ * 那就是真丢数据了。按 id 删只删真正落到 R2 的那些行。
+ */
+export async function deleteRequestLogsByIds(env: Env, ids: number[]): Promise<number> {
+  let removed = 0;
+  for (let i = 0; i < ids.length; i += D1_PARAM_CHUNK) {
+    const chunk = ids.slice(i, i + D1_PARAM_CHUNK).filter((n) => Number.isFinite(n) && n > 0);
+    if (!chunk.length) continue;
+    const sql = `DELETE FROM request_logs WHERE id IN (${chunk.map(() => "?").join(",")})`;
+    const r = await run(env, sql, chunk);
+    removed += Number(r?.meta?.changes ?? 0);
+  }
+  return removed;
+}
+
 // ---------- 用量 ----------
 // 0001 建的 usage 表（hour,model,realm,tokens,cnt）已废弃：它按小时预聚合且无
 // uid，面板要的「按账号」「prompt/completion 拆分」「credit」「缓存命中」全都
