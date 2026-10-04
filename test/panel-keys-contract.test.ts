@@ -100,6 +100,14 @@ describe("密钥明文契约（静态守卫）", () => {
     }
     // 禁用账号必须靠 disabled 布尔暴露，不能只回 status（前端用 s.disabled 判定标签）。
     expect(overview).toMatch(/disabled:\s*a\.status\s*===\s*"disabled"/);
+    // 时间字段必须是 ISO 字符串（Go 契约）：前端 ago() 对参数调 .startsWith()，
+    // 传数字时间戳会在账号首次成功后抛 TypeError，整个账号池 tbody 渲染崩溃
+    // （异常被 loadOverview 的 catch 吞掉，表现为「连行都没有」）。
+    for (const f of ["last_success", "breaker_until", "degrade_until"]) {
+      const line = overview.split("\n").find((l) => l.includes(f + ":"));
+      expect(line, `overview 缺时间字段 ${f}`).toBeTruthy();
+      expect(line, `${f} 必须序列化为 ISO 字符串（?: new Date(...).toISOString() : ""），不得直接回数字`).toMatch(/new Date\([^)]*\)\.toISOString\(\)/);
+    }
     // 不能用「只回 7 字段」的旧形态蒙混——基础字段仍在，但必须扩出上面的运行时字段。
     expect(overview).not.toMatch(/uid:\s*a\.uid,\s*\n\s*nickname:\s*a\.nickname,\s*\n\s*realm:\s*a\.realm,\s*\n\s*status:\s*a\.status,\s*\n\s*credits:\s*a\.credits,\s*\n\s*credits_total:\s*a\.creditsTotal,\s*\n\s*in_flight:\s*a\.inFlight,\s*\n\s*\}\)/);
   });
