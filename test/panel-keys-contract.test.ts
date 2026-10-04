@@ -147,7 +147,9 @@ describe("密钥明文契约（静态守卫）", () => {
 
   it("面板轮询间隔不得回到 5s——账号池无秒级变化需求，却持续吃 DO 额度", () => {
     expect(appJs).not.toMatch(/setInterval\(refreshVisible,\s*5000\)/);
-    expect(appJs).toMatch(/REFRESH_IDLE_MS\s*=\s*30000/);
+    // 30s → 60s：面板常开时这是唯一一份"什么都不做也在烧"的 DO 请求，
+    // 一天 2880 次 → 1440 次，直接对半砍，而运营数字（用量/冷却/成功失败）没有秒级意义。
+    expect(appJs).toMatch(/REFRESH_IDLE_MS\s*=\s*60000/);
     // 任务队列例外：执行进度需要实时回写，仍走 5s。
     expect(appJs).toMatch(/REFRESH_QUEUE_MS\s*=\s*5000/);
   });

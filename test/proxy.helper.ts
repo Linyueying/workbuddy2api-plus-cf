@@ -4,7 +4,7 @@ import type { Auth } from "../src/types";
 //
 // 从 proxy.test.ts 提出来，是为了让 workers-lifecycle 之类的新测试复用同一份 env。
 // 两处各自造一个 fakeDB 的话，它们的 D1 行为会悄悄漂移——而用量链路恰恰是靠
-// 「INSERT 占位 + UPDATE 回填」两条 SQL 的顺序与参数来断言的，口径必须一致。
+// 那条 INSERT 的 SQL 与参数顺序来断言的（单写：用量随 INSERT 一次落清），口径必须一致。
 
 export function makeAuth(uid: string): Auth {
   return {

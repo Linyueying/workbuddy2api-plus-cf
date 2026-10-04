@@ -9,7 +9,7 @@ import { Chain, Fallbackable, NO_HEALTHY_ACCOUNT, type AutoModelConfig } from ".
 import { realModelExists, stripRealm } from "./resolveModel";
 import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from "./prompt";
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
-import { insertRequestLog, updateRequestLogUsage } from "../storage/d1";
+import { insertRequestLog } from "../storage/d1";
 import type { Usage } from "./sse";
 
 // 反向代理 + 多账号轮转 + 模型编排（替代 internal/server/handler.go 的
@@ -299,9 +299,24 @@ export async function proxyChat(
         // 成功即记（不论是否被编排路由）。流式分支此前只在 routed 时记，导致
         // 「流式 + 未路由」（最常见的直连用法）一条日志都不写，面板日志页全空。
         //
-        // 拿返回 id 是为了回填用量：流式的 usage 在末帧，必须等流走完才知道，
-        // 但日志又得在开局就落一行（客户端中途断开也要有记录），故「占位 + UPDATE」。
-        const logId = await log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start);
+        // 日志改成**流结束时一次写清**（含用量），不再是「开局占位 + 末帧 UPDATE」：
+        //   1) 占位 INSERT 是在返回首个字节之前 await 的 —— 一次 D1 往返被压进了 TTFB，
+        //      而 D1 的往返是毫秒级可变延迟，直接加在用户感知的"首字时间"上；
+        //   2) 占位 + 回填是**两行写**，D1 免费套餐按写入行数计（10 万行/天），
+        //      一次对话请求付两行，等于把日志额度砍半；
+        //   3) 少一条 UPDATE 也就少一次"UPDATE 掉进 unprotected 窗口被静默丢弃"的风险。
+        // 代价：客户端中途断连、且 Worker 在 abort 回调跑完前就被回收时，这一条没有记录。
+        // 正常情况下 abort 分支会补写一行（见下），真正丢的只有进程级硬中断。
+        let rawUsage: string | undefined;
+        let logged = false;
+        /** close 落日志，只落一次；usage 为 null 时靠 note 说明"为什么没有用量"。 */
+        const close = (usage: Usage | null, note?: string) => {
+          if (logged) return;
+          logged = true;
+          waitUntil(
+            log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, usage, rawUsage ?? note),
+          );
+        };
         // 在途回收双保险：流式请求此前只 acquire 从不 release，inFlight 只增不减，
         // 几次请求后所有账号在途占满 → inFlightFull → no_healthy_account（真机「之前能用、
         // 用着用着全空」的根因）。正常结束走 onEnd；客户端中途断连时 streamChat 的
@@ -312,9 +327,8 @@ export async function proxyChat(
           released = true;
           waitUntil(poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {}));
         };
-        // 诊断：把上游真实返回的 usage 原文暂存，随回填一起写进日志 msg，
+        // 诊断：把上游真实返回的 usage 原文暂存，随日志一起写进 msg，
         // 便于面板日志页直接看到「上游到底回了什么 usage」（token 恒 0 时最关键）。
-        let rawUsage: string | undefined;
         const res = streamChat(up, request, {
           onUsageRaw: (raw) => {
             rawUsage = raw;
@@ -323,12 +337,15 @@ export async function proxyChat(
             waitUntil(recordCost(env, uid, bareModel, usage));
             // 上游若整条流都没给 usage，rawUsage 为空——写明确标记，便于区分
             // 「上游没回 usage」与「解析器认不出字段」这两种完全不同的原因。
-            waitUntil(backfillUsage(env, logId, usage, rawUsage ?? (usage ? undefined : "上游流内无 usage 帧")));
+            close(usage, usage ? undefined : "上游流内无 usage 帧");
             if (keyRow) waitUntil(consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0)));
             release();
           },
         });
-        request.signal.addEventListener("abort", release);
+        request.signal.addEventListener("abort", () => {
+          close(null, "客户端在流结束前断开");
+          release();
+        });
         if (routed) res.headers.set("X-WB2A-Routed-Model", chain[ci]);
         return res;
       }
@@ -471,23 +488,12 @@ export function dryUsage(usage: Usage | null | undefined): {
   };
 }
 
-/** backfillUsage 把流式末帧的用量回填到开局那行占位日志。
- *  rawUsage 为上游原始 usage 文本或诊断标记，写进 msg 供排查（可为空）。 */
-async function backfillUsage(env: Env, id: number, usage: Usage | null, rawUsage?: string): Promise<void> {
-  if (!id) {
-    // 拿不到行 id 就无从定位回填——id<=0 意味着 INSERT 失败，或 D1 没返回 last_row_id。
-    // 这一步必须留声：静默 return 会让「有请求数、有延迟，但 token 全 0」变成无头案，
-    // 日志里看不到任何线索。（`wrangler tail` 能看到本行。）
-    console.error("[usage] 跳过回填：未取到日志行 id（INSERT 失败或 D1 未返回 last_row_id）");
-    return;
-  }
-  // usage 缺失但带了诊断标记时也要写（否则「上游无 usage」这种关键信息会丢）。
-  if (!usage && !rawUsage) return;
-  await updateRequestLogUsage(env, id, dryUsage(usage), rawUsage).catch(() => {});
-}
-
 /**
- * log 写一条请求日志，返回该行自增 id（流式回填用量要用）。
+ * log 写一条请求日志（一次 INSERT 就把用量写清，不依赖后续 UPDATE 回填）。
+ *
+ * msg 用于携带上游原始 usage 或"为什么没有用量"的诊断标记，写在同一行里——
+ * 早先它是靠第二次 UPDATE 补进去的，那条 UPDATE 一旦掉进 Workers 的 unprotected
+ * 窗口就会被静默丢弃，症状是「有请求数、有延迟，但 token 全 0 且查不到原因」。
  *
  * 失败一律吞掉：日志是观测设施，它挂了不应该让用户的对话请求失败。代价是丢日志，
  * 这比让整个网关不可用划算得多。
@@ -504,6 +510,7 @@ function log(
   status: number,
   start: number,
   usage?: any,
+  msg?: string | null,
 ): Promise<number> {
   return insertRequestLog(env, {
     ts: Date.now(),
@@ -517,6 +524,7 @@ function log(
     status,
     ms: Date.now() - start,
     ...dryUsage(usage),
+    ...(msg ? { msg: `usage=${msg.slice(0, 400)}` } : {}),
   }).catch((e: any) => {
     // 失败一律吞掉：日志是观测设施，它挂了不应该让用户的对话请求失败。
     // 但不能连声响都没有——写不进日志正是「用量页空」最容易被忽略的一环。

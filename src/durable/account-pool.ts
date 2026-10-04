@@ -50,6 +50,8 @@ const EXPLORE_EVENTS_KEY = "cost_explore_events";
 /** 单调选号序号（LRU 兜底权威依据，跨请求严格全序）。 */
 const PICK_SEQ_KEY = "pick_seq";
 const acctKey = (uid: string) => `acct:${uid}`;
+/** 账号键前缀：批量读（storage.list）靠它一次捞出全部账号，替代逐 uid 的 get。 */
+const ACCT_PREFIX = "acct:";
 
 /** modelBlock TTL（11102 负缓存退避，对齐 cooldown.go）。 */
 const MODEL_BLOCK_BASE_TTL = 6 * 3600_000;
@@ -71,33 +73,72 @@ export class PoolDO {
   }
 
   // ---- 状态读写 ----
+  //
+  // 内存态是本 DO 的**唯一活状态**：账号对象只在首次访问时从 Storage 反序列化一次，
+  // 之后 getAcct 直接返回内存里的那个对象，putAcct 写 Storage 并同步内存。
+  //
+  // 为什么必须这样（而不是"每次读都拿一份新副本"）：
+  //   老实现是"逐 uid storage.get（N+1）+ 每次 pick 全量重读"。pick 在每条对话请求的
+  //   关键路径上，N 个账号就是 N 次 Storage 读 + 一轮 JSON 反序列化，N 越大首字延迟越长。
+  //   但直接加缓存会踩一个更隐蔽的坑：DO 的 storage.get 每次返回**独立副本**，
+  //   acquire/release/note 这些写路径如果读的是副本、而 pick 读的是缓存里的另一个对象，
+  //   inFlight/冷却就会各写各的、互相覆盖 —— 比慢更危险。
+  //   所以缓存存的必须是"活对象引用"，且所有写路径一律走 putAcct（含内存同步），
+  //   不允许绕过它裸调 storage.put。
+  private _accts: Map<string, AccountState> | null = null;
+  /** 账号顺序（快照来自 index 键；list 顺序影响同分时的兜底选取，故要稳定）。 */
+  private _order: string[] | null = null;
+
+  /** ensureState 首次访问时批量装载；已装载则直接返回（写路径自行维护，无需重读）。 */
+  private async ensureState(): Promise<Map<string, AccountState>> {
+    if (this._accts) return this._accts;
+    // 一次 list 拿全部账号（1 次 Storage 读），替代 N 次 get。
+    const [uids, listed] = await Promise.all([
+      this.ctx.storage.get<string[]>(INDEX_KEY),
+      this.ctx.storage.list<AccountState>({ prefix: ACCT_PREFIX }),
+    ]);
+    const byUid = new Map<string, AccountState>();
+    for (const [k, v] of listed) {
+      if (!v || typeof v !== "object") continue;
+      byUid.set(k.slice(ACCT_PREFIX.length), v as AccountState);
+    }
+    // index 是权威顺序；index 缺失/落后于实际账号（老数据或异常写入）时补齐，
+    // 保证"存了就一定选得到"，不会凭空少号。
+    const order = (uids ?? []).filter((u) => typeof u === "string");
+    const seen = new Set(order);
+    for (const uid of byUid.keys()) if (!seen.has(uid)) order.push(uid);
+    this._order = order;
+    this._accts = byUid;
+    return byUid;
+  }
+
   private async listUids(): Promise<string[]> {
-    return (await this.ctx.storage.get<string[]>(INDEX_KEY)) ?? [];
+    await this.ensureState();
+    return (this._order ?? []).slice();
   }
   private async saveUids(uids: string[]): Promise<void> {
     await this.ctx.storage.put(INDEX_KEY, uids);
+    if (this._order) this._order = uids.slice();
   }
   private async getAcct(uid: string): Promise<AccountState | null> {
-    return (await this.ctx.storage.get<AccountState>(acctKey(uid))) ?? null;
+    return (await this.ensureState()).get(uid) ?? null;
   }
   private async putAcct(a: AccountState): Promise<void> {
     await this.ctx.storage.put(acctKey(a.uid), a);
+    // 写穿：内存态与 Storage 一起更新，避免"改了副本、缓存还是旧值"。
+    if (this._accts) {
+      this._accts.set(a.uid, a);
+      if (this._order && !this._order.includes(a.uid)) this._order.push(a.uid);
+    }
   }
   private async allAccts(): Promise<AccountState[]> {
-    const uids = await this.listUids();
+    const byUid = await this.ensureState();
     const out: AccountState[] = [];
-    for (const uid of uids) {
-      const a = await this.getAcct(uid);
+    for (const uid of this._order ?? []) {
+      const a = byUid.get(uid);
       if (a) out.push(a);
     }
     return out;
-  }
-
-  // 运行期账号缓存（DO 内短生命周期，避免每次 pick 全量读 Storage）
-  private _cache: AccountState[] | null = null;
-  private async refreshCache(): Promise<AccountState[]> {
-    this._cache = await this.allAccts();
-    return this._cache;
   }
 
   // ---- 选号 ----
@@ -129,7 +170,9 @@ export class PoolDO {
     now: number,
     cfg: Config,
   ): Promise<{ uid: string; explored: boolean; fallback: boolean; fallbackKind: string } | null> {
-    const accs = this._cache ?? [];
+    // 内存态已装载则零 Storage 读；写路径（acquire/release/note/…）改的是同一批对象，
+    // 所以这里看到的必然是最新的 inFlight / 冷却 / 成本台账。
+    const accs = await this.allAccts();
     for (const a of accs) this.prune(a, now);
 
     // 超时回收：acquire 后长时间未 release 的在途占用强制清零（见 ACQUIRE_TTL_MS 说明）。
@@ -176,9 +219,9 @@ export class PoolDO {
   }
 
   /** realmSnapshot 各 realm 的 total/healthy 分布，用于 no_healthy_account 诊断。 */
-  private realmSnapshot(now: number): Record<string, { total: number; healthy: number }> {
+  private async realmSnapshot(now: number): Promise<Record<string, { total: number; healthy: number }>> {
     const out: Record<string, { total: number; healthy: number }> = {};
-    for (const a of this._cache ?? []) {
+    for (const a of await this.allAccts()) {
       const r = a.realm || "unknown";
       out[r] ??= { total: 0, healthy: 0 };
       out[r].total++;
@@ -205,7 +248,8 @@ export class PoolDO {
     const pushReason = (r: string) => {
       byReason[r] = (byReason[r] ?? 0) + 1;
     };
-    for (const a of this._cache ?? []) {
+    const accs = await this.allAccts();
+    for (const a of accs) {
       const reasons: string[] = [];
       if (realm && a.realm !== realm) reasons.push("realm_mismatch");
       if (a.status === "disabled") reasons.push("disabled");
@@ -232,7 +276,7 @@ export class PoolDO {
         });
       }
     }
-    return { total: (this._cache ?? []).length, by_reason: byReason, sample };
+    return { total: accs.length, by_reason: byReason, sample };
   }
 
   /** prune 惰性清理过期的模型级冷却与成本台账条目（对齐 pruneExpiredModelCooldowns/Costs）。 */
@@ -263,8 +307,8 @@ export class PoolDO {
         return json(await this.status(cfg, now));
       }
       if (request.method === "GET" && p === "/internal/list") {
-        await this.refreshCache();
-        for (const a of this._cache ?? []) this.prune(a, now);
+        const list = await this.allAccts();
+        for (const a of list) this.prune(a, now);
         // ?stats=1：一次 RPC 带回面板概览要的全部信息。sticky_sessions 读的是 DO
         // 内会话存储，Worker 侧拿不到，只能在这里顺带返回——其余统计项（healthy/
         // cooling/disabled/in_flight_full）Worker 侧可用 pool-core 的同一份纯函数
@@ -277,9 +321,9 @@ export class PoolDO {
           } catch {
             /* noop */
           }
-          return json({ accounts: this._cache ?? [], sticky_sessions: sticky });
+          return json({ accounts: list, sticky_sessions: sticky });
         }
-        return json(this._cache ?? []);
+        return json(list);
       }
       if (request.method === "GET" && p.startsWith("/internal/auth/")) {
         const uid = decodeURIComponent(p.slice("/internal/auth/".length));
@@ -290,7 +334,8 @@ export class PoolDO {
       const body: any = request.method === "POST" ? await request.json().catch(() => ({})) : {};
 
       if (p === "/internal/pick") {
-        await this.refreshCache();
+        // 不再无条件全量重读 Storage：账号状态常驻内存，写路径写穿维护。
+        // 面板每次对话请求都要走这一支，此前 N 个账号 = N+1 次 Storage 读。
         const realm = (body.realm as Realm) ?? "cn";
         const model = body.model as string | undefined;
         const exclude: string[] = body.exclude ?? [];
@@ -332,7 +377,7 @@ export class PoolDO {
           if (!relaxed) {
             const diag = await this.diagnose(now, realm, model, cfg);
             return json(
-              { error: "no_healthy_account", realm, model: model ?? "", byRealm: this.realmSnapshot(now), diagnose: diag },
+              { error: "no_healthy_account", realm, model: model ?? "", byRealm: await this.realmSnapshot(now), diagnose: diag },
               503,
             );
           }
@@ -459,8 +504,7 @@ export class PoolDO {
         const uids = await this.listUids();
         if (!uids.includes(a.uid)) uids.push(a.uid);
         await this.saveUids(uids);
-        await this.putAcct(a);
-        this._cache = null;
+        await this.putAcct(a); // 写穿：内存态同步入池
         return json({ ok: true, uid: a.uid });
       }
 
@@ -470,7 +514,9 @@ export class PoolDO {
         let uids = await this.listUids();
         uids = uids.filter((u) => u !== uid);
         await this.saveUids(uids);
-        this._cache = null;
+        // 内存态同步除名，否则"删了还在池里被选中"。
+        this._accts?.delete(uid);
+        if (this._order) this._order = this._order.filter((u) => u !== uid);
         return json({ ok: true });
       }
 
@@ -484,8 +530,7 @@ export class PoolDO {
           a.disabledReason = String(body.reason ?? "manual disable");
         } else if (action === "enable") this.revive(a);
         else if (action === "checkin_done") a.checkinDone = true;
-        await this.putAcct(a);
-        this._cache = null;
+        await this.putAcct(a); // 写穿：disable/enable 立刻对选号生效
         return json({ ok: true, status: a.status });
       }
 
@@ -495,8 +540,7 @@ export class PoolDO {
         const refreshed = await refreshToken(this.env, a.auth);
         a.auth = refreshed;
         a.refreshedAt = now;
-        await this.putAcct(a);
-        this._cache = null;
+        await this.putAcct(a); // 写穿：新 token 立刻对后续 pick 生效
         return json({ ok: true, auth: refreshed });
       }
 
@@ -866,13 +910,12 @@ export class PoolDO {
     a.creditsEarliestExpiry = earliestExpiry;
     a.creditsEarliestRemaining = earliestRemaining;
     a.creditsBelowFloor = credits <= 0;
-    this._cache = null;
+    // 不需要失效缓存：调用方（/internal/credits）紧接着 putAcct，改的就是内存里这个对象。
   }
 
   // ---- 统计 ----
   async status(cfg: Config, now: number): Promise<PoolStatus> {
-    await this.refreshCache();
-    const accs = this._cache ?? [];
+    const accs = await this.allAccts();
     const pcfg = await this.pickCfg(cfg);
     let healthy = 0;
     let cooling = 0;

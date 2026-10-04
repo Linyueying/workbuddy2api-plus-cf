@@ -145,6 +145,32 @@ describe("D1 自动迁移", () => {
     expect(r.error).toContain("usage");
   });
 
+  // 回归：这两条索引原本只存在于 migrations/0003_usage_metrics.sql 里，而 Pages 部署
+  // 从不执行手工 SQL —— 新环境永远建不出来。缺了它不报错、只是用量聚合退化成
+  // 「命中 ts 索引后逐行回表」，D1 按扫描行数计费，用量页能把 500 万行/天额度刷穿。
+  it("0003 的复合索引必须进入自动迁移（零配置部署不能靠手工 SQL）", async () => {
+    const { d1, executed } = makeD1({ cols: [] });
+    const r = await ensureSchema(envWith(d1));
+    expect(r.status).toBe("ok");
+    expect(
+      executed.some((s) => /CREATE INDEX IF NOT EXISTS idx_reqlogs_usage ON request_logs\(ts DESC, model, realm\)/.test(s)),
+    ).toBe(true);
+    expect(
+      executed.some((s) => /CREATE INDEX IF NOT EXISTS idx_reqlogs_usage_uid ON request_logs\(ts DESC, uid\)/.test(s)),
+    ).toBe(true);
+  });
+
+  it("复合索引建失败不阻断迁移：索引只影响查询计划，缺了仍要能出数", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { d1 } = makeD1({ cols: [], failOn: /idx_reqlogs_usage/ });
+      // 与 0002 的索引相反：那条建不出来是硬故障（列表排序退化），这两条不是。
+      expect((await ensureSchema(envWith(d1))).status).toBe("ok");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("resetSchemaCache 后可强制重跑（运维兜底入口）", async () => {
     const { d1, executed } = makeD1({ cols: [] });
     const env = envWith(d1);

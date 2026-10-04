@@ -200,11 +200,11 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     });
   }
 
-  it("流式请求写一条日志（占位），此前完全不写——面板日志页全空的直接原因", async () => {
+  it("流式请求在流结束时写且只写一条日志（此前完全不写——面板日志页全空的直接原因）", async () => {
     const env = envFor();
     const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
     expect(res.status).toBe(200);
-    // 把流读完才会触发末帧回填。这里顺带锁定「流式转发内容不丢」：
+    // 把流读完才会触发收尾写日志。这里顺带锁定「流式转发内容不丢」：
     // 用户曾实测到 200 + SSE 头 + 零正文（sseSplit 的 while 循环不更新缓冲导致
     // 无限 enqueue 同一帧，Worker 被 OOM 杀掉），这类退化一定会让这里变空或超时。
     const text = await res.text();
@@ -214,24 +214,45 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
 
     const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
     expect(inserts).toHaveLength(1); // 恰好一条：不重复记账
-    // 占位时还没有用量，四列应为 0
-    const p = inserts[0].params;
-    expect(p.slice(-4)).toEqual([0, 0, 0, 0]);
+    // 单写就带用量：末四列 prompt_tokens, completion_tokens, credits, cache_read_tokens
+    expect(inserts[0].params.slice(-4)).toEqual([100, 50, 1.5, 0]);
+    // 且不再有「占位 + 回填」的第二条 UPDATE —— 省一行 D1 写入额度，
+    // 也免掉 UPDATE 掉进 unprotected 窗口被静默丢弃（token 恒 0 的根因）。
+    expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 
-  it("末帧 usage 回填到同一行（UPDATE 的 WHERE id 取自 INSERT 返回的 rowid）", async () => {
+  it("末帧用量随唯一那条 INSERT 落清，并把上游原始 usage 写进 msg 供排查", async () => {
     const env = envFor();
     const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
     await res.text();
     await new Promise((r) => setTimeout(r, 0));
 
-    const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
-    expect(upd).toBeTruthy();
-    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, msg, id
+    const ins = env.writes.find((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(ins).toBeTruthy();
     // msg 记录上游原始 usage（诊断用，便于面板看到上游到底回了什么）。
-    expect(upd!.params.slice(0, 4)).toEqual([100, 50, 1.5, 0]);
-    expect(String(upd!.params[4])).toContain("usage=");
-    expect(upd!.params[5]).toBe(42);
+    const msg = String(ins!.params.find((p: any) => typeof p === "string" && String(p).startsWith("usage=")) ?? "");
+    expect(msg).toContain("usage=");
+  });
+
+  it("客户端中途断连：abort 分支补写一条日志（单写语义下不能整条丢失）", async () => {
+    const env = envFor();
+    const ac = new AbortController();
+    const req = new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cn:hy3", stream: true, messages: [] }),
+      signal: ac.signal,
+    });
+    const res = await proxyChat(env, req, "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    expect(res.status).toBe(200);
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(inserts).toHaveLength(1);
+    // 没有 usage 帧可回填，四列为 0，但 msg 必须说清「为什么没有用量」。
+    expect(inserts[0].params.slice(-4)).toEqual([0, 0, 0, 0]);
+    expect(JSON.stringify(inserts[0].params)).toContain("断开");
   });
 
   it("非流式也写且只写一条：token/credit 随 INSERT 一次落清，无需回填", async () => {
@@ -272,7 +293,7 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     'data: {"choices":[{"delta":{"content":"好"}}],"usage":{"credit":2.5,"prompt_tokens":200,"completion_tokens":80,"total_tokens":280,"prompt_cache_hit_tokens":64}}\r\n\r\n' +
     "data: [DONE]\r\n\r\n";
 
-  it("真实帧形态（event: 行 + CRLF）：末帧用量照样回填，token 不再是 0", async () => {
+  it("真实帧形态（event: 行 + CRLF）：末帧用量照样随 INSERT 落清，token 不再是 0", async () => {
     const env = envForWith(STREAM_REAL_SHAPE);
     const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
     expect(res.status).toBe(200);
@@ -282,10 +303,10 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     expect(text).toContain("好");
     await new Promise((r) => setTimeout(r, 0));
 
-    const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
-    expect(upd).toBeTruthy();
-    // SQL 列序：prompt_tokens, completion_tokens, credits, cache_read_tokens, msg, id
-    expect(upd!.params.slice(0, 4)).toEqual([200, 80, 2.5, 64]);
+    const ins = env.writes.find((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(ins).toBeTruthy();
+    // 末四列：prompt_tokens, completion_tokens, credits, cache_read_tokens
+    expect(ins!.params.slice(-4)).toEqual([200, 80, 2.5, 64]);
   });
 
   it("真实帧形态 + 非流式：用量随 INSERT 一次落清（含缓存命中列）", async () => {

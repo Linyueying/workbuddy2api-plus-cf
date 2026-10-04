@@ -27,7 +27,7 @@ describe("Workers 生命周期：响应返回后的写入必须挂 waitUntil", (
     // / 不带任何前缀的 `log(env, ...)`。它们处在 return 之前的路径上时，
     // 写库动作会在响应返回后被丢掉，且不报错。
     for (const re of [
-      /void\s+backfillUsage\(/,
+      /void\s+close\(/,
       /void\s+recordCost\(/,
       /void\s+consumeKey\(/,
       /void\s+log\(/,
@@ -37,15 +37,28 @@ describe("Workers 生命周期：响应返回后的写入必须挂 waitUntil", (
     }
   });
 
-  it("流式收尾（回填 / 记账 / 扣配额 / release）逐个挂了 waitUntil", () => {
+  it("流式收尾（日志 / 记账 / 扣配额 / release）逐个挂了 waitUntil", () => {
     for (const call of [
-      "waitUntil(backfillUsage(",
+      "waitUntil(\n            log(",
       "waitUntil(recordCost(",
       "waitUntil(consumeKey(",
       'waitUntil(poolRPC(env, "/internal/release"',
     ]) {
       expect(proxySrc, `缺少 ${call}`).toContain(call);
     }
+  });
+
+  // 单写守卫：占位 INSERT + 末帧 UPDATE 的老形态必须回不来。它有两个代价——
+  // 多付一行 D1 写入额度（免费套餐按行数计），以及 UPDATE 掉进 unprotected 窗口
+  // 就被静默丢弃（正是「有请求数有延迟、token 恒 0」的成因）。
+  it("请求日志不得出现「占位 + 回填」双写：proxy.ts 不再 import updateRequestLogUsage", () => {
+    expect(proxySrc).not.toContain("updateRequestLogUsage");
+    expect(proxySrc).not.toContain("backfillUsage");
+  });
+
+  it("流式分支不得在首字节之前 await 写日志（D1 往返不能压进 TTFB）", () => {
+    // 老形态：`const logId = await log(...)` 出现在 streamChat 之前。
+    expect(proxySrc).not.toMatch(/await\s+log\(/);
   });
 
   it("api.ts 三个 chat 入口都注入了 waitUntil", () => {
@@ -56,8 +69,7 @@ describe("Workers 生命周期：响应返回后的写入必须挂 waitUntil", (
     }
   });
 
-  it("回填拿不到行 id 时留声，而不是静默 return（否则「token 全 0」无头可查）", () => {
-    expect(proxySrc).toContain("[usage] 跳过回填");
+  it("日志写不进去时必须留声，而不是静默 return（否则「token 全 0」无头可查）", () => {
     expect(proxySrc).toContain("[reqlog] 请求日志写入失败");
   });
 });
@@ -97,12 +109,14 @@ describe("waitUntil 接线 smoke", () => {
     await res.text();
     await Promise.allSettled(captured);
 
-    // 三个收尾点各挂一次：recordCost + backfillUsage + release（未传 keyRow，无 consumeKey）。
+    // 三个收尾点各挂一次：log + recordCost + release（未传 keyRow，无 consumeKey）。
     // 漏挂任何一个都会在这里露出来——它就根本不会经过 waitUntil。
     expect(captured.length).toBeGreaterThanOrEqual(3);
 
-    const upd = env.writes.find((w) => w.sql.includes("UPDATE request_logs"));
-    expect(upd).toBeTruthy();
-    expect(upd!.params.slice(0, 4)).toEqual([100, 50, 1.5, 0]);
+    // 单写：用量随唯一那条 INSERT 落清，不再有 UPDATE 回填。
+    const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].params.slice(-4)).toEqual([100, 50, 1.5, 0]);
+    expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 });

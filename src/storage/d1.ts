@@ -220,10 +220,12 @@ async function ensureUsageColumns(env: Env): Promise<boolean> {
 }
 
 /**
- * insertRequestLog 写一条请求日志，返回自增 id（供流式回填用量）。
+ * insertRequestLog 写一条请求日志，返回自增 id（调用方通常不关心）。
  *
- * 流式无法在开始时就知道用量（usage 在末帧），所以这里是「先占位、后 UPDATE」：
- * 拿到 id 才能在流结束时把 token/credit 回写到同一行。见 updateRequestLogUsage。
+ * 用量必须**随这条 INSERT 一次落清**：早期实现是「开局占位 INSERT + 流末 UPDATE 回填」，
+ * 那多出来的一次 UPDATE 既多付一行 D1 写入额度，又可能在 Workers 的 unprotected 窗口
+ * 里被静默丢弃（症状：有请求数有延迟，token 恒 0）。流式分支因此改为等拿到末帧 usage
+ * 再写，只写这一行。
  */
 export async function insertRequestLog(env: Env, e: RequestLogEntry): Promise<number> {
   const params = [
@@ -258,33 +260,6 @@ export async function insertRequestLog(env: Env, e: RequestLogEntry): Promise<nu
     }
     throw err;
   }
-}
-
-/** UsagePatch 流式末帧回填的用量字段。 */
-export interface UsagePatch {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  credits?: number;
-  cache_read_tokens?: number;
-}
-
-/** updateRequestLogUsage 把末帧用量回填到流式开始时的占位日志行。
- *  rawUsage 为上游原始 usage 文本，写进 msg 供排查（可为空）。 */
-export async function updateRequestLogUsage(env: Env, id: number, u: UsagePatch, rawUsage?: string): Promise<void> {
-  if (!id) return;
-  await run(
-    env,
-    `UPDATE request_logs SET prompt_tokens = ?, completion_tokens = ?, credits = ?, cache_read_tokens = ?, msg = ?
-     WHERE id = ?`,
-    [
-      Number(u.prompt_tokens ?? 0) || 0,
-      Number(u.completion_tokens ?? 0) || 0,
-      Number(u.credits ?? 0) || 0,
-      Number(u.cache_read_tokens ?? 0) || 0,
-      rawUsage ? `usage=${rawUsage.slice(0, 400)}` : null,
-      id,
-    ],
-  );
 }
 
 export interface RequestLogQuery {

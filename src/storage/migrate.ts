@@ -87,6 +87,22 @@ const COLS_0004: { name: string; ddl: string }[] = [
 
 const INDEX_0002 = `CREATE INDEX IF NOT EXISTS idx_apikeys_seq ON apikeys(seq DESC)`;
 
+// 0003 的复合索引（与 migrations/0003_usage_metrics.sql 末两行保持同步）。
+//
+// 为什么必须补进自动迁移：那两行原本只存在于手工 SQL 文件里，而 Pages 部署根本
+// 不会执行它——新环境（零配置起量）永远走不到 `npm run db:init:remote`，于是
+// request_logs 上只有 0001 建的单列 idx_reqlogs_ts。用量页的聚合是
+// 「按 ts 窗口扫描 + 按 uid/model/realm 分组」，窗口可达 90 天：
+//   1) 单列 ts 索引命中后仍要**逐行回表**取 model/realm/uid → 扫多少行算多少行；
+//   2) D1 按**扫描行数**计费（不是返回行数），免费套餐 500 万行/天的额度
+//      会被几张用量页刷爆。
+// 两个复合索引让分组键直接落在索引里（覆盖扫描），缺了它们只是慢，不会报错——
+// 所以这个缺口此前一直没被发现。
+const INDEX_0003 = [
+  `CREATE INDEX IF NOT EXISTS idx_reqlogs_usage ON request_logs(ts DESC, model, realm)`,
+  `CREATE INDEX IF NOT EXISTS idx_reqlogs_usage_uid ON request_logs(ts DESC, uid)`,
+];
+
 export type MigrateState =
   | { status: "skipped"; reason: string }
   | { status: "ok"; created: string[]; added_cols: string[] }
@@ -153,6 +169,15 @@ async function migrate(env: Env): Promise<MigrateState> {
     await d1.prepare(INDEX_0002).run();
   } catch (e) {
     throw new Error(`建索引失败: idx_apikeys_seq → ${msgOf(e)}`);
+  }
+  // 0003 的复合索引同样在此补齐：IF NOT EXISTS，老库重跑是 no-op。
+  // 建索引失败不阻断启动（索引只影响查询计划，缺了仍能正确出数），故只告警不抛。
+  for (const sql of INDEX_0003) {
+    try {
+      await d1.prepare(sql).run();
+    } catch (e) {
+      console.error(`[migrate] 建索引失败（跳过，不影响正确性）: ${firstLine(sql)} → ${msgOf(e)}`);
+    }
   }
 
   return { status: "ok", created, added_cols };

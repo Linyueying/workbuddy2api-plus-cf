@@ -37,9 +37,31 @@ function makeEnv(): Env {
   } as unknown as Env;
 }
 
-function newPool(): PoolDO {
-  const state: any = { id: { toString: () => "main" }, storage: memStorage() };
+function newPool(storage?: any): PoolDO {
+  const state: any = { id: { toString: () => "main" }, storage: storage ?? memStorage() };
   return new PoolDO(state, makeEnv());
+}
+
+/** 记账版 Storage：记录每次读的键，用来抓「逐账号 get」这类读放大。 */
+function countingStorage() {
+  const m = new Map<string, any>();
+  const reads: string[] = [];
+  return {
+    reads,
+    get: async (k: string) => {
+      reads.push(String(k));
+      return m.has(k) ? m.get(k) : null;
+    },
+    put: async (k: string, v: any) => void m.set(k, v),
+    delete: async (k: string) => void m.delete(k),
+    list: async (opts?: { prefix?: string }) => {
+      reads.push("list:" + (opts?.prefix ?? ""));
+      const out = new Map<string, any>();
+      for (const [k, v] of m) if (!opts?.prefix || k.startsWith(opts.prefix)) out.set(k, v);
+      return out;
+    },
+    setAlarm: async () => {},
+  } as any;
 }
 
 async function rpc(pool: PoolDO, path: string, method = "GET", body?: unknown) {
@@ -292,6 +314,54 @@ describe("账号池 P1 状态机", () => {
     expect(st.json.healthy).toBe(1);
     expect(st.json.model_cooldowns).toBe(0);
     expect((await rpc(pool, "/internal/pick", "POST", { realm: "cn", model: "hy3" })).json.uid).toBe("u1");
+  });
+
+  // 读放大回归：老实现在 pick/list/status 每条路径上都无条件 refreshCache()，
+  // 而 allAccts 是「逐 uid storage.get」——N 个账号 = N+1 次 Storage 读，
+  // 且 pick 在**每条对话请求的关键路径**上，账号越多首字越慢。
+  it("账号装载一次，后续 pick 零账号读（N+1 → 0）", async () => {
+    const st = countingStorage();
+    const pool = newPool(st);
+    for (const u of ["u1", "u2", "u3"]) await rpc(pool, "/internal/add", "POST", { auth: auth(u) });
+    // 首次 pick 触发装载（批量 list + 一次 index get）。
+    await rpc(pool, "/internal/pick", "POST", { realm: "cn" });
+    st.reads.length = 0;
+    for (let i = 0; i < 5; i++) await rpc(pool, "/internal/pick", "POST", { realm: "cn" });
+    const acct = st.reads.filter((k) => k.startsWith("acct:") || k.startsWith("list:"));
+    expect(acct).toEqual([]);
+    // 账号数翻倍不应改变这条结论（真正被验证的是「不随 N 增长」）。
+    for (const u of ["u4", "u5", "u6"]) await rpc(pool, "/internal/add", "POST", { auth: auth(u) });
+    st.reads.length = 0;
+    await rpc(pool, "/internal/pick", "POST", { realm: "cn" });
+    expect(st.reads.filter((k) => k.startsWith("acct:") || k.startsWith("list:"))).toEqual([]);
+  });
+
+  // 缓存必须存「活对象」：storage.get 每次返回独立副本，若 acquire/release 改的是副本、
+  // 而 pick 读的是缓存里的另一个对象，inFlight 就会各写各的、互相覆盖 —— 比慢更危险。
+  it("写穿：acquire/release/note 的改动对 pick 与 status 立刻可见", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
+    await rpc(pool, "/internal/acquire", "POST", { uid: "u1" });
+    expect((await rpc(pool, "/internal/list")).json[0].inFlight).toBe(1);
+    await rpc(pool, "/internal/release", "POST", { uid: "u1" });
+    expect((await rpc(pool, "/internal/list")).json[0].inFlight).toBe(0);
+
+    // 冷却也一样：note 之后必须立刻不再可选（不能还按旧快照选出号）。
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u2") });
+    await rpc(pool, "/internal/note", "POST", { uid: "u2", kind: "soft_rate" });
+    expect((await rpc(pool, "/internal/status")).json.cooling).toBe(1);
+    expect((await rpc(pool, "/internal/pick", "POST", { realm: "cn" })).json.uid).toBe("u1");
+  });
+
+  it("remove 同步除名：删掉的号不会被内存态再选中", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u2") });
+    await rpc(pool, "/internal/pick", "POST", { realm: "cn" }); // 触发装载
+    await rpc(pool, "/internal/remove", "POST", { uid: "u1" });
+    await rpc(pool, "/internal/remove", "POST", { uid: "u2" });
+    expect((await rpc(pool, "/internal/status")).json.total).toBe(0);
+    expect((await rpc(pool, "/internal/pick", "POST", { realm: "cn" })).status).toBe(503);
   });
 
   it("list 暴露模型级冷却与成本台账（运维可观测性）", async () => {
