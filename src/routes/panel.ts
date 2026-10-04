@@ -5,6 +5,8 @@ import { poolRPC } from "../durable/account-pool";
 import { listModels } from "../services/resolveModel";
 import {
   queryRequestLogs,
+  usageByAccountWindow,
+  type AccountUsageAgg,
   listKeys,
   getKey,
   insertKey,
@@ -30,6 +32,28 @@ import type { CtxVars } from "../types";
 
 const VERSION = "1.0.0-pages";
 const STARTED_AT = Date.now();
+
+/**
+ * 账号池「成功/失败」「用量」列的数据源：request_logs 窗口聚合（口径与用量页一致）。
+ *
+ * 此前这两个数据从 DO 的运行时计数（successCount/errTotal）出，与用量页（D1 权威
+ * 账本）对不上号；token_usage 在 AccountState 里根本没有数据源。统一改为 D1 聚合。
+ *
+ * 前端在账号池视图下每 5s 轮询一次 overview，聚合结果做 60s 模块级缓存——
+ * D1 扫描量只随时间增长（每分钟一次），不随轮询放大。
+ */
+const ACCT_USAGE_TTL_MS = 60_000;
+const ACCT_USAGE_HOURS = 24; // 与用量页缺省窗口一致
+let acctUsageCache: { at: number; byUid: Map<string, AccountUsageAgg> } | null = null;
+
+async function accountUsageByUid(env: Env, hours = ACCT_USAGE_HOURS): Promise<Map<string, AccountUsageAgg>> {
+  if (acctUsageCache && Date.now() - acctUsageCache.at < ACCT_USAGE_TTL_MS) return acctUsageCache.byUid;
+  const to = Date.now();
+  const rows = await usageByAccountWindow(env, to - hours * 3600_000, to).catch(() => []);
+  const byUid = new Map<string, AccountUsageAgg>(rows.map((r) => [r.uid, r]));
+  acctUsageCache = { at: Date.now(), byUid };
+  return byUid;
+}
 
 function genKey(): string {
   const b = new Uint8Array(24);
@@ -100,6 +124,8 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const now = Date.now();
     const st = await poolRPC(c.env, "/internal/status").catch(() => null);
     const accounts = (await poolRPC(c.env, "/internal/list").catch(() => [])) as any[];
+    // 成功/失败与用量列：D1 窗口聚合（与用量页同口径、同缺省窗口 24h）。
+    const usageByUid = await accountUsageByUid(c.env);
     return c.json({
       version: VERSION,
       uptime_sec: Math.floor((now - STARTED_AT) / 1000),
@@ -111,36 +137,51 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       cooling: st?.cooling ?? 0,
       disabled: st?.disabled ?? 0,
       in_flight_full: st?.in_flight_full ?? 0,
+      usage_window_hours: ACCT_USAGE_HOURS,
       // 序列化对齐前端（Go 版）契约：前端 renderAccounts/renderPackages/groupItems
       // 读的是 snake_case 字段名，且需要 success_count/err_total/last_success/
       // breaker_until/degrade_until/cool_remaining_sec/cool_kind/disabled/reason/
       // checkin_done/model_costs 等运行时字段——后端此前只映射了 7 个基础字段，
       // 导致账号池整列空白（行能画、但成功/失败/用量/状态标签全空）。
-      accounts: (accounts ?? []).map((a) => ({
-        uid: a.uid,
-        nickname: a.nickname,
-        realm: a.realm,
-        status: a.status,
-        disabled: a.status === "disabled",
-        reason: a.disabledReason ?? "",
-        credits: a.credits ?? 0,
-        credits_total: a.creditsTotal ?? 0,
-        in_flight: a.inFlight ?? 0,
-        success_count: a.successCount ?? 0,
-        err_total: a.errTotal ?? 0,
-        last_success: a.lastSuccess ? new Date(a.lastSuccess).toISOString() : "",
-        breaker_until: a.breakerUntil ? new Date(a.breakerUntil).toISOString() : "",
-        degrade_until: a.degradeUntil ? new Date(a.degradeUntil).toISOString() : "",
-        cool_remaining_sec: a.cooldownUntil > now ? Math.max(0, Math.floor((a.cooldownUntil - now) / 1000)) : 0,
-        cool_kind: a.cooldownKind ?? "",
-        checkin_done: a.checkinDone ?? false,
-        rate_limited_models: [],
-        model_costs: Object.entries(a.modelCost ?? {}).map(([model, c]) => ({
-          model,
-          cost_per_1k: (c as { costPer1k?: number })?.costPer1k ?? 0,
-        })),
-        token_usage: {},
-      })),
+      accounts: (accounts ?? []).map((a) => {
+        // 聚合行口径与 usage-agg.ts 一致：requests 含失败；均值延迟/速率在展示层折算
+        // （总耗时/请求数、总 token/总秒），避免逐行平均的辛普森悖论。
+        const u = usageByUid.get(String(a.uid));
+        const requests = Number(u?.requests ?? 0) || 0;
+        const errors = Math.min(Number(u?.errors ?? 0) || 0, requests);
+        const msSum = Number(u?.ms_sum ?? 0) || 0;
+        const totalTokens = Number(u?.total_tokens ?? 0) || 0;
+        return {
+          uid: a.uid,
+          nickname: a.nickname,
+          realm: a.realm,
+          status: a.status,
+          disabled: a.status === "disabled",
+          reason: a.disabledReason ?? "",
+          credits: a.credits ?? 0,
+          credits_total: a.creditsTotal ?? 0,
+          in_flight: a.inFlight ?? 0,
+          success_count: requests - errors,
+          err_total: errors,
+          last_success: a.lastSuccess ? new Date(a.lastSuccess).toISOString() : "",
+          breaker_until: a.breakerUntil ? new Date(a.breakerUntil).toISOString() : "",
+          degrade_until: a.degradeUntil ? new Date(a.degradeUntil).toISOString() : "",
+          cool_remaining_sec: a.cooldownUntil > now ? Math.max(0, Math.floor((a.cooldownUntil - now) / 1000)) : 0,
+          cool_kind: a.cooldownKind ?? "",
+          checkin_done: a.checkinDone ?? false,
+          rate_limited_models: [],
+          model_costs: Object.entries(a.modelCost ?? {}).map(([model, c]) => ({
+            model,
+            cost_per_1k: (c as { costPer1k?: number })?.costPer1k ?? 0,
+          })),
+          token_usage: {
+            request_count: requests,
+            total_tokens: totalTokens,
+            last_latency_ms: requests > 0 ? msSum / requests : 0,
+            last_tokens_per_second: msSum > 0 ? totalTokens / (msSum / 1000) : 0,
+          },
+        };
+      }),
     });
   });
 

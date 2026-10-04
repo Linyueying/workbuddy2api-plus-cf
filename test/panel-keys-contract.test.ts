@@ -108,6 +108,13 @@ describe("密钥明文契约（静态守卫）", () => {
       expect(line, `overview 缺时间字段 ${f}`).toBeTruthy();
       expect(line, `${f} 必须序列化为 ISO 字符串（?: new Date(...).toISOString() : ""），不得直接回数字`).toMatch(/new Date\([^)]*\)\.toISOString\(\)/);
     }
+    // 成功/失败与 token_usage 必须来自 D1 聚合（usageByAccountWindow，与用量页同口径），
+    // 不得回退到 DO 运行时计数（successCount/errTotal，与用量页对不上号）
+    // 或空对象（AccountState 里根本没有 token 统计的数据源）。
+    expect(overview, "overview 必须调用 accountUsageByUid（D1 窗口聚合）").toMatch(/accountUsageByUid\(c\.env\)/);
+    expect(overview, "token_usage 不得回空对象——账号池用量列会全空").not.toMatch(/token_usage:\s*\{\}/);
+    expect(overview, "success_count 不得回 DO 运行时计数").not.toMatch(/success_count:\s*a\.successCount/);
+    expect(panelSrc).toContain("usageByAccountWindow");
     // 不能用「只回 7 字段」的旧形态蒙混——基础字段仍在，但必须扩出上面的运行时字段。
     expect(overview).not.toMatch(/uid:\s*a\.uid,\s*\n\s*nickname:\s*a\.nickname,\s*\n\s*realm:\s*a\.realm,\s*\n\s*status:\s*a\.status,\s*\n\s*credits:\s*a\.credits,\s*\n\s*credits_total:\s*a\.creditsTotal,\s*\n\s*in_flight:\s*a\.inFlight,\s*\n\s*\}\)/);
   });

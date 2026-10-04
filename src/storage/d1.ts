@@ -375,6 +375,39 @@ export async function oldestRequestLogTs(env: Env): Promise<number> {
   return Number(r?.t ?? 0) || 0;
 }
 
+/**
+ * AccountUsageAgg 账号池「成功/失败」「用量」列的窗口聚合行。
+ *
+ * 口径必须与 usage-agg.ts 逐项一致（那是用量页的唯一权威口径）：
+ *   requests    = 窗口内全部日志行（含失败，与用量页「请求数」同源）
+ *   errors      = outcome != 'ok' 的行数（NULL 按失败算，宁多勿漏）
+ *   total_tokens= prompt + completion
+ *   ms_sum      = 全部 ms 之和（均值延迟/速率在展示层折算，避免逐行平均的辛普森悖论）
+ */
+export interface AccountUsageAgg {
+  uid: string;
+  requests: number;
+  errors: number;
+  total_tokens: number;
+  ms_sum: number;
+}
+
+/** usageByAccountWindow 按 uid 聚合 [from, to] 窗口内的请求日志（GROUP BY 在 D1 侧完成，返回行数 = 账号数）。 */
+export async function usageByAccountWindow(env: Env, from: number, to: number): Promise<AccountUsageAgg[]> {
+  return all<AccountUsageAgg>(
+    env,
+    `SELECT uid,
+            COUNT(*) AS requests,
+            SUM(CASE WHEN outcome IS NULL OR outcome != 'ok' THEN 1 ELSE 0 END) AS errors,
+            SUM(COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) AS total_tokens,
+            SUM(COALESCE(ms, 0)) AS ms_sum
+     FROM request_logs
+     WHERE ts >= ? AND ts <= ? AND uid IS NOT NULL AND uid != ''
+     GROUP BY uid`,
+    [from, to],
+  ).catch(() => []);
+}
+
 export async function recordUsage(env: Env, model: string, realm: string, tokens: number, ts: number): Promise<void> {
   await run(
     env,
