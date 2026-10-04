@@ -265,6 +265,20 @@ export class PoolDO {
       if (request.method === "GET" && p === "/internal/list") {
         await this.refreshCache();
         for (const a of this._cache ?? []) this.prune(a, now);
+        // ?stats=1：一次 RPC 带回面板概览要的全部信息。sticky_sessions 读的是 DO
+        // 内会话存储，Worker 侧拿不到，只能在这里顺带返回——其余统计项（healthy/
+        // cooling/disabled/in_flight_full）Worker 侧可用 pool-core 的同一份纯函数
+        // 从账号列表直接算出，不必再发一次 /internal/status。
+        // 面板轮询从 5s 降到 30s 后仍是持续开销，合并成单次 RPC 把 DO 请求再砍一半。
+        if (url.searchParams.get("stats") === "1") {
+          let sticky = 0;
+          try {
+            sticky = await countSticky(this.ctx);
+          } catch {
+            /* noop */
+          }
+          return json({ accounts: this._cache ?? [], sticky_sessions: sticky });
+        }
         return json(this._cache ?? []);
       }
       if (request.method === "GET" && p.startsWith("/internal/auth/")) {

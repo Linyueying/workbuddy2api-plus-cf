@@ -118,4 +118,23 @@ describe("密钥明文契约（静态守卫）", () => {
     // 不能用「只回 7 字段」的旧形态蒙混——基础字段仍在，但必须扩出上面的运行时字段。
     expect(overview).not.toMatch(/uid:\s*a\.uid,\s*\n\s*nickname:\s*a\.nickname,\s*\n\s*realm:\s*a\.realm,\s*\n\s*status:\s*a\.status,\s*\n\s*credits:\s*a\.credits,\s*\n\s*credits_total:\s*a\.creditsTotal,\s*\n\s*in_flight:\s*a\.inFlight,\s*\n\s*\}\)/);
   });
+
+  it("overview 每次只能发一次 DO 请求——status+list 合并后不得回退成两次 RPC", () => {
+    // 面板每 30s 轮询一次概览，一次 RPC 与两次 RPC 差一倍 DO 请求量；
+    // 免费套餐 10 万次/天，这是面板常开时最持续的开销。
+    const overview = handlerOf(panelSrc, 'app.get("/panel/api/overview"');
+    const rpcs = overview.match(/poolRPC\(/g) ?? [];
+    expect(rpcs.length, "overview 的 DO 请求必须是 1 次（合并 status+list）").toBe(1);
+    expect(overview, "overview 不得再调 /internal/status（统计已在 Worker 侧用 pool-core 算）").not.toMatch(/\/internal\/status/);
+    // 统计口径必须复用 pool-core 的同一份纯函数，不得在 Worker 侧另写一套判定。
+    expect(overview).toMatch(/coreHealthy\(/);
+    expect(overview).toMatch(/coreInFlightFull\(/);
+  });
+
+  it("面板轮询间隔不得回到 5s——账号池无秒级变化需求，却持续吃 DO 额度", () => {
+    expect(appJs).not.toMatch(/setInterval\(refreshVisible,\s*5000\)/);
+    expect(appJs).toMatch(/REFRESH_IDLE_MS\s*=\s*30000/);
+    // 任务队列例外：执行进度需要实时回写，仍走 5s。
+    expect(appJs).toMatch(/REFRESH_QUEUE_MS\s*=\s*5000/);
+  });
 });

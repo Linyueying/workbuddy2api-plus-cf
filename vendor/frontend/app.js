@@ -5,7 +5,7 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
-let refTimer = null;
+let refTimer = null, queueRefreshTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
@@ -1191,16 +1191,25 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+// 概览/日志 30s 一次：账号池的运营数字（成功失败、用量、冷却剩余）秒级变化没有
+// 意义，而每次轮询都要打 Durable Object（免费套餐 10 万次/天，5s 轮询一天就吃掉
+// 三分之一额度）。任务队列例外——队列执行进度需要实时回写，保持 5s。
+const REFRESH_IDLE_MS = 30000;
+const REFRESH_QUEUE_MS = 5000;
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') reattachQueueView();
+}
+function refreshQueueView() {
+  if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
   loadOverview(true);
   loadPanelKeyRow();
   if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  if (queueRefreshTimer) clearInterval(queueRefreshTimer);
+  refTimer = setInterval(refreshVisible, REFRESH_IDLE_MS);
+  queueRefreshTimer = setInterval(refreshQueueView, REFRESH_QUEUE_MS);
   checkAuthGate();
 }
 async function checkAuthGate() {

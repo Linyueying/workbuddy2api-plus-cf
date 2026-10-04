@@ -2,6 +2,11 @@ import type { Hono } from "hono";
 import type { Env } from "../../worker-configuration.d.ts";
 import { getConfig, saveConfig } from "../config";
 import { poolRPC } from "../durable/account-pool";
+import {
+  healthy as coreHealthy,
+  inFlightFull as coreInFlightFull,
+  type PickCfg,
+} from "../durable/pool-core";
 import { listModels } from "../services/resolveModel";
 import {
   queryRequestLogs,
@@ -122,8 +127,28 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
   app.get("/panel/api/overview", async (c) => {
     const cfg = await getConfig(c.env);
     const now = Date.now();
-    const st = await poolRPC(c.env, "/internal/status").catch(() => null);
-    const accounts = (await poolRPC(c.env, "/internal/list").catch(() => [])) as any[];
+    // 单次 RPC 取回账号列表 + sticky（原本 status 与 list 是两次 DO 请求）。
+    // 概览统计项在 Worker 侧用 pool-core 的同一份纯函数算出，口径与 DO 内 status() 一致。
+    const pool = (await poolRPC(c.env, "/internal/list?stats=1").catch(() => null)) as any;
+    const accounts = (pool?.accounts ?? []) as any[];
+    const pcfg: PickCfg = {
+      idle_weight_per_hour: cfg.pool.idle_weight_per_hour,
+      idle_weight_max: cfg.pool.idle_weight_max,
+      prefer_expiring: cfg.pool.prefer_expiring,
+      expiring_soon: cfg.pool.expiring_soon,
+      credit_floor: cfg.pool.credit_floor,
+      cost_explore_interval: cfg.pool.cost_explore_interval,
+      max_in_flight: cfg.pool.max_in_flight,
+      max_in_flight_global: cfg.pool.max_in_flight_global,
+    };
+    let healthyN = 0, coolingN = 0, disabledN = 0, inFlightFullN = 0;
+    for (const a of accounts) {
+      // 与 DO status() 同口径：disabled 优先，其次 healthy，其余计 cooling。
+      if (a.status === "disabled") disabledN++;
+      else if (coreHealthy(a, now)) healthyN++;
+      else coolingN++;
+      if (coreInFlightFull(a, pcfg)) inFlightFullN++;
+    }
     // 成功/失败与用量列：D1 窗口聚合（与用量页同口径、同缺省窗口 24h）。
     const usageByUid = await accountUsageByUid(c.env);
     return c.json({
@@ -131,12 +156,12 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       uptime_sec: Math.floor((now - STARTED_AT) / 1000),
       auth_required: true,
       redis_mode: false,
-      sticky_sessions: st?.sticky_sessions ?? 0,
-      total: st?.total ?? 0,
-      healthy: st?.healthy ?? 0,
-      cooling: st?.cooling ?? 0,
-      disabled: st?.disabled ?? 0,
-      in_flight_full: st?.in_flight_full ?? 0,
+      sticky_sessions: Number(pool?.sticky_sessions ?? 0) || 0,
+      total: accounts.length,
+      healthy: healthyN,
+      cooling: coolingN,
+      disabled: disabledN,
+      in_flight_full: inFlightFullN,
       usage_window_hours: ACCT_USAGE_HOURS,
       // 序列化对齐前端（Go 版）契约：前端 renderAccounts/renderPackages/groupItems
       // 读的是 snake_case 字段名，且需要 success_count/err_total/last_success/
