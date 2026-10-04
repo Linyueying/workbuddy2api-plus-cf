@@ -813,6 +813,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-expiry-hdr, .pk-expiry-row { grid-template-columns: 56px minmax(60px, 1fr) 64px; }
   .empty { padding: 28px 14px; }
   .tc-empty { padding: 30px 14px; }
+
+  /* ⑪ 账号卡：短值字段两两并列——首屏最占地方的就是这张卡。
+     grid auto-fit + minmax 把「放得下就两列、放不下自动回落单列」交给浏览器算，
+     不必为 360 / 390 / 430 各写一个列断点。身份头（昵称 + uid）、用量 chips、
+     最近成功与操作按钮区内容长或要点按，显式跨满整行；其余短值按 DOM 顺序
+     两两组行（状态|积分、成功失败|在途），8 行压到 6 行。只作用账号池视图。 */
+  #view-accounts .acc.is-carded tr {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  }
+  #view-accounts .acc.is-carded td.who,
+  #view-accounts .acc.is-carded td.usage-cell,
+  #view-accounts .acc.is-carded td.ago,
+  #view-accounts .acc.is-carded td.acts { grid-column: 1 / -1; }
+
+  /* ⑫ 统计条横滑：末张卡留一点余白，滑到尽头时不至于贴死屏幕边缘 */
+  .stats > .stat:last-child, .kpis > .kpi:last-child { margin-right: 14px; }
 }
 
 /* 极窄屏（≤400px）：再收一档，保证「列名 + 值」仍能并排放下 */
@@ -1609,6 +1626,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<script src="app.js?v=20261005a"></script>
+<script src="app.js?v=20261005b"></script>
 </body>
 </html>
