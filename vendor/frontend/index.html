@@ -242,6 +242,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .nm.cp.copied::after { content: '✓'; color: var(--ok); }
 .md-desc { display: none; }
 .md-toggle { display: none; }
+/* 移动端顶栏品牌块：桌面是侧栏 brand（.nav .brand），这块只在 ≤760px 显示 */
+.m-brand { display: none; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -599,9 +601,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
    卡片化只作用于被 JS 打上 .is-carded 的表，JS 失效时优雅退回横向滚动。
    ══════════════════════════════════════════════════════════════════════ */
 @media (max-width: 760px) {
-  /* 底部标签栏实测高 ~88px（导航项 57 + 连接状态行 24 + 边框），内容区、
-     toast、保存条都按这个值让位。改导航内边距时必须同步改这里。 */
-  :root { --navh: 90px; }
+  /* 底部标签栏只剩标签一行，实测高 ~68px（导航项 57 + 上下内边距 10 + 边框）。
+     连接状态/版本已上移到顶栏左上角品牌块（.m-brand），不再占底栏一行。
+     改导航内边距时必须同步改这里。 */
+  :root { --navh: 68px; }
 
   /* ① 导航 → 底部标签栏 */
   .shell { grid-template-columns: 1fr; }
@@ -624,26 +627,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-size: 11px; border-radius: 9px; justify-content: center; text-align: center;
   }
   .nav a svg { width: 17px; height: 17px; }
-  /* 版本 / Redis 那行在窄屏没位置，但连接状态是唯一的链路指示，必须留。 */
-  .nav .sig {
-    display: flex; justify-content: center; gap: 10px;
-    border-top: 1px solid var(--line-soft); border-bottom: 0;
-    padding: 4px 10px; font-size: 11px;
-  }
-  .nav .sig .row { margin-top: 0 !important; }
-  .nav .sig .row + .row { display: none; }
+  /* 版本 / 连接状态行整体上移到顶栏品牌块，底栏不再显示 */
+  .nav .sig { display: none; }
   .main { padding-bottom: calc(var(--navh) + env(safe-area-inset-bottom, 0px)); }
 
-  /* ② 顶栏瘦身：标题 + 状态 + 三个按钮；状态可截断但保留。
-     标题与按钮必须 nowrap + flex:none——360px 真机上它们会被 flex 压缩，
-     「账号池」折成两行、「刷新」竖着断字，正是截图里那种碎掉的样子。 */
-  .topbar { padding: 9px 13px; gap: 8px; }
-  .topbar h2 { font-size: 14.5px; white-space: nowrap; flex: none; }
-  .topbar .sep { display: none; }
-  .topbar .meta {
-    flex: 1 1 auto; min-width: 0; font-size: 11.5px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* ② 顶栏左上角 = 品牌块：WorkBuddy2API + 版本 · 提交号 · 服务状态。
+     原「视图标题 + 运行时长」让位（视图身份由底栏高亮与块头标题承担），
+     按钮组原样保留在右侧。 */
+  .topbar { padding: 7px 12px; gap: 8px; }
+  .m-brand { display: block; min-width: 0; }
+  .m-brand .t {
+    font-size: 14.5px; font-weight: 650; letter-spacing: -.01em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  .m-brand .s {
+    display: flex; align-items: center; gap: 5px; margin-top: 1px;
+    font-size: 10.5px; color: var(--ink-3); white-space: nowrap;
+  }
+  .m-brand .s .pulse { flex: none; }
+  .m-brand .pulse { width: 6px; height: 6px; }
+  .topbar h2, .topbar .sep, .topbar .meta { display: none; }
   .topbar .grow { flex: none; }
   .topbar button { padding: 6px 11px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
@@ -865,6 +868,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   <div class="main">
     <div class="topbar">
+      <!-- 移动端左上角品牌块：标题 + 版本/提交号/服务状态（桌面隐藏，见样式表两处） -->
+      <div class="m-brand" id="mBrand">
+        <div class="t">WorkBuddy2API</div>
+        <div class="s"><span class="pulse" id="mPulse"></span><span id="mSub">连接中</span></div>
+      </div>
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
@@ -1601,6 +1609,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<script src="app.js?v=20261004b"></script>
+<script src="app.js?v=20261005a"></script>
 </body>
 </html>

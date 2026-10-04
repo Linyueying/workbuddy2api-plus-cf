@@ -32,6 +32,7 @@ import {
   type SigninOutcome,
 } from "../services/checkin";
 import { normRealm } from "../services/apikeys";
+import { BUILD_COMMIT } from "../generated/build-info";
 import type { ApiKeyRow, Auth } from "../types";
 import type { CtxVars } from "../types";
 
@@ -184,8 +185,12 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     }
     // 成功/失败与用量列：D1 窗口聚合（与用量页同口径、同缺省窗口 24h）。
     const usageByUid = await accountUsageByUid(c.env);
+    // commit 号：Pages 部署环境带 CF_PAGES_COMMIT_SHA（部署时的真实提交），
+    // 本地/测试回落到构建时生成的 BUILD_COMMIT。
+    const pagesSha = (c.env as unknown as Record<string, string | undefined>).CF_PAGES_COMMIT_SHA;
     return c.json({
       version: VERSION,
+      commit: (pagesSha || BUILD_COMMIT || "").slice(0, 7),
       uptime_sec: Math.floor((now - STARTED_AT) / 1000),
       auth_required: true,
       redis_mode: false,

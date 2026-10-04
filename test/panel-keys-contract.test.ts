@@ -77,6 +77,20 @@ describe("密钥明文契约（静态守卫）", () => {
     expect(appJs).toMatch(/body\.expires_at = Date\.now\(\) \+ days \* 86400000/);
   });
 
+  it("overview 必须暴露 commit，且移动端品牌块消费的就是它（WorkBuddy2API 标题下的版本 · 提交号）", () => {
+    // 左上角品牌块的第二行 = 版本 · 提交号 · 服务状态。commit 在后端断了
+    // （BUILD_COMMIT 生成脚本没跑 / 字段被删），前端会静默少一段而不是报错——
+    // 正是这类「不崩但空」要靠契约守卫盯着。
+    const overview = handlerOf(panelSrc, 'app.get("/panel/api/overview"');
+    expect(overview, "overview 漏了 commit 字段").toMatch(/\bcommit:/);
+    expect(panelSrc).toContain("BUILD_COMMIT");
+    // 前端品牌块：标题固定、mSub 拼接 commit、pulse 状态点
+    const html = readFileSync(resolve(root, "vendor/frontend/index.html"), "utf8");
+    expect(html).toContain('id="mBrand"');
+    expect(html).toMatch(/m-brand[\s\S]{0,200}WorkBuddy2API/);
+    expect(appJs).toMatch(/\$\('mSub'\)\.textContent = \['v' \+ d\.version, d\.commit, stateTxt\]/);
+  });
+
   it("overview 的账号序列化必须对齐前端（Go 版）snake_case 契约——否则账号池整列空白", () => {
     // 2026-10 事故：后端 overview 只映射了 7 个基础字段，前端 renderAccounts
     // 读的 success_count/err_total/last_success/breaker_until/degrade_until/

@@ -431,9 +431,14 @@ async function loadOverview(quiet) {
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
-    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
-    const p = $('navPulse');
-    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+    const stateTxt = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+    $('navState').textContent = stateTxt;
+    const pcls = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+    $('navPulse').className = pcls;
+    // 移动端顶栏品牌块：WorkBuddy2API / 版本 · 提交号 · 服务状态（同一份 overview 数据）
+    if ($('mVer')) $('mVer').textContent = 'v' + d.version;
+    if ($('mSub')) $('mSub').textContent = ['v' + d.version, d.commit, stateTxt].filter(Boolean).join(' · ');
+    if ($('mPulse')) $('mPulse').className = pcls;
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';

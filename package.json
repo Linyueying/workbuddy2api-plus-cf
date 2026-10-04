@@ -5,8 +5,8 @@
   "type": "module",
   "description": "workbuddy2api 网关：Go 后端云原生重写为 Cloudflare Pages (Pages Functions + Durable Objects)。前端静态资源与后端 API 全部由 Pages 托管。",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022 --define:process.env.NODE_ENV='\"production\"' && npm run copy-frontend",
-    "build:worker": "esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022",
+    "build": "node scripts/gen-commit.mjs && esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022 --define:process.env.NODE_ENV='\"production\"' && npm run copy-frontend",
+    "build:worker": "node scripts/gen-commit.mjs && esbuild src/index.ts --bundle --format=esm --outfile=dist/_worker.js --platform=browser --target=es2022",
     "copy-frontend": "node scripts/copy-frontend.mjs",
     "dev": "npm run build && wrangler pages dev dist --binding WB2A_API_KEY=dev-admin-key --kv WB2A_CONFIG --kv WB2A_CACHE --d1 WB2A_DB --r2 WB2A_LOGS --do POOL=PoolDO@workbuddy2api-engine",
     "build:engine": "esbuild engine-worker/src/index.ts --bundle --format=esm --outfile=engine-worker/dist/index.js --platform=browser --target=es2022",
