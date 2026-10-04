@@ -2939,3 +2939,84 @@ $('btnKIssuedCopy').onclick = () => {
   $('btnKIssuedCopy').textContent = '已复制';
   setTimeout(() => $('btnKIssuedCopy').textContent = '复制', 1500);
 };
+
+/* ── 移动端：宽表 → 卡片 ──────────────────────────────────────────────────
+   窄屏下 640~1080px 的宽表只能横向滚动，字被压成一条。CSS 已把 .acc.is-carded
+   整表转成卡片（字段竖排），这里只负责两件事：
+     1) 把列名从 thead 抄到每个 td 的 data-l 上，CSS 用 ::before 显示在左侧；
+        列名是实时读 thead 的，所以「按账号/按模型/按域」切换表头时标签跟着变
+        ——不用在每个渲染函数里各写一遍，也不会和表头漂移。
+     2) 标记 is-solo：colspan 的汇总 / 占位行（"暂无数据"、积分包的聚合行）
+        列数对不上，按索引贴标签会整行错位，跳过并给中性边框。
+   请求记录（.acc.req）是密集日志，故意不打标——保留横向滚动，免得 1000 行
+   变成 1000 张卡片。CSS 里 .is-carded 只在 ≤760px 生效，故桌面端无副作用。 */
+function mobileDecorateTable(table) {
+  if (!table || !table.classList || table.classList.contains('req')) return;
+  const head = table.tHead;
+  if (!head || !head.rows.length) return;
+  const ths = head.rows[0].cells;
+  const labels = [];
+  for (let i = 0; i < ths.length; i++) labels.push(String(ths[i].textContent || '').trim());
+  const bodies = table.tBodies;
+  for (let b = 0; b < bodies.length; b++) {
+    const rows = bodies[b].rows;
+    for (let r = 0; r < rows.length; r++) {
+      const cells = rows[r].cells;
+      if (cells.length !== labels.length) { rows[r].classList.add('is-solo'); continue; }
+      rows[r].classList.remove('is-solo');
+      for (let c = 0; c < cells.length; c++) {
+        const lb = labels[c];
+        if (lb) cells[c].setAttribute('data-l', lb);
+        else cells[c].removeAttribute('data-l');
+      }
+    }
+  }
+  table.classList.add('is-carded');
+}
+
+function mobileDecorateAll() {
+  const tables = document.querySelectorAll('table.acc');
+  for (let i = 0; i < tables.length; i++) mobileDecorateTable(tables[i]);
+}
+
+/* 每张表都是各自 innerHTML 重刷的，逐个渲染函数挂钩会漏（积分构成的表还是
+   动态创建的）。改为观察「哪张表变了」就只重刷那张：日志每秒追加时不会带着
+   账号表一起重算。只观察 childList——本函数自己写的是属性，不会自激循环。 */
+(function mobileCardWatch() {
+  const navToActive = () => {
+    const ul = document.querySelector('.nav ul');
+    const on = ul && ul.querySelector('a.on');
+    if (!ul || !on) return;
+    ul.scrollLeft = Math.max(0, on.offsetLeft - (ul.clientWidth - on.offsetWidth) / 2);
+  };
+  const start = () => {
+    mobileDecorateAll();
+    navToActive();
+    if (typeof MutationObserver === 'undefined') return;
+    let dirty = [], pending = false;
+    const raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
+    const flush = () => {
+      pending = false;
+      const list = dirty; dirty = [];
+      for (let i = 0; i < list.length; i++) {
+        try { mobileDecorateTable(list[i]); } catch (e) {}
+      }
+    };
+    const mo = new MutationObserver((muts) => {
+      for (let i = 0; i < muts.length; i++) {
+        const n = muts[i].target;
+        const el = n && n.nodeType === 1 ? n : (n && n.parentElement);
+        if (!el || !el.closest) continue;
+        const t = el.closest('table');
+        if (t && dirty.indexOf(t) < 0) dirty.push(t);
+      }
+      if (dirty.length && !pending) {
+        pending = true;
+        if (raf) raf(flush); else setTimeout(flush, 32);
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  };
+  if (document.body) start();
+  else document.addEventListener('DOMContentLoaded', start);
+})();

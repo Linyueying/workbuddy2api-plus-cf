@@ -378,12 +378,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
 
-@media (max-width: 760px) {
-  .shell { grid-template-columns: 1fr; }
-  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
-  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
-  .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
-}
+/* 移动端（≤760px）的完整重排统一放在样式表末尾的「移动端重构」段。
+   不要在这里补规则：媒体查询不增加权重，写在 .kpis / .acc.zebra / .fbar 等
+   桌面规则**之前**的响应式会被它们按源码顺序覆盖掉（历史 bug 的来源）。 */
   /* ── 用量视图 ─────────────────────────────────────────────────────
      这一页一屏要放下「两组 KPI + 图表 + 三张表」，所以视觉语言比账号池更轻：
      卡片用左侧色轨区分语义，数字用等宽体对齐，分隔靠留白而不是更多边框。 */
@@ -572,6 +569,214 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
+/* ══════════════════════════════════════════════════════════════════════════
+   移动端重构（≤760px）
+   ──────────────────────────────────────────────────────────────────────────
+   原来的响应式只有 6 行，把侧栏折成顶部横条就完事，其余照搬桌面布局。三件事
+   叠在一起，把首屏吃光、正文挤成一条：
+     ① 额头：顶部横导航 + 吸顶顶栏 + 六张统计卡（2 列 × 3 行）连成一坨，
+        真正的表格要划两屏才看得到；
+     ② 表格：min-width 640/700/1080 的宽表塞进 390px，只能横向滚动，字号
+        与间距被压到一起，长字段（账号 ID、模型名、UA）全程省略号；
+     ③ 块头：标题 nowrap + 一排按钮 + 一句长说明，横向挤爆后互相裁切。
+   这一层按移动端的信息层级重排：
+     ① 导航移到底部标签栏——额头让位，且拇指可及；连接状态保留成一行
+        （它是唯一的链路指示，不能随导航一起藏掉）；
+     ② 统计卡 / KPI 改横向吸附滚动条，纵向从 3 行压到 1 行；
+     ③ 宽表整表转卡片：字段竖排、列名由 app.js 写进 data-l 再用 ::before
+        显示在左侧；不再横向滚动，省略号放开（截断正是"看不清"的来源）；
+     ④ 块头换行、弹窗变底部抽屉、底部固定元素让开标签栏与安全区。
+   位置必须在样式表末尾：媒体查询不增加权重，只有靠源码顺序压住前面的桌面规则。
+   卡片化只作用于被 JS 打上 .is-carded 的表，JS 失效时优雅退回横向滚动。
+   ══════════════════════════════════════════════════════════════════════ */
+@media (max-width: 760px) {
+  /* 底部标签栏实测高 ~88px（导航项 57 + 连接状态行 24 + 边框），内容区、
+     toast、保存条都按这个值让位。改导航内边距时必须同步改这里。 */
+  :root { --navh: 90px; }
+
+  /* ① 导航 → 底部标签栏 */
+  .shell { grid-template-columns: 1fr; }
+  .nav {
+    position: fixed; top: auto; bottom: 0; left: 0; right: 0;
+    height: auto; z-index: 50; flex-direction: column; align-items: stretch;
+    border-right: 0; border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .nav .brand { display: none; }
+  .nav ul {
+    display: flex; gap: 2px; padding: 5px 4px; flex: none;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+    -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity;
+  }
+  .nav ul::-webkit-scrollbar { display: none; }
+  .nav li { flex: none; scroll-snap-align: center; }
+  .nav a {
+    flex-direction: column; gap: 3px; padding: 6px 11px; min-width: 58px;
+    font-size: 11px; border-radius: 9px; justify-content: center; text-align: center;
+  }
+  .nav a svg { width: 17px; height: 17px; }
+  /* 版本 / Redis 那行在窄屏没位置，但连接状态是唯一的链路指示，必须留。 */
+  .nav .sig {
+    display: flex; justify-content: center; gap: 10px;
+    border-top: 1px solid var(--line-soft); border-bottom: 0;
+    padding: 4px 10px; font-size: 11px;
+  }
+  .nav .sig .row { margin-top: 0 !important; }
+  .nav .sig .row + .row { display: none; }
+  .main { padding-bottom: calc(var(--navh) + env(safe-area-inset-bottom, 0px)); }
+
+  /* ② 顶栏瘦身：标题 + 状态 + 三个按钮；状态可截断但保留 */
+  .topbar { padding: 9px 13px; gap: 8px; }
+  .topbar h2 { font-size: 14.5px; }
+  .topbar .sep { display: none; }
+  .topbar .meta {
+    flex: 1 1 auto; min-width: 0; font-size: 11.5px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .topbar .grow { flex: none; }
+  .topbar button { padding: 6px 11px; font-size: 12.5px; }
+
+  .view { padding: 12px 12px 20px; }
+
+  /* ③ 统计条 / KPI → 横向吸附条（纵向 3 行压到 1 行） */
+  .stats, .kpis, .kpis.k4 {
+    display: flex; gap: 8px; overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+    border: 0; border-radius: 0; background: none; box-shadow: none;
+    margin-bottom: 12px;
+  }
+  .kpis, .kpis.k4 { padding: 10px 12px 12px; margin-bottom: 0; }
+  .stats::-webkit-scrollbar, .kpis::-webkit-scrollbar { display: none; }
+  .stat, .kpi {
+    flex: 0 0 auto; scroll-snap-align: start;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  }
+  .stat { min-width: 104px; padding: 9px 12px; }
+  .stat .v { font-size: 18px; }
+  .stat .k { font-size: 11px; margin-top: 3px; }
+  .kpi { min-width: 126px; padding: 9px 12px 10px 14px; background: var(--surface-2); }
+  .kpi .v { font-size: 17px; }
+  .kpi .k { font-size: 11px; }
+  .kpi .s { font-size: 10.5px; }
+
+  /* ④ 宽表 → 卡片。请求记录（.req）是密集日志，保留横向滚动。 */
+  .tbl-wrap:not(.req-wrap) { overflow-x: visible; }
+  .acc:not(.req) { min-width: 0; }
+  .req-wrap { max-height: 58vh; }
+  .acc.is-carded { display: block; width: 100%; }
+  .acc.is-carded thead { display: none; }
+  .acc.is-carded tbody { display: block; }
+  .acc.is-carded tr {
+    display: block; margin: 10px 12px; border: 1px solid var(--line);
+    border-left: 3px solid var(--ok); border-radius: 10px;
+    background: var(--surface-2); overflow: hidden;
+  }
+  .acc.is-carded tr.cool { border-left-color: var(--warn); }
+  .acc.is-carded tr.off { border-left-color: var(--bad); }
+  .acc.is-carded td {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px;
+    padding: 7px 12px; border-bottom: 1px solid var(--line-soft);
+    overflow-wrap: break-word; min-width: 0;
+  }
+  .acc.is-carded tr > td:last-child { border-bottom: 0; }
+  .acc.is-carded td[data-l]::before {
+    content: attr(data-l); flex: 0 0 74px;
+    color: var(--ink-3); font-size: 11.5px; font-weight: 500;
+  }
+  /* 值不放大铺开：多个子元素（成功 1284 / 失败 12）要挨在一起，别被 flex:1
+     拉到整行两端；块级子元素（积分值+进度条、状态标签+原因、账号名+ID）
+     独占整行竖排，才是移动卡片的正常形态。 */
+  .acc.is-carded td[data-l] > * { flex: 0 1 auto; min-width: 0; }
+  .acc.is-carded td[data-l] > div { flex: 0 0 100%; }
+  .acc.is-carded .mark { display: none; }
+  .acc.is-carded td:not([data-l]) { justify-content: flex-end; }
+  .acc.is-carded td.empty { justify-content: center; }
+  .acc.is-carded tr.is-solo { border-left-color: var(--line); }
+  /* 卡片里放开截断：账号名 / ID / 用量的省略号在窄屏正是"看不清"的来源 */
+  .acc.is-carded .who { max-width: none; min-width: 0; }
+  .acc.is-carded .who .nm,
+  .acc.is-carded .who .id { white-space: normal; overflow: visible; text-overflow: clip; }
+  .acc.is-carded .usage-cell,
+  .acc.is-carded .rate-limits,
+  .acc.is-carded .cred,
+  .acc.is-carded .efs { min-width: 0; }
+  .acc.is-carded .usage-line { white-space: normal; flex-wrap: wrap; }
+  .acc.is-carded .c-acts .acts { flex-wrap: wrap; }
+
+  /* ⑤ 块头：按钮换行、说明独占一行 */
+  .box { margin-bottom: 14px; border-radius: 10px; box-shadow: none; }
+  .box > header { flex-wrap: wrap; gap: 8px; padding: 11px 13px; }
+  .box > header h3 { white-space: normal; font-size: 13px; }
+  .box > header > .note { flex: 1 1 100%; order: 5; white-space: normal; line-height: 1.5; }
+  .box > header select, .box > header input { max-width: 100%; }
+  .box .pad { padding: 12px; }
+  .uschart-hd { flex-wrap: wrap; }
+  #view-usage .box > header > .note { white-space: normal; }
+
+  /* ⑥ 任务中心：多列网格 → 堆叠 */
+  .qrow { grid-template-columns: 1fr auto; gap: 5px 10px; padding: 9px 13px; }
+  .qrow .code, .qrow .msg { grid-column: 1 / -1; }
+  .qrow .msg { white-space: normal; }
+  .qrow .name .t { white-space: normal; }
+  .shead { display: none; }
+  .srow { grid-template-columns: 1fr; gap: 7px; padding: 11px 13px; }
+  .stasks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .qprog { padding: 10px 13px 0; }
+
+  /* ⑦ 筛选栏：搜索独占一行，下拉按内容收缩 */
+  .fbar { gap: 7px; padding: 9px 12px; }
+  .fbar > input[type=search] { flex: 1 1 100%; min-width: 0; }
+  .fbar > select { flex: 0 1 auto; }
+  .fbar .grow { display: none; }
+
+  /* ⑧ 弹窗 → 底部抽屉 */
+  .veil.on { padding: 0; align-items: flex-end; }
+  .dlg {
+    width: 100% !important; max-width: 100%; max-height: 92vh;
+    border-radius: 14px 14px 0 0;
+  }
+  .dlg header { padding: 14px 15px 11px; }
+  .dlg header h3 { font-size: 14.5px; }
+  .dlg .body { padding: 14px 15px; }
+  .dlg footer {
+    padding: 11px 15px calc(11px + env(safe-area-inset-bottom, 0px));
+    flex-wrap: wrap; gap: 8px;
+  }
+  .dlg footer button { flex: 1 1 auto; }
+  .dlg footer .grow { display: none; }
+  /* 密钥表单的两列是内联 style，只能靠属性选择器 + !important 压过去 */
+  .dlg .body > div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
+  .dlg .tabs { margin-left: 0; margin-top: 8px; }
+
+  /* ⑨ 底部固定元素让开标签栏 */
+  #toasts { left: 10px; right: 10px; bottom: calc(var(--navh) + 10px); align-items: stretch; }
+  .tst { max-width: none; }
+  .savebar {
+    bottom: var(--navh); flex-wrap: wrap;
+    padding-bottom: calc(13px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* ⑩ 杂项 */
+  #logBox { max-height: 46vh; padding: 12px; font-size: 11.5px; }
+  .vc .ft { flex-wrap: wrap; }
+  .vc .ft .acts { margin-left: 0; }
+  .pk-card { flex: 1 1 100%; min-width: 0; }
+  .pk-expiry-hdr, .pk-expiry-row { grid-template-columns: 56px minmax(60px, 1fr) 64px; }
+  .empty { padding: 28px 14px; }
+  .tc-empty { padding: 30px 14px; }
+}
+
+/* 极窄屏（≤400px）：再收一档，保证「列名 + 值」仍能并排放下 */
+@media (max-width: 400px) {
+  .stat { min-width: 92px; padding: 8px 10px; }
+  .stat .v { font-size: 16.5px; }
+  .kpi { min-width: 112px; }
+  .kpi .v { font-size: 16px; }
+  .acc.is-carded td[data-l]::before { flex: 0 0 62px; font-size: 11px; }
+  .topbar { padding: 8px 10px; gap: 6px; }
+  .topbar button { padding: 5px 9px; font-size: 12px; }
+}
 </style>
 </head>
 <body>
@@ -1351,6 +1556,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<script src="app.js?v=20260922b"></script>
+<script src="app.js?v=20261004a"></script>
 </body>
 </html>
