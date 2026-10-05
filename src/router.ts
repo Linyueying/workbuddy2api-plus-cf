@@ -41,6 +41,8 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
     return next();
   }
   const auth = c.req.header("Authorization") || "";
+  // 鉴权计时起点（子密钥有 D1 读，是 TTFT 的关键分段之一）。
+  const authStart = Date.now();
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) return c.json({ error: { message: "unauthorized", type: "api_error", code: "unauthorized" } }, 401);
   const token = m[1];
@@ -74,6 +76,9 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   if (token.startsWith(PREFIX)) {
     const hash = await sha256Hex(token);
     const row = await getKeyByHash(c.env, hash).catch(() => null);
+    // 只有子密钥路径才打 auth 段：这里是全程唯一一趟 D1 读（十几到几十毫秒），
+    // 正是 TTFT 里最值得被看见的一块。管理员分支是内存比对，记它只会平添噪声。
+    c.set("wb2aAuthMs", Date.now() - authStart);
     if (!row) {
       return c.json({ error: { message: "invalid api key", type: "api_error", code: "invalid_api_key" } }, 401);
     }
@@ -105,11 +110,38 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     });
   });
 
+  // ⚠️ CORS 头必须在 `await next()` **之后**写进 c.res.headers，不能在此之前用
+  // c.header()。
+  //
+  // Hono 的 Context.set res 里有一句 `this.#preparedHeaders = undefined`：任何在
+  // next() 之前通过 c.header() 攒下的头，都会在 handler 交出 Response 的那一刻被
+  // 丢弃。而本项目的 handler 一律 `return new Response(...)`（不是 c.json/c.body），
+  // 走的正是不经过 preparedHeaders 合并的那条路——于是这些头从来没出现在成功响应
+  // 上。症状很有迷惑性：鉴权失败等走 c.json 的路径 CORS 正常，成功路径却没有，
+  // 而同源面板看不出任何问题，只有跨域浏览器客户端（Web UI 直连 /v1）会被拦。
+  //
+  // 放在 next() 之后就没这个问题了：此刻 c.res 已是 handler 的 Response，
+  // 直接 set 到它自己的 headers 上。
   app.use("*", async (c, next) => {
-    c.header("Access-Control-Allow-Origin", "*");
-    c.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    c.header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Conversation-Request-ID,X-Session-Key");
+    // 计时起点：这是**最先注册**的中间件，它的入口时刻最贴近「请求到达 Workers」，
+    // 晚于此处的任何打点都会漏掉鉴权 / 路由匹配的耗时。
+    c.set("wb2aT0", Date.now());
     await next();
+    const h = c.res?.headers;
+    if (!h) return;
+    try {
+      h.set("Access-Control-Allow-Origin", "*");
+      h.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      h.set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Conversation-Request-ID,X-Session-Key");
+      // Expose-Headers 是自定义响应头能否被浏览器 JS 读到的开关：同源不看它，
+      // 但跨域客户端要认 X-WB2A-* 就必须列出，否则 headers.get() 恒为 null
+      // ——头在 HTTP 层面明明存在，抓包看得到、代码读不到。
+      h.set("Access-Control-Expose-Headers", "Server-Timing, X-WB2A-Timing, X-WB2A-Routed-Model");
+    } catch {
+      // 静态资源由 env.ASSETS.fetch 返回，其 headers 带 immutable guard，set 会抛
+      // TypeError。静态页同源访问本就不需要 CORS，尽力而为即可，不必为它重建
+      // 一遍 Response（那要复制整个 body 引用，纯属浪费）。
+    }
   });
 
   // 鉴权

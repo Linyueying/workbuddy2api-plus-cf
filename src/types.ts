@@ -216,9 +216,18 @@ export interface RequestLogEntry {
  *
  *   role     "admin"（管理员总钥匙）| "key"（wbk_ 子密钥）
  *   models   子密钥的模型白名单；null = 不限（管理员恒为 null）
- *   keyRow   子密钥整行（配额累加与请求级校验用）；管理员为 null */
+ *   keyRow   子密钥整行（配额累加与请求级校验用）；管理员为 null
+ *
+ * 计时两字段（wb2aT0 / wb2aAuthMs）是 Server-Timing 响应头的数据源，见
+ * services/timing.ts：
+ *   wb2aT0      请求进入网关的墙钟（由最外层 CORS 中间件打点，早于鉴权）
+ *   wb2aAuthMs  鉴权耗时（毫秒）。**只有子密钥路径会设**——管理员走的是 Secret
+ *               比对，耗时在微秒级，设进来只会让响应头多一个恒为 0 的字段。
+ *               缺失即表示「鉴权不是瓶颈」，下游据此省略 auth 段。 */
 export interface CtxVars {
   role: "admin" | "key";
   models: string[] | null;
   keyRow: ApiKeyRow | null;
+  wb2aT0?: number;
+  wb2aAuthMs?: number;
 }

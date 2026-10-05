@@ -10,6 +10,7 @@ import { realModelExists, stripRealm } from "./resolveModel";
 import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from "./prompt";
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
 import { insertRequestLog } from "../storage/d1";
+import { newTimeline, markSince, addElapsed, withTiming, headersWithTiming, type Timeline } from "./timing";
 import type { Usage } from "./sse";
 
 // 反向代理 + 多账号轮转 + 模型编排（替代 internal/server/handler.go 的
@@ -32,10 +33,13 @@ const ROTATE_BACKOFF_BASE = 500;
 /** ROTATE_BACKOFF_CAP 轮转退避封顶。 */
 const ROTATE_BACKOFF_CAP = 8000;
 
-export function openAIError(status: number, code: string, message: string, hint?: string): Response {
+export function openAIError(status: number, code: string, message: string, hint?: string, tl?: Timeline): Response {
+  const headers: Record<string, string> = { "content-type": "application/json; charset=utf-8" };
+  // 错误响应也带计时：失败路径的时间分布同样是诊断依据——pick 慢导致的
+  // 503（no_healthy_account）与其���错误码的耗时画像完全不同，丢了就白瞎一趟。
   return new Response(
     JSON.stringify({ error: { message, type: "api_error", code, gateway_hint: hint } }),
-    { status, headers: { "content-type": "application/json; charset=utf-8" } },
+    { status, headers: tl ? headersWithTiming(headers, tl) : headers },
   );
 }
 
@@ -147,9 +151,20 @@ export async function proxyChat(
   waitUntil: (p: Promise<unknown>) => void = (p) => {
     void p;
   },
+  /**
+   * tl 本次请求的分段计时表（TTFT 归因用，见 services/timing.ts）。
+   *
+   * 由路由层建好后一路传进来，而不是在这里新建：t0 必须是请求进入网关的
+   * 时刻，那比 proxyChat 被调用早一个中间件（CORS + 鉴权 + 读 body 都在之前），
+   * 在这里起表会把最该被看见的几段（auth / body）整个漏掉。
+   * 缺省自建一张：单测直连本函数时不会崩，只是 total 会偏小。
+   */
+  tl: Timeline = newTimeline(),
 ): Promise<Response> {
+  const tCfg = Date.now();
   await primeConfig(env);
   const cfg = await getConfig(env);
+  markSince(tl, "cfg", tCfg);
   const autoCfg = autoConfigOf(cfg);
   const start = Date.now();
   const signal = request.signal;
@@ -158,7 +173,7 @@ export async function proxyChat(
   // 400 + 具体原因，让客户端把「配置不对」与「密钥无效」区分开。
   if (keyRow) {
     const bad: KeyError | null = verifyKeyRequest(keyRow as any, rawModel, stripRealm(rawModel).realm);
-    if (bad) return openAIError(bad.status, bad.code, bad.message);
+    if (bad) return openAIError(bad.status, bad.code, bad.message, undefined, tl);
   }
 
   // 系统提示词改写（出站前、轮转前；每个请求一次，对齐 Go handler.go）。
@@ -166,11 +181,15 @@ export async function proxyChat(
   // 轮级键在 TS 侧由 pool 的 stickyKey 承担，不从 body 派生，故此处顺序无耦合。
   const promptCfg = cfg;
   const promptMode = String(promptCfg?.prompt?.mode ?? "passthrough").trim().toLowerCase();
+  const tPrompt = Date.now();
   const policy = await applyPromptPolicy(env, body, promptCfg);
+  markSince(tl, "prompt", tPrompt);
   let degradedApplied = policy.degraded;
 
   // ---- 模型编排：客户端写的模型名 → 候选链（链首首选）----
+  const tModels = Date.now();
   const realExists = await realModelExists(env, rawModel).catch(() => false);
+  markSince(tl, "models", tModels);
   const chain = Chain(autoCfg, rawModel, hourCST(), realExists);
   let ci = 0;
   let work = policy.body;
@@ -202,6 +221,8 @@ export async function proxyChat(
     let pick: any;
     let pickErr: string | undefined;
     let pickStatus: number | undefined;
+    // pick 累加而非覆盖：轮转重试会打好几轮，要看的是「选号这件事总共占了多久」。
+    const tPick = Date.now();
     try {
       // acquire 随 pick 一起做：PoolDO 在独立 Worker 上，这两步原本是两次跨 Worker
       // HTTP 往返，而它们永远成对出现（选到号就一定要占位）。合并后关键路径少一次。
@@ -215,6 +236,8 @@ export async function proxyChat(
       try { parsed = JSON.parse(e?.message ?? "{}"); } catch {}
       if (pickStatus !== undefined && parsed?.error) pick = { error: parsed.error, ...parsed };
       else pick = { error: "pool_unavailable" };
+    } finally {
+      addElapsed(tl, "pick", Date.now() - tPick);
     }
     if (pick.error) {
       // 该模型在池里已无可用账号（或 DO 直接报错）：换号已穷尽才降级换模型。
@@ -260,10 +283,17 @@ export async function proxyChat(
       // 「不临期」直接跳过 —— 省掉一次跨 Worker 往返。旧版 engine 返回的还是旧
       // auth，判定仍成立，于是照原路补一次 refresh：功能不变，只是没省这一趟。
       if (needsRefresh(auth)) {
+        const tRefresh = Date.now();
         const r = await poolRPC(env, "/internal/refresh", "POST", { uid }).catch(() => null);
         if (r?.auth) auth = r.auth;
+        markSince(tl, "refresh", tRefresh);
       }
+      const tUp = Date.now();
       const up = await chatStream(env, auth, bareModel, work, request.headers);
+      // upstream = 到**响应头**为止（fetch 在头到达时 resolve），即上游握手 + 排队
+      // 的首字节延迟。真正的模型首 Token 还在这之后（上游要先把第一个 chunk 发出），
+      // 但那是不可逆的物理等待，也从第一个 SSE 帧的下发时刻起就与本地无关了。
+      markSince(tl, "upstream", tUp);
       if (!up.ok) {
         const txt = await up.text();
         const c = classify(up.status, txt);
@@ -288,7 +318,7 @@ export async function proxyChat(
 
         if (c.passthrough || c.kind === "ErrContentBlocked") {
           waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "blocked", c.status, start));
-          return openAIError(c.status, c.code, c.message, c.hint);
+          return openAIError(c.status, c.code, c.message, c.hint, tl);
         }
         // 模型级降级：换号解决不了的错误 → 切下一个候选模型。
         if (Fallbackable(autoCfg, c.kindName) && advance()) continue;
@@ -300,7 +330,9 @@ export async function proxyChat(
       // 成功：清该 (账号,模型) 的 11102 负缓存 + 记成功。
       // 两个事件一次 RPC 施加（kinds 批量），省一次跨 Worker 往返。
       // 副作用与分两次发完全一致：applyNote 按 kinds 顺序逐个施加，最后统一落盘。
+      const tNote = Date.now();
       await poolRPC(env, "/internal/note", "POST", { uid, kinds: ["model_block_clear", "success"], model: bareModel }).catch(() => {});
+      markSince(tl, "note", tNote);
 
       const routed = chain[ci] !== rawModel;
 
@@ -356,6 +388,10 @@ export async function proxyChat(
           release();
         });
         if (routed) res.headers.set("X-WB2A-Routed-Model", chain[ci]);
+        // 计时头在**返回前**写：此刻 downstream 还没拿到任何字节，写入的两帧
+        // headers 仍然可变。这是 TTFT 归因的关键——客户端（或 curl -I）在收到
+        // 第一个 data 帧的同时就能读到完整的时间分布。
+        withTiming(res, tl);
         return res;
       }
 
@@ -364,7 +400,7 @@ export async function proxyChat(
         await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
         // 「响应返回后还要写库」一律交给 waitUntil，否则 isolate 回收会把日志吞掉。
         waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", merged.status, start));
-        return merged;
+        return withTiming(merged, tl);
       }
       const payload: any = await merged.json().catch(() => null);
 
@@ -382,7 +418,7 @@ export async function proxyChat(
         }
         await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
         waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "error", 502, start));
-        return openAIError(502, "empty_completion", "upstream returned empty completion");
+        return openAIError(502, "empty_completion", "upstream returned empty completion", undefined, tl);
       }
 
       // 收尾三件（扣配额 / 带成本台账的 release / 日志）全部挂 waitUntil 并行发出，
@@ -395,10 +431,13 @@ export async function proxyChat(
       waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage));
       return new Response(JSON.stringify(payload), {
         status: 200,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          ...(routed ? { "X-WB2A-Routed-Model": chain[ci] } : {}),
-        },
+        headers: headersWithTiming(
+          {
+            "content-type": "application/json; charset=utf-8",
+            ...(routed ? { "X-WB2A-Routed-Model": chain[ci] } : {}),
+          },
+          tl,
+        ),
       });
     } catch (e: any) {
       // 传输层失败：不知道原因的失败 → 喂连败计数（降权兜底），并按 5xx 记熔断。
@@ -425,6 +464,7 @@ export async function proxyChat(
     lastErr?.code ?? "no_healthy_account",
     lastErr?.message ?? "no healthy account available",
     lastErr?.hint,
+    tl,
   );
 }
 

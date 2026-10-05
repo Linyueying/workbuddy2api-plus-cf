@@ -337,6 +337,35 @@ curl -X POST https://<your-pages.dev>/panel/api/scheduler/arm -H "Authorization:
 
 错误信封统一为 `{ error: { message, type: "api_error", code, gateway_hint? } }`，错误 `code` 名（如 `content_blocked`、`prompt_too_long`、`upstream_credits_exhausted`）逐字保留。
 
+### 首 Token 延迟归因（Server-Timing）
+
+每个 `/v1/*` 响应（含错误）都带两份等价的分段计时，用于定位 TTFT（首字节延迟）花在哪：
+
+```
+Server-Timing: auth;dur=12, body;dur=4, cfg;dur=0, prompt;dur=0, models;dur=0, pick;dur=48, note;dur=41, upstream;dur=310, total;dur=420
+X-WB2A-Timing: auth=12 body=4 cfg=0 prompt=0 models=0 pick=48 note=41 upstream=310 total=420
+```
+
+| 段 | 含义 |
+|---|---|
+| `auth` | 子密钥的 D1 查询（管理员钥匙走内存比对，不输出此段）|
+| `body` | 读取请求体（长上下文时这项会变大）|
+| `cfg` | 读网关配置（KV，5s 缓存）|
+| `prompt` | 提示词策略（KV：降级门状态）|
+| `models` | 模型存在性判定（60s 快照，通常 0）|
+| `pick` | 选号 RPC（**跨 Worker 往返**，轮转重试会累加）|
+| `note` | 成功后清负缓存 + 记成功的 RPC |
+| `upstream` | 上游握手到**响应头**为止 |
+| `total` | 请求进网关到响应返回；与前几项之差＝未计段的调度开销 |
+
+一看就知道该优化哪一段：`pick`+`note` 大＝跨 Worker 往返是瓶颈；`upstream` 大＝上游握手/排队慢，本地无事可做。
+
+```bash
+curl -sD - -o /dev/null -X POST https://<你的域名>/v1/chat/completions \
+  -H "Authorization: Bearer <KEY>" -H "Content-Type: application/json" \
+  -d '{"model":"cn:hy3","messages":[{"role":"user","content":"hi"}]}' | grep -i 'x-wb2a-timing\|server-timing'
+```
+
 ---
 
 ## 7. 测试

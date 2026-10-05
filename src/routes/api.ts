@@ -7,7 +7,22 @@ import { modelsForApi } from "../services/resolveModel";
 import { responsesToChat, anthropicToChat } from "../services/compat";
 import { VirtualIDs } from "../services/autoroute";
 import { healthReport } from "../services/health";
+import { newTimeline, markSince } from "../services/timing";
 import type { CtxVars } from "../types";
+
+/**
+ * timelineOf 取本次请求的分段计时表。
+ *
+ * t0 由最外层中间件打点（见 router.ts）；子密钥路径额外带上 auth 段。
+ * 拿不到 wb2aT0（非中间件发起的调用 / 单测直连 handler）时退化为当下计时，
+ * 只是 total 会偏小，不影响其余分段的准确性。
+ */
+function timelineOf(c: any) {
+  const tl = newTimeline(Number(c.get("wb2aT0") ?? Date.now()));
+  const authMs = c.get("wb2aAuthMs");
+  if (typeof authMs === "number") tl.seg.auth = authMs;
+  return tl;
+}
 
 /**
  * waitUntilOf 取当前请求的生命周期延长钩子（Workers ExecutionContext）。
@@ -18,39 +33,61 @@ import type { CtxVars } from "../types";
  * 取不到（测试环境 / 非 Workers 运行时）时降级为立即执行，不影响既有断言。
  */
 function waitUntilOf(c: any): (p: Promise<unknown>) => void {
-  const wait = c?.executionCtx?.waitUntil;
-  if (typeof wait !== "function") return (p) => { void p; };
-  return (p) => wait.call(c.executionCtx, p);
+  try {
+    const ctx = c?.executionCtx;
+    if (ctx && typeof ctx.waitUntil === "function") return (p) => ctx.waitUntil(p);
+  } catch {
+    // ⚠️ 这个 try 不是防御性冗余，是必需的：Hono 的 `c.executionCtx` 是
+    // **getter**，在没有 ExecutionContext 的宿主下它会 `throw new Error(
+    // "This context has no ExecutionContext")`，而不是优雅地返回 undefined
+    // （见 hono/dist/context.js 的 get executionCtx）。那么 `c?.executionCtx`
+    // 里的可选链救不了——它只对 undefined/null 生效，对抛异常无效。
+    // 取不到就降级为真机之外的「挂了也白挂」，至少请求本身不被打成 500。
+  }
+  return (p) => {
+    void p;
+  };
 }
 
 export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
   // /v1/chat/completions
   app.post("/v1/chat/completions", async (c) => {
+    const tl = timelineOf(c);
+    // 读请求体单独计一段：它是从客户端 socket 里吸字节，长上下文（几十 KB 的
+    // system + tools）时能到十几毫秒，且与上游毫无关系——纯本地开销，必须能被看见。
+    const tBody = Date.now();
     const body = await c.req.json().catch(() => ({}));
+    markSince(tl, "body", tBody);
     const model = body.model || "cn:hy3";
     const cfg = await getConfig(c.env);
     const req = c.req.raw;
     // 系统提示词改写不在这里做：它必须与降级重试共享同一份状态，由 proxyChat
     // 在轮转循环内统一裁决（对齐 Go handler.go 的改写位置）。
-    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
+    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c), tl);
   });
 
   // /v1/responses (OpenAI Responses API -> chat)
   app.post("/v1/responses", async (c) => {
+    const tl = timelineOf(c);
+    const tBody = Date.now();
     const body = await c.req.json().catch(() => ({}));
+    markSince(tl, "body", tBody);
     const chat = responsesToChat(body);
     const cfg = await getConfig(c.env);
     const req = c.req.raw;
-    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
+    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c), tl);
   });
 
   // /v1/messages (Anthropic Messages API -> chat)
   app.post("/v1/messages", async (c) => {
+    const tl = timelineOf(c);
+    const tBody = Date.now();
     const body = await c.req.json().catch(() => ({}));
+    markSince(tl, "body", tBody);
     const chat = anthropicToChat(body);
     const cfg = await getConfig(c.env);
     const req = c.req.raw;
-    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c));
+    return proxyChat(c.env, req, chat.model || "cn:hy3", chat, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c), tl);
   });
 
   // /v1/models
