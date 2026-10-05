@@ -375,6 +375,63 @@ export async function oldestRequestLogTs(env: Env): Promise<number> {
 }
 
 /**
+ * requestLogStats 窗口聚合的总量口径（运行日志页顶部「已完成/成功/HTTP/平均」用）。
+ *
+ * 这是 COUNT/SUM/AVG 一条搞定、不带回明细的轻量统计——面板日志页的概要条要的
+ * 只是几个总数与均值，不该为了它把整张表拉到 Worker 里再扫一遍（D1 按扫描行计费）。
+ * 窗口与右侧时间范围、整张请求记录表保持一致：谁都能从这一个数字看出本区间的体感。
+ *
+ * success_rate    = 业务成功（outcome=success）占比；
+ * http_success_rate = HTTP 2xx/3xx 占比（上游握手层面的成功，与业务成功区分开——
+ *                    前者重试后仍可能进 5xx，后者是「最终给到用户的那条」）；
+ * avg_duration_ms = 全部请求（含失败）的 ms 均值，失败也计入，否则均值被人为压低。
+ */
+export interface RequestLogStats {
+  completed: number;
+  success_rate: number | null;
+  http_success_rate: number | null;
+  avg_duration_ms: number;
+}
+export async function requestLogStats(
+  env: Env,
+  q: { from?: number; to?: number },
+): Promise<RequestLogStats> {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (q.from) { where.push("ts >= ?"); params.push(q.from); }
+  if (q.to) { where.push("ts <= ?"); params.push(q.to); }
+  const sql =
+    "SELECT COUNT(*) AS completed," +
+    " SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success," +
+    " SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END) AS http_success," +
+    " AVG(ms) AS avg_ms" +
+    " FROM request_logs" +
+    (where.length ? " WHERE " + where.join(" AND ") : "");
+  const r = await first<any>(env, sql, params).catch(() => null);
+  const completed = Number(r?.completed ?? 0) || 0;
+  const success = Number(r?.success ?? 0) || 0;
+  const http = Number(r?.http_success ?? 0) || 0;
+  return {
+    completed,
+    success_rate: completed ? success / completed : null,
+    http_success_rate: completed ? http / completed : null,
+    avg_duration_ms: Number(r?.avg_ms ?? 0) || 0,
+  };
+}
+
+/**
+ * truncateRequestLogs 清空用量/请求日志表。
+ *
+ * 给「手动重置用量信息」用：用量页、账号用量、运行日志全部从这张表实时聚合，
+ * 把它清零 = 全部统计从头开始。这是不可逆操作，调用方（面板按钮）必须带二次确认。
+ * 行级删除而非 DROP：保留表结构，自动迁移与列自愈逻辑都不受影响。
+ */
+export async function truncateRequestLogs(env: Env): Promise<number> {
+  const r = await run(env, "DELETE FROM request_logs").catch(() => null);
+  return Number(r?.meta?.changes ?? 0) || 0;
+}
+
+/**
  * AccountUsageAgg 账号池「成功/失败」「用量」列的窗口聚合行。
  *
  * 口径必须与 usage-agg.ts 逐项一致（那是用量页的唯一权威口径）：

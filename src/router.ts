@@ -19,6 +19,25 @@ async function sha256Hex(s: string): Promise<string> {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * waitUntilOf 把异步收尾挂到 Workers 生命周期上（与 routes/api.ts 同源约定）。
+ *
+ * 关键：路由层没有把 waitUntil 作为参数传进来，必须自己从 c.executionCtx 取。
+ * 按用户已踩过的坑——Hono 的 `c.executionCtx` 在请求上下文缺失时是**抛出**而非
+ * 返回 undefined——这里用 try/catch 兜住；取不到就退化为「立即执行」（本地/单测
+ * 场景），保证逻辑仍然跑，只是不再享受 isolate 回收前的延寿。
+ */
+function waitUntilOf(c: any): (p: Promise<unknown>) => void {
+  let ctx: ExecutionContext | undefined;
+  try {
+    ctx = c.executionCtx as ExecutionContext | undefined;
+  } catch {
+    ctx = undefined;
+  }
+  if (ctx && typeof ctx.waitUntil === "function") return (p) => ctx!.waitUntil(p);
+  return (p) => void p;
+}
+
 function keyError(c: any, e: { status: number; code: string; message: string }): Response {
   return c.json({ error: { message: e.message, type: "api_error", code: e.code } }, e.status as any);
 }
@@ -91,8 +110,10 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
     c.set("role", "key");
     c.set("models", parseJSONArray(row.models).length ? parseJSONArray(row.models) : null);
     c.set("keyRow", row);
-    // Touch 最佳努力：统计口径不该因为写失败而拦住业务请求。
-    void touchKey(c.env, row, clientIPOf(c, cfg.trust_proxy)).catch(() => {});
+    // Touch 最佳努力：统计口径不该因为写失败而拦住业务请求。挂 waitUntil 而非
+    // 裸 `void`——否则响应返回、isolate 被回收时会把这笔 D1 写静默吞掉，症状就是
+    // last_used / last_ip 偶尔不更新（只在 Workers 上出现，本地/Go 复现不了）。
+    waitUntilOf(c)(touchKey(c.env, row, clientIPOf(c, cfg.trust_proxy)).catch(() => {}));
     return next();
   }
   return c.json({ error: { message: "invalid api key", type: "api_error", code: "invalid_api_key" } }, 401);

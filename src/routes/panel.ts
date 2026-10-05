@@ -10,6 +10,8 @@ import {
 import { listModels } from "../services/resolveModel";
 import {
   queryRequestLogs,
+  requestLogStats,
+  truncateRequestLogs,
   usageByAccountWindow,
   type AccountUsageAgg,
   listKeys,
@@ -292,22 +294,74 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     return c.json({ entries: entries.map((e) => ({ ts: e.ts, ch: e.channel || "sys", text: requestLogLine(e) })) });
   });
 
+  // 请求记录概要（运行日志页顶部「已完成 / 成功 / HTTP / 平均 / 进行中」）。
+  //
+  // 早先这里是个写死的 `{ requests: 0 }` 桩——于是真机上概要条永远是「已完成 0 /
+  // 成功 —」，且前端只在 metrics.archive.enabled 为真时才用 request_logs 的真实数据，
+  // 这个开关 CF 端从不置位，导致整张请求记录表恒空。这里改为对 D1 做一次轻量
+  // COUNT/SUM/AVG（不拉明细，D1 按扫描行计费，概要约=一条聚合 SQL），窗口与右侧
+  // 时间范围一致。in_flight 来自账号池 DO（在途占用的账号数），拉不到就记 0。
   app.get("/panel/api/request_metrics", async (c) => {
-    return c.json({ requests: 0, note: "see /panel/api/request_logs" });
+    const q = c.req.query();
+    // 「全部历史」预设（preset=0）前端什么参数都不发；这种情形要统计整张表，
+    // 不能退化成「近 24h」——否则概要条与下方请求记录表区间不一致。
+    const hasRange = !!(q.from || q.to || q.hours);
+    const toMs = q.to ? Number(q.to) * 1000 : Date.now();
+    const fromMs = q.from
+      ? Number(q.from) * 1000
+      : toMs - (Number(q.hours) || 24) * 3600_000;
+    const m = await requestLogStats(
+      c.env,
+      hasRange ? { from: fromMs, to: toMs } : {},
+    ).catch(() => null);
+    let inFlight = 0;
+    try {
+      const list = (await poolRPC(c.env, "/internal/list").catch(() => [])) as any[];
+      for (const a of list || []) inFlight += Number(a?.inFlight ?? a?.in_flight ?? 0);
+    } catch {
+      /* 账号池不可达不阻断概要 */
+    }
+    return c.json({
+      ...(m || { completed: 0, success_rate: null, http_success_rate: null, avg_duration_ms: 0 }),
+      in_flight: inFlight,
+      // d1=true 告诉前端「日志落 D1，没有 JSONL 归档」——前端据此改文案、并
+      // 始终用 request_logs 的真实明细当表格数据源（见 loadLogs 的 recent 取值）。
+      d1: true,
+      archive: { enabled: false },
+    });
   });
 
   app.get("/panel/api/request_logs", async (c) => {
     const q = c.req.query();
-    const entries = await queryRequestLogs(c.env, {
+    const rows = await queryRequestLogs(c.env, {
       limit: Number(q.limit) || 200,
       outcome: q.outcome,
       account: q.account,
       model: q.model,
       client_ip: q.client_ip,
       user_agent: q.user_agent,
-      from: q.from ? Number(q.from) : undefined,
-      to: q.to ? Number(q.to) : undefined,
+      from: q.from ? Number(q.from) * 1000 : undefined,
+      to: q.to ? Number(q.to) * 1000 : undefined,
     }).catch(() => []);
+    // ⚠️ 字段名归一：前端 renderRequestTable 消费的是 Go 版口径
+    // （time / duration_ms / account / request_id / credit_known …），而 D1 列名是
+    // ts / ms / uid / id / credits。直接透传原始列会让整张表渲染成一片「—」。
+    const entries = rows.map((e) => ({
+      time: e.ts,
+      outcome: e.outcome,
+      status: e.status,
+      model: e.model,
+      account: e.uid,
+      client_ip: e.client_ip,
+      user_agent: e.user_agent,
+      request_id: e.id,
+      duration_ms: e.ms,
+      prompt_tokens: Number(e.prompt_tokens) || 0,
+      completion_tokens: Number(e.completion_tokens) || 0,
+      total_tokens: (Number(e.prompt_tokens) || 0) + (Number(e.completion_tokens) || 0),
+      credit: Number(e.credits) || 0,
+      credit_known: e.credits != null,
+    }));
     return c.json({ entries, limit: Number(q.limit) || 200 });
   });
 
@@ -556,6 +610,22 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
   });
   app.post("/panel/api/usage/save", async (c) => {
     return c.json({ ok: true });
+  });
+
+  // 手动重置用量信息：清空 request_logs，让用量页 / 账号用量 / 运行日志全部归零重算。
+  //
+  // 为什么是清这张表而不是去改 apikey 的 used_tokens/used_credit：前者是「统计口径」
+  // 的源头——用量、账号成功/失败、运行日志全都从它实时聚合；后者是「配额占用」的
+  // 计数器，归零会立刻放大一个账号的可用额度，与「重置用量展示」不是一回事。
+  // 调用方（面板按钮）会带二次确认，这里只管执行。
+  app.post("/panel/api/usage/reset", async (c) => {
+    try {
+      const deleted = await truncateRequestLogs(c.env);
+      resetUsageCache();
+      return c.json({ ok: true, deleted });
+    } catch (e: any) {
+      return c.json({ ok: false, error: String(e?.message ?? e) }, 500);
+    }
   });
 
   // 模型探测

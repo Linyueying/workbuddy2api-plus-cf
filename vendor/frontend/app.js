@@ -749,14 +749,17 @@ async function loadLogs() {
   try {
     const [d, metrics, requestRows] = await Promise.all([
       api('logs'),
-      api('request_metrics').catch(() => ({})),
+      api('request_metrics?' + rq.toString()).catch(() => ({})),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
     ]);
-    // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
-    // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
-    // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求。
-    const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
-    const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
+    // CF 版没有 Go 版的「内存指标 + JSONL 归档」双源；唯一真实数据源就是 D1 的
+    // request_logs。所以表格数据一律以 request_logs 的真实明细为准，metrics 只负责
+    // 顶部概要条（已完成/成功/平均）。之前前端只在 metrics.archive.enabled 为真时
+    // 才用真实的 request_logs，而这个开关 CF 从不置位——导致整张请求记录表恒空。
+    // 这里改为「有真实明细就用真实明细，没有才回落 metrics.recent」。
+    const recent = (requestRows && requestRows.entries && requestRows.entries.length)
+      ? requestRows.entries
+      : (metrics && metrics.recent) || [];
     renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
@@ -788,7 +791,9 @@ function renderRequestMetrics(m, entries) {
   $('reqNote').textContent = a.enabled
     ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
       (a.last_error ? ' · 错误：' + a.last_error : '')
-    : '仅内存指标，JSONL 归档已关闭';
+    : m.d1
+      ? '日志落 D1（request_logs），无 JSONL 归档'
+      : '仅内存指标，JSONL 归档已关闭';
 
   reqEntries = entries || [];
   renderRequestTable();
@@ -2376,6 +2381,27 @@ async function loadUsage() {
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 // 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
 if ($('usRange')) trangeBind('usRange', loadUsage);
+
+// 重置用量：清空 request_logs（用量/账号用量/运行日志全部归零重算）。不可逆，必须
+// 二次确认。成功后清掉本地用法率缓存并重新拉取，避免界面停留在旧窗口的数字上。
+if ($('btnUsageReset')) $('btnUsageReset').onclick = async () => {
+  if (!confirm('确定重置用量信息？\n将清空全部请求/用量日志（request_logs），用量页、账号用量、运行日志会从头开始统计。此操作不可撤销。')) return;
+  const btn = $('btnUsageReset');
+  btn.disabled = true;
+  try {
+    const r = await api('usage/reset', { method: 'POST' });
+    if (r && r.ok) {
+      toast('已重置用量信息（清空 ' + (r.deleted ?? 0) + ' 条记录）', 'ok');
+      await loadUsage();
+    } else {
+      toast('重置失败：' + (r && r.error || '未知错误'), 'err');
+    }
+  } catch (e) {
+    toast('重置失败：' + (e && e.message || e), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
