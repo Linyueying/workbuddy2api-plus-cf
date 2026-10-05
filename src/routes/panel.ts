@@ -22,6 +22,10 @@ import {
   run,
 } from "../storage/d1";
 import { getUsage } from "../storage/usage";
+// 子密钥内存缓存的失效钩子：管理面每改一次密钥行都必须调它。
+// 否则「停用 / 改配额 / 清零用量 / 轮换」会被隔离内存里的旧行挡住最长 30s
+// ——其中轮换尤其严重：旧明文在缓存有效期内仍能通过鉴权，等于轮换没有立即生效。
+import { invalidateKeyCache } from "../services/apikeys";
 import { kvGetJSON, CACHE_KEY_OUTPUT_PROBES, cacheKV } from "../storage/kv";
 import { forEachAccount, runCreditReport, runTrialBatch, prettyReport } from "../services/tasks";
 import { creditPackages, getCredits } from "../services/upstream";
@@ -449,11 +453,14 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const bad = validateKeyInput(body, true);
     if (bad) return c.json({ ok: false, error: bad }, 400);
     await patchKey(c.env, c.req.param("id"), body).catch(() => {});
+    // 改的是同一把钥匙的管控字段（含 enabled / 配额），缓存里那行就此作废。
+    invalidateKeyCache();
     const k = await getKey(c.env, c.req.param("id")).catch(() => null);
     return c.json({ ok: true, key: k });
   });
   app.delete("/panel/api/keys/:id", async (c) => {
     await deleteKey(c.env, c.req.param("id")).catch(() => {});
+    invalidateKeyCache();
     return c.json({ ok: true });
   });
   // POST /reset 语义**必须与 Go 一致**：清零已用额度，而不是换密钥
@@ -467,6 +474,9 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
       "UPDATE apikeys SET used_tokens = 0, used_credit = 0, req_count = 0 WHERE id = ?",
       [c.req.param("id")],
     ).catch(() => null);
+    // 清零用量必须立刻可见：否则刚点完「重置用量」，下一个请求撞上缓存里的旧计数
+    // 照样被 429 拦住——管理员会以为是重置功能坏了。
+    invalidateKeyCache();
     // 行不存在时不报错——幂等语义，调一次和调十次结果相同。
     return c.json({ ok: true, changed: Number(r?.meta?.changes ?? 0) });
   });
@@ -475,6 +485,7 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     await run(c.env, "UPDATE apikeys SET used_tokens = 0, used_credit = 0, req_count = 0 WHERE id = ?", [
       c.req.param("id"),
     ]).catch(() => {});
+    invalidateKeyCache(); // 同 /reset：清零必须立刻对鉴权可见
     return c.json({ ok: true });
   });
   // Go 没有轮换能力，这是 CF 侧的增强：换一把新明文，**旧密钥立即失效**。
@@ -486,6 +497,10 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const key = genKey();
     // prefix 必须跟着换：留在旧掩码上会让列表页继续显示一把已作废的钥匙。
     await insertKey(c.env, { ...k, key_hash: await sha256Hex(key), prefix: keyPrefix(key) }).catch(() => {});
+    // ⚠️ 这是安全口径，不是性能问题：轮换的语义就是「旧明文立即失效」。而鉴权
+    // 走的是带缓存的读——不清缓存，旧 key 在它的 TTL 内照样能通过，轮换等于
+    // 延迟生效。这一行删掉，轮换就从「紧急止损手段」退化成「30 秒后止损」。
+    invalidateKeyCache();
     return c.json({ ok: true, key, plain: key });
   });
   // 配额概览（面板顶部：多少把钥匙、已用多少 token/积分、多少把已超额）。

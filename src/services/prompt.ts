@@ -113,11 +113,33 @@ export function nextMidnightCST(now: number): number {
 /** 降级状态在 KV 里的键（Workers 无进程内存，见文件头说明）。 */
 const DEGRADE_KEY = "prompt:degraded_until";
 
+/**
+ * 降级状态的进程内缓存。
+ *
+ * 存在理由（真机数据驱动）：degradedActive 在**每个请求**的提示词策略里被调用，
+ * 原实现直接读一次 KV，实测稳定吃掉 ~100ms——而它读的那个键在绝大多数部署里
+ * **根本不存在**（没触发过降级），KV 确认「键不存在」的成本同样要付。
+ *
+ * 降级是「一天最多触发一次、且本来就是尽力而为的兜底」语义（见文件头：它不参与
+ * 正确性判定），因此 60s 的可见性滞后完全可接受，换掉每请求一次 KV 往返很划算。
+ */
+const DEGRADE_TTL_MS = 60_000;
+let degradeCache: { ts: number; until: number } | null = null;
+
+/** invalidateDegradeCache 降级状态变更后调用，让本机立刻看到新值。 */
+export function invalidateDegradeCache(): void {
+  degradeCache = null;
+}
+
 /** degradedActive 当前是否处于降级期（now < until）。 */
 export async function degradedActive(env: Env): Promise<boolean> {
-  const raw = await env.WB2A_CACHE.get(DEGRADE_KEY).catch(() => null);
-  const until = Number(raw ?? 0);
-  return Number.isFinite(until) && until > Date.now();
+  if (degradeCache && Date.now() - degradeCache.ts < DEGRADE_TTL_MS) {
+    return degradeCache.until > Date.now();
+  }
+  // 读失败时记 0（未降级）而非抛错：降级只是兜底，不该因为它让对话请求失败。
+  const until = await degradedUntil(env);
+  degradeCache = { ts: Date.now(), until };
+  return until > Date.now();
 }
 
 /** triggerDegrade 触发降级，直到次日 00:00 CST。已在降级期内则**不续期**
@@ -129,6 +151,9 @@ export async function triggerDegrade(env: Env): Promise<void> {
   // KV 最小 TTL 60s；跨过零点后键自然过期，无需清理。
   const ttl = Math.max(60, Math.ceil((next - Date.now()) / 1000));
   await env.WB2A_CACHE.put(DEGRADE_KEY, String(next), { expirationTtl: ttl }).catch(() => {});
+  // 立刻对本机生效：降级是被上游 400 逼出来的，若本 isolate 还按「未降级」继续
+  // 用原提示词发下一个请求，会确定性地再撞一次同样的拦截。
+  invalidateDegradeCache();
 }
 
 /** degradedUntil 读降级截止墙钟（0 = 未降级）。测试与面板用。 */

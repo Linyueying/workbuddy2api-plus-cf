@@ -10,7 +10,7 @@ import { realModelExists, stripRealm } from "./resolveModel";
 import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from "./prompt";
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
 import { insertRequestLog } from "../storage/d1";
-import { newTimeline, markSince, addElapsed, withTiming, headersWithTiming, type Timeline } from "./timing";
+import { newTimeline, markSince, addElapsed, withTiming, headersWithTiming, now, type Timeline } from "./timing";
 import type { Usage } from "./sse";
 
 // 反向代理 + 多账号轮转 + 模型编排（替代 internal/server/handler.go 的
@@ -161,7 +161,7 @@ export async function proxyChat(
    */
   tl: Timeline = newTimeline(),
 ): Promise<Response> {
-  const tCfg = Date.now();
+  const tCfg = now();
   await primeConfig(env);
   const cfg = await getConfig(env);
   markSince(tl, "cfg", tCfg);
@@ -181,15 +181,24 @@ export async function proxyChat(
   // 轮级键在 TS 侧由 pool 的 stickyKey 承担，不从 body 派生，故此处顺序无耦合。
   const promptCfg = cfg;
   const promptMode = String(promptCfg?.prompt?.mode ?? "passthrough").trim().toLowerCase();
-  const tPrompt = Date.now();
-  const policy = await applyPromptPolicy(env, body, promptCfg);
-  markSince(tl, "prompt", tPrompt);
+  // prompt 与 models 是两次**互不相干**的 KV 读，原先串行 await，于是两笔
+  // ~100ms 的往返首尾相接叠成 ~200ms。这里并行发起，各自在落地时打点。
+  const tPrompt = now();
+  const policyP = applyPromptPolicy(env, body, promptCfg).then((p) => {
+    tl.seg.prompt = Math.max(0, now() - tPrompt);
+    return p;
+  });
+  const tModels = now();
+  const existsP = realModelExists(env, rawModel)
+    .catch(() => false)
+    .then((exists) => {
+      tl.seg.models = Math.max(0, now() - tModels);
+      return exists;
+    });
+  const [policy, realExists] = await Promise.all([policyP, existsP]);
   let degradedApplied = policy.degraded;
 
   // ---- 模型编排：客户端写的模型名 → 候选链（链首首选）----
-  const tModels = Date.now();
-  const realExists = await realModelExists(env, rawModel).catch(() => false);
-  markSince(tl, "models", tModels);
   const chain = Chain(autoCfg, rawModel, hourCST(), realExists);
   let ci = 0;
   let work = policy.body;
@@ -222,7 +231,7 @@ export async function proxyChat(
     let pickErr: string | undefined;
     let pickStatus: number | undefined;
     // pick 累加而非覆盖：轮转重试会打好几轮，要看的是「选号这件事总共占了多久」。
-    const tPick = Date.now();
+    const tPick = now();
     try {
       // acquire 随 pick 一起做：PoolDO 在独立 Worker 上，这两步原本是两次跨 Worker
       // HTTP 往返，而它们永远成对出现（选到号就一定要占位）。合并后关键路径少一次。
@@ -237,7 +246,7 @@ export async function proxyChat(
       if (pickStatus !== undefined && parsed?.error) pick = { error: parsed.error, ...parsed };
       else pick = { error: "pool_unavailable" };
     } finally {
-      addElapsed(tl, "pick", Date.now() - tPick);
+      addElapsed(tl, "pick", now() - tPick);
     }
     if (pick.error) {
       // 该模型在池里已无可用账号（或 DO 直接报错）：换号已穷尽才降级换模型。
@@ -283,12 +292,12 @@ export async function proxyChat(
       // 「不临期」直接跳过 —— 省掉一次跨 Worker 往返。旧版 engine 返回的还是旧
       // auth，判定仍成立，于是照原路补一次 refresh：功能不变，只是没省这一趟。
       if (needsRefresh(auth)) {
-        const tRefresh = Date.now();
+        const tRefresh = now();
         const r = await poolRPC(env, "/internal/refresh", "POST", { uid }).catch(() => null);
         if (r?.auth) auth = r.auth;
         markSince(tl, "refresh", tRefresh);
       }
-      const tUp = Date.now();
+      const tUp = now();
       const up = await chatStream(env, auth, bareModel, work, request.headers);
       // upstream = 到**响应头**为止（fetch 在头到达时 resolve），即上游握手 + 排队
       // 的首字节延迟。真正的模型首 Token 还在这之后（上游要先把第一个 chunk 发出），
@@ -330,9 +339,17 @@ export async function proxyChat(
       // 成功：清该 (账号,模型) 的 11102 负缓存 + 记成功。
       // 两个事件一次 RPC 施加（kinds 批量），省一次跨 Worker 往返。
       // 副作用与分两次发完全一致：applyNote 按 kinds 顺序逐个施加，最后统一落盘。
-      const tNote = Date.now();
-      await poolRPC(env, "/internal/note", "POST", { uid, kinds: ["model_block_clear", "success"], model: bareModel }).catch(() => {});
-      markSince(tl, "note", tNote);
+      //
+      // ⚠️ 挂 waitUntil 而不是 await：这趟 RPC 原本排在 `up.ok` 之后、首字节之前
+      // ——一个完整的跨 Worker 往返（真机实测 41ms）被白压在用户的 TTFT 上，而它
+      // 的结果（清负缓存、成功计数）对本次响应**没有任何影响**：流都还没开始转
+      // 发，客户端此刻也不需要知道这一步的成败。
+      // waitUntil 保证它在 isolate 回收前跑完，语义等价于原来的 await，只是不再
+      // 结算到用户的等待时间里。
+      waitUntil(poolRPC(env, "/internal/note", "POST", { uid, kinds: ["model_block_clear", "success"], model: bareModel }).catch(() => {}));
+      // 段值记 0 而非删除：让响应头持续反映「它已不在关键路径上」，而不是让人
+      // 怀疑是埋点丢了。
+      tl.seg.note = 0;
 
       const routed = chain[ci] !== rawModel;
 

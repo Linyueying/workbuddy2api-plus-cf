@@ -15,9 +15,30 @@
 // 都原生识别，不必接工具链。额外再给一份紧凑纯文本的 X-WB2A-Timing，
 // 是为了在终端里贴出来对比时一眼能读完（Server-Timing 的 `;dur=` 语法很啰嗦）。
 //
-// 精度说明：全部走 Date.now()（毫秒），不用 performance.now() 的亚毫秒——这里要
-// 区分的是「几十毫秒的 IO 往返」与「几百毫秒的上游握手」，毫秒足够，而
-// performance.now() 在部分非 Workers 运行时下并不保证可用。
+// 精度说明：一律走 `performance.now()`（亚毫秒），不用 Date.now()。
+//
+// 这不是洁癖——真机上 `body` 段恒显示为 0 就是这个坑：几十 KB 请求体的读取加
+// JSON.parse 大约 0.3~0.8ms，Date.now() 的毫秒分辨率把它整个抹成 0，于是看不出
+// 「到底是快还是压根没计时」这种本质区别。TTFT 优化到后期要争的就是这几毫秒的
+// 取舍，计时器自己不能成为瓶颈。
+// Workers 与 Node 都有 performance.now()；万一在某种运行时下缺席，回落到
+// Date.now()（只是重新引入亚毫秒抹平，不会崩）。
+const perf: { now(): number } | undefined = typeof performance !== "undefined" ? performance : undefined;
+
+/**
+ * now 单调时钟毫秒（浮点）。
+ *
+ * ⚠️ 必须用**单调**时钟：performance.now() 不受系统时钟调整影响，而 Date.now()
+ * 会被 NTP 校正回拨。计时差值一旦为负，Server-Timing 的解析方会直接丢弃整条头。
+ *
+ * ⚠️⚠️ 全链路**只能**用这一支表：`performance.now()` 返回的是「isolate 启动至今
+ * 的毫秒」（几百~几十万量级），`Date.now()` 是 epoch（1.7e12 量级），两者**不能
+ * 相减**。任何一个埋点图省事写了 Date.now()，那一段的差值就会变成天文数字
+ * （或负到被归零），整条归因数据当场报废。所有取时刻处一律 `now()`。
+ */
+export function now(): number {
+  return perf ? perf.now() : Date.now();
+}
 
 /** Timeline 一次请求的分段计时表。 */
 export interface Timeline {
@@ -28,18 +49,19 @@ export interface Timeline {
 }
 
 /** newTimeline 建表。t0 缺省取调用时刻（调用方应尽量传入更早的真实入口时刻）。 */
-export function newTimeline(t0 = Date.now()): Timeline {
+export function newTimeline(t0 = now()): Timeline {
   return { t0, seg: {} };
 }
 
 /**
  * markSince 把「从 since 到现在」记为一段耗时（毫秒），返回该毫秒数。
  *
- * 负值一律归零：时钟回拨（NTP 校正）会让差值为负，而负数打进 Server-Timing
- * 会让下游解析器直接丢弃整条头。
+ * 负值一律归零：虽然改用单调时钟后不会再出现，但外部传入的 since 可能是用别的
+ * 时间源取的（比如有人在调用侧混用了 Date.now()），负值会让下游解析器丢弃整条
+ * Server-Timing 头，宁可显示 0 也别让整段归因数据消失。
  */
 export function markSince(tl: Timeline, name: string, since: number): number {
-  const ms = Math.max(0, Date.now() - since);
+  const ms = Math.max(0, now() - since);
   tl.seg[name] = ms;
   return ms;
 }
@@ -84,9 +106,11 @@ export function timingHeaders(tl: Timeline): Record<string, string> {
     ...Object.keys(tl.seg).filter((k) => !SEG_ORDER.includes(k)),
   ];
   if (!keys.length) return {};
-  const total = Math.max(0, Date.now() - tl.t0);
+  const total = Math.max(0, now() - tl.t0);
   const st = [...keys.map((k) => `${k};dur=${round1(tl.seg[k])}`), `total;dur=${round1(total)}`].join(", ");
-  const flat = [...keys.map((k) => `${k}=${Math.round(tl.seg[k])}`), `total=${Math.round(total)}`].join(" ");
+  // 紧凑版统一取一位小数：原先这里用 Math.round 取整，亚毫秒段（body / cfg /
+  // note 这类已经优化到 <1ms 的）会一整片糊成 0，看不出优化到底生效没有。
+  const flat = [...keys.map((k) => `${k}=${round1(tl.seg[k])}`), `total=${round1(total)}`].join(" ");
   return { "Server-Timing": st, "X-WB2A-Timing": flat };
 }
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
   DEFAULT_PROMPT,
   DEGRADED,
@@ -10,10 +10,17 @@ import {
   degradedActive,
   degradedUntil,
   triggerDegrade,
+  invalidateDegradeCache,
 } from "../src/services/prompt";
 import { DEFAULT_CONFIG, normalizePromptMode } from "../src/config";
 import { classify } from "../src/services/classify";
 import type { Env } from "../worker-configuration.d.ts";
+
+// 降级状态现在是**进程内缓存**的（60s），而单测里每个用例都会重建 memKV。
+// 不清理的话上一个用例写进 KV 的降级标记会以缓存形式泄漏到下一个用例——
+// 表现为「明明是新环境，degraded 却莫名其妙是 true」。这是测试隔离问题，
+// 不是产品问题：真机上一个 isolate 内连续请求共享这份缓存正是设计意图。
+beforeEach(() => invalidateDegradeCache());
 
 /** 可读写的内存 KV（get/put/delete 语义齐 Workers KV 子集）。 */
 function memKV(seed: Record<string, string> = {}) {

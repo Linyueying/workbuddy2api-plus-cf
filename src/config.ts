@@ -243,7 +243,13 @@ export function normalizePromptMode(mode: unknown): PromptMode | null {
 }
 
 // 每请求缓存（DO 单实例内仍是单线程，ctx 短暂，函数内复用即可）。
+//
+// ⚠️ 这里的实现是 **stale-while-revalidate**，不是简单的 TTL 缓存。原因见
+// getConfig 的注释：配置是每请求必读的，任何一次冷 miss 都会把 ~100ms 的 KV
+// 往返直接压在用户感知的首字节上。
 let cache: { ts: number; cfg: Config } | null = null;
+/** 后台刷新去重：陈旧窗口内的并发请求只触发一次刷新，而不是每请求一次。 */
+let refreshing: Promise<void> | null = null;
 
 /** invalidateConfig 清缓存。改配置/ 自检等需要立刻看到新值时用。 */
 export function invalidateConfig(): void {
@@ -253,8 +259,8 @@ export function invalidateConfig(): void {
 /**
  * 绕过缓存读配置。
  *
- * 给「需要反映真实现场」的调用用——部署自检是其中之一：若自检读到 5s 内的旧
- * 缓存（例如此前刚部署、Secret 后补），会把 "key 没配" 误判成已配，反之亦然。
+ * 给「需要反映真实现场」的调用用——部署自检是其中之一：若自检读到缓存里的旧值
+ * （例如此前刚部署、Secret 后补），会把 "key 没配" 误判成已配，反之亦然。
  * 诊断路径宁可多读一次 KV，也不接受被缓存误导。
  */
 export async function getConfigFresh(env: Env): Promise<Config> {
@@ -262,9 +268,26 @@ export async function getConfigFresh(env: Env): Promise<Config> {
   return getConfig(env);
 }
 
-/** 从 KV 读取配置并合并默认值与 WB2A_* 环境变量覆盖。 */
-export async function getConfig(env: Env): Promise<Config> {
-  if (cache && Date.now() - cache.ts < 5000) return cache.cfg;
+// 三处 KV 读（配置 / 降级门 / 模型目录）在真机上都实测在 100ms 量级，而它们
+// 全是**每请求必读**。差别在于各自有没有缓存，以及缓存的 TTL 够不够长：
+//   配置   —— 原先 5s TTL：请求间隔一旦超过 5s 就重新 miss，等于每请求付一次
+//   降级门 —— 原先完全没缓存：稳定 100ms，一次不落
+//   模型目录 —— 60s 快照：同样会周期性 miss
+// 统一策略见 getConfig 的 stale-while-revalidate 与下面两个常量。
+
+/** CONFIG_FRESH_MS 这段时间内认为缓存是新鲜的，直接返回、零 IO。 */
+const CONFIG_FRESH_MS = 30_000;
+/**
+ * CONFIG_STALE_MS 超过这个时长就认为数据不可信，连陈旧值都不该再返回。
+ *
+ * 只会出现在 isolate 长时间 idle 后又收到请求的场景（后台刷新 promise 会随
+ * isolate 一起被回收，没有机会更新 ts）。留一个大窗口是为了不把它设计成
+ * 「读不到配置就全站 5xx」——那种失败模式比用一份 5 分钟前的配置糟糕得多。
+ */
+const CONFIG_STALE_MS = 300_000;
+
+/** loadConfig 真正读一次 KV 并做归一（唯一的实际 IO 点）。 */
+async function loadConfig(env: Env): Promise<Config> {
   let stored: Partial<Config> = {};
   try {
     const raw = await env.WB2A_CONFIG.get(KV_KEY, { type: "json" });
@@ -301,6 +324,59 @@ export async function getConfig(env: Env): Promise<Config> {
   if (process.env.WB2A_EXPIRING_SOON) cfg.pool.expiring_soon = Number(process.env.WB2A_EXPIRING_SOON);
   if (process.env.WB2A_PREFER_EXPIRING) cfg.pool.prefer_expiring = process.env.WB2A_PREFER_EXPIRING === "true";
 
+  cache = { ts: Date.now(), cfg };
+  return cfg;
+}
+
+/**
+ * getConfig 取网关配置（stale-while-revalidate）。
+ *
+ * 为什么不能用「命中就返回、过期就等 KV」的朴素 TTL：这行代码在**每个请求**的
+ * 关键路径上，而且它比看起来更早——鉴权中间件里第一件事就读它。任何一次冷 miss
+ * 都会把 ~100ms 的 KV 往返加在用户感知的首字节上，且这笔开销会被记到 auth 段，
+ * 从外面看还以为是子密钥的 D1 查询慢了。真机数据里 auth 在 123ms 与 247ms 之间
+ * 反复横跳，混进去的正是这一项。
+ *
+ * SWR 的行为：
+ *   - 新鲜（<30s）  → 直接返回缓存，零 IO；
+ *   - 陈旧（>30s）  → **立即返回旧值**，同时在后台刷新，下一个请求就拿到新的。
+ *     代价是此刻的 isolate 最多慢一个请求周期的可见性；换来的是请求永不等 KV。
+ *   - 无缓存        → 不得不 await（否则鉴权拿不到 api_key 会把全站打成 401）。
+ *     这一跳只在 isolate 冷启动时发生一次。
+ *
+ * 一致性由两处兜住：面板保存配置时 saveConfig 会清缓存（改的那个 isolate 立即可
+ * 见）；其余 isolate 最多滞后一个刷新周期。这对「改完配置立刻生效」完全够用。
+ */
+export async function getConfig(env: Env): Promise<Config> {
+  const nowTs = Date.now();
+  if (cache) {
+    if (nowTs - cache.ts < CONFIG_FRESH_MS) return cache.cfg;
+    if (nowTs - cache.ts < CONFIG_STALE_MS) {
+      // 后台刷新不去 await：这是本函数存在的全部意义——把 KV 往返从首字节路径上
+      // 移除。refreshing 去重，避免陈旧窗口内的 N 个并发请求打出 N 次 KV 读。
+      if (!refreshing) {
+        refreshing = loadConfig(env)
+          .then((cfg) => {
+            cache = { ts: Date.now(), cfg };
+          })
+          .catch(() => {
+            // 刷新失败就让它下次重试；旧值继续用，不因一次读失败而全站 500。
+          })
+          .finally(() => {
+            refreshing = null;
+          });
+      }
+      return cache.cfg;
+    }
+    // 超过 STALE：不敢再用，回落同步读。
+    return await refreshNow(env);
+  }
+  return await refreshNow(env);
+}
+
+/** refreshNow 同步读一次并落缓存（冷启动 / 数据过旧时的回落路径）。 */
+async function refreshNow(env: Env): Promise<Config> {
+  const cfg = await loadConfig(env);
   cache = { ts: Date.now(), cfg };
   return cfg;
 }

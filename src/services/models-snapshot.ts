@@ -15,11 +15,26 @@ import { cacheKV, kvGetJSON, CACHE_KEY_MODELS, CACHE_KEY_MODELS_GLOBAL } from ".
 // 主动 invalidate，只有被动等 KV TTL 过期的情况才最多滞后 60s。
 const SNAPSHOT_TTL_MS = 60_000;
 
-let snap: { ts: number; cn: any[]; gl: any[] } | null = null;
+/**
+ * snap 两域各自独立维护「取数时刻」。
+ *
+ * 原实现对 cn / global **两个 key 一并 Promise.all 读**：理由是一次请求后续两个域
+ * 都可能用到，合并读比分两次 miss 更省。但这个前提在实测中不成立——绝大多数部署
+ * 只服务一个域，另一域的 key 压根不存在。而 KV 确认「键不存在」的成本和命中一样
+ * 要付一次往返（真机 ~50ms）：合并读等于**每次 miss 都为用不到的那一域白付一次**。
+ * 改成按域惰性取数、各自独立过期，一次请求最多只读它真正要用的那一个 key。
+ */
+const snapStore: {
+  ts: { cn: number; gl: number };
+  data: { cn: any[]; gl: any[] };
+} = { ts: { cn: 0, gl: 0 }, data: { cn: [], gl: [] } };
 
 /** invalidateModelsSnapshot 目录刷新后调用，让新目录立刻可见。 */
 export function invalidateModelsSnapshot(): void {
-  snap = null;
+  snapStore.ts.cn = 0;
+  snapStore.ts.gl = 0;
+  snapStore.data.cn = [];
+  snapStore.data.gl = [];
 }
 
 /**
@@ -27,16 +42,15 @@ export function invalidateModelsSnapshot(): void {
  * 未就绪返回空数组——调用方按「目录不可用」处理，与既有语义一致。
  */
 export async function modelsSnapshot(env: Env, realm: Realm): Promise<any[]> {
-  if (snap && Date.now() - snap.ts < SNAPSHOT_TTL_MS) {
-    return realm === "global" ? snap.gl : snap.cn;
-  }
+  const key = realm === "global" ? "gl" : "cn";
+  const nowMs = Date.now();
+  if (snapStore.ts[key] && nowMs - snapStore.ts[key] < SNAPSHOT_TTL_MS) return snapStore.data[key];
   const kv = cacheKV(env);
-  // 两域一起读：一次请求通常只用一个域，但两域共享同一个 isolate，
-  // 合并成一次 Promise.all 比两次各自 miss 更省（miss 时才付这 2 次读）。
-  const [cn, gl] = await Promise.all([
-    kvGetJSON<any[]>(kv, CACHE_KEY_MODELS).catch(() => null),
-    kvGetJSON<any[]>(kv, CACHE_KEY_MODELS_GLOBAL).catch(() => null),
-  ]);
-  snap = { ts: Date.now(), cn: Array.isArray(cn) ? cn : [], gl: Array.isArray(gl) ? gl : [] };
-  return realm === "global" ? snap.gl : snap.cn;
+  // 只取当前 realm 的那一个 key：见 snapStore 的注释。
+  const raw = await kvGetJSON<any[]>(kv, realm === "global" ? CACHE_KEY_MODELS_GLOBAL : CACHE_KEY_MODELS).catch(
+    () => null,
+  );
+  snapStore.data[key] = Array.isArray(raw) ? raw : [];
+  snapStore.ts[key] = nowMs;
+  return snapStore.data[key];
 }

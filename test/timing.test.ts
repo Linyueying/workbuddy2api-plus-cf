@@ -6,6 +6,7 @@ import {
   timingHeaders,
   withTiming,
   headersWithTiming,
+  now,
   type Timeline,
 } from "../src/services/timing";
 import { Hono } from "hono";
@@ -28,15 +29,17 @@ afterEach(() => vi.unstubAllGlobals());
 describe("timing 纯函数", () => {
   it("markSince 记录毫秒，重复调用覆盖同名段", () => {
     const tl = newTimeline(0);
-    markSince(tl, "pick", Date.now() - 42);
+    markSince(tl, "pick", now() - 42);
     expect(tl.seg.pick).toBeGreaterThanOrEqual(42);
-    markSince(tl, "pick", Date.now());
-    expect(tl.seg.pick).toBe(0);
+    markSince(tl, "pick", now());
+    // 亚毫秒时钟下这里不会精确等于 0（两次 now() 之间过了几十微秒），
+    // 断言落到「已归零到亚毫秒量级」而非 Object.is(0)。
+    expect(tl.seg.pick).toBeLessThan(1);
   });
 
   it("时钟回拨不产生负值（负数会让下游解析器丢弃整条 Server-Timing）", () => {
     const tl = newTimeline(0);
-    markSince(tl, "auth", Date.now() + 5_000); // 未来时刻 → 差值为负
+    markSince(tl, "auth", now() + 5_000); // 未来时刻 → 差值为负
     expect(tl.seg.auth).toBe(0);
   });
 
@@ -52,7 +55,7 @@ describe("timing 纯函数", () => {
   });
 
   it("Server-Timing 符合 name;dur= 语法且带 total", () => {
-    const tl = newTimeline(Date.now() - 500);
+    const tl = newTimeline(now() - 500);
     tl.seg.pick = 30;
     tl.seg.upstream = 120;
     const h = timingHeaders(tl);
@@ -83,7 +86,7 @@ describe("timing 纯函数", () => {
   });
 
   it("withTiming 写进自建响应；headersWithTiming 合并进 headers 字面量", () => {
-    const tl = newTimeline(Date.now() - 10);
+    const tl = newTimeline(now() - 10);
     tl.seg.pick = 4;
     const res = withTiming(new Response("x", { status: 200 }), tl);
     expect(res.headers.get("Server-Timing")).toContain("pick;dur=4");
@@ -118,7 +121,7 @@ describe("proxyChat 计时头落地", () => {
   it("非流式成功：两个计时头都在，且含 cfg/prompt/models/pick/note/upstream 全段", async () => {
     vi.stubGlobal("fetch", mockOK());
     const env = fakeEnv(makeAuth("u1"));
-    const tl = newTimeline(Date.now());
+    const tl = newTimeline();
     const res = await proxyChat(
       env,
       reqOf(false),
@@ -157,7 +160,7 @@ describe("proxyChat 计时头落地", () => {
     );
     expect(res.status).toBe(200);
     // 不读 body 就能拿到 —— 这正是 TTFT 归因的前提
-    expect(res.headers.get("X-WB2A-Timing")).toMatch(/upstream=\d+ total=\d+$/);
+    expect(res.headers.get("X-WB2A-Timing")).toMatch(/upstream=[\d.]+ total=[\d.]+$/);
   });
 
   it("错误路径同样带计时（pick 慢导致的 503 画像与业务错误完全不同）", async () => {
@@ -173,7 +176,7 @@ describe("proxyChat 计时头落地", () => {
   });
 
   it("openAIError 带 tl 时输出计时头（错误信封与成功路径同源）", () => {
-    const tl = newTimeline(Date.now() - 12);
+    const tl = newTimeline(now() - 12);
     tl.seg.pick = 5;
     const r = openAIError(503, "no_healthy_account", "none", undefined, tl);
     expect(r.headers.get("X-WB2A-Timing")).toContain("pick=5");
@@ -292,20 +295,47 @@ describe("埋点守卫（静态）", () => {
 
   it("每一段的计时点位都在（删掉任何一处都会让该段永远不出现）", () => {
     expect(proxySrc).toContain('markSince(tl, "cfg"');
-    expect(proxySrc).toContain('markSince(tl, "prompt"');
-    expect(proxySrc).toContain('markSince(tl, "models"');
+    // prompt / models 是并行发起的两段（省下一次串行 KV 往返），故不落在 await 后，
+    // 而是在各自的 .then 里打点——断言也要跟着改成按段名判dan而不是按句式。
+    expect(proxySrc).toContain('tl.seg.prompt =');
+    expect(proxySrc).toContain('tl.seg.models =');
     expect(proxySrc).toContain('addElapsed(tl, "pick"');
-    expect(proxySrc).toContain('markSince(tl, "note"');
+    expect(proxySrc).toContain('tl.seg.note = 0');
     expect(proxySrc).toContain('markSince(tl, "upstream"');
   });
 
+  it("全链路只用 now()，不许混 Date.now()（两种时钟相减会让归因数据报废）", () => {
+    // performance.now() 是 isolate 相对毫秒、Date.now() 是 epoch，二者不可相减。
+    // 任何一个埋点写成 Date.now()，那一段就会变成天文数字或被归零。
+    for (const [name, src] of [["proxy", proxySrc], ["router", routerSrc], ["api", apiSrc]] as const) {
+      const bad = [...src.matchAll(/const t[A-Z]\w* = Date\.now\(\)/g)];
+      expect(bad.map((m) => m[0]), `${name} 出现 timing 混用`).toEqual([]);
+      const bad2 = [...src.matchAll(/Date\.now\(\) - t[A-Z]\w*/g)];
+      expect(bad2.map((m) => m[0]), `${name} 出现 timing 混用`).toEqual([]);
+    }
+    // 反过来：新的时间源必须真的被用起来
+    expect(apiSrc).toContain("const tBody = now()");
+    expect(routerSrc).toContain('c.set("wb2aT0", now())');
+    expect(proxySrc).toContain("const tPick = now()");
+  });
+
+  it("note 已挂 waitUntil，不再挡在首字节之前", () => {
+    expect(proxySrc).toContain('waitUntil(poolRPC(env, "/internal/note"');
+    // 旧的同步等待写法必须消失：只要还有一处 await note，TTFT 就还背着这一趟
+    expect(proxySrc).not.toContain('await poolRPC(env, "/internal/note", "POST", { uid, kinds');
+  });
+
+  it("prompt 与 models 并行（两次 KV 读不再首尾相接）", () => {
+    expect(proxySrc).toContain("Promise.all([policyP, existsP])");
+  });
+
   it("pick 计时放在 finally 里（异常重试也要计入，不能被 throw 跳过）", () => {
-    expect(proxySrc).toContain("} finally {\n      addElapsed(tl, \"pick\", Date.now() - tPick);\n    }");
+    expect(proxySrc).toContain("} finally {\n      addElapsed(tl, \"pick\", now() - tPick);\n    }");
   });
 
   it("t0 由最外层中间件打点，auth 段只在子密钥路径设置", () => {
-    expect(routerSrc).toContain('c.set("wb2aT0", Date.now())');
-    expect(routerSrc).toContain('c.set("wb2aAuthMs", Date.now() - authStart)');
+    expect(routerSrc).toContain('c.set("wb2aT0", now())');
+    expect(routerSrc).toContain('c.set("wb2aAuthMs", now() - authStart)');
     // 三个 /v1 入口都必须计时，漏一个就有一条链路是黑盒
     for (const route of ["/v1/chat/completions", "/v1/responses", "/v1/messages"]) {
       expect(apiSrc).toContain(`app.post("${route}"`);
@@ -321,10 +351,12 @@ describe("埋点守卫（静态）", () => {
 
 /** 类型自洽性：Timeline 是跨层契约，形状变了编译就该炸。 */
 describe("Timeline 契约", () => {
-  it("newTimeline 的缺省 t0 不晚于调用时刻", () => {
-    const before = Date.now();
+  it("newTimeline 的缺省 t0 合理，且与 biz 用同一支时钟", () => {
     const tl: Timeline = newTimeline();
-    expect(tl.t0).toBeGreaterThanOrEqual(before);
+    // t0 取自 performance.now()（isolate 相对毫秒），不是 epoch。
+    expect(tl.t0).toBeGreaterThanOrEqual(0);
+    expect(tl.t0).toBeLessThan(Date.now()); // epoch 大得多，能错到几十万倍
+    expect(tl.t0).toBeGreaterThan(now() - 1000);
     expect(tl.seg).toEqual({});
   });
 });

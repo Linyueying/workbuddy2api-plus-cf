@@ -1,13 +1,13 @@
 import { Hono } from "hono";
 import type { Env } from "../worker-configuration.d.ts";
 import { getConfig } from "./config";
-import { getKeyByHash } from "./storage/d1";
-import { PREFIX, parseJSONArray, timingSafeEqual, touchKey, verifyKey } from "./services/apikeys";
+import { PREFIX, parseJSONArray, timingSafeEqual, touchKey, verifyKey, loadKeyByHash } from "./services/apikeys";
 import { registerApi } from "./routes/api";
 import { registerPanel } from "./routes/panel";
 import { registerLogin } from "./routes/login";
 import { registerAdmin } from "./routes/admin";
 import type { CtxVars } from "./types";
+import { now } from "./services/timing";
 
 // 鉴权：Bearer api_key（管理员总钥匙，全权放行）或 wbk_ 子密钥（D1 内 key_hash，
 // 带停用/过期/双配额/IP/realm/模型白名单管控）。
@@ -42,7 +42,7 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   }
   const auth = c.req.header("Authorization") || "";
   // 鉴权计时起点（子密钥有 D1 读，是 TTFT 的关键分段之一）。
-  const authStart = Date.now();
+  const authStart = now();
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) return c.json({ error: { message: "unauthorized", type: "api_error", code: "unauthorized" } }, 401);
   const token = m[1];
@@ -75,10 +75,12 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   }
   if (token.startsWith(PREFIX)) {
     const hash = await sha256Hex(token);
-    const row = await getKeyByHash(c.env, hash).catch(() => null);
-    // 只有子密钥路径才打 auth 段：这里是全程唯一一趟 D1 读（十几到几十毫秒），
-    // 正是 TTFT 里最值得被看见的一块。管理员分支是内存比对，记它只会平添噪声。
-    c.set("wb2aAuthMs", Date.now() - authStart);
+    // 走带内存缓存的读：一次 /v1 调用只因鉴权就要跨洋查一趟 D1（实测 20~150ms 抖动），
+    // 而密钥行是天量级变更的数据。见 services/apikeys.ts 的缓存注释。
+    const row = await loadKeyByHash(c.env, hash).catch(() => null);
+    // 只有子密钥路径才打 auth 段：这里是热路径上唯一一趟会被感知到的 IO。
+    // 管理员分支是内存比对，记它只会平添噪声。
+    c.set("wb2aAuthMs", now() - authStart);
     if (!row) {
       return c.json({ error: { message: "invalid api key", type: "api_error", code: "invalid_api_key" } }, 401);
     }
@@ -125,7 +127,7 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
   app.use("*", async (c, next) => {
     // 计时起点：这是**最先注册**的中间件，它的入口时刻最贴近「请求到达 Workers」，
     // 晚于此处的任何打点都会漏掉鉴权 / 路由匹配的耗时。
-    c.set("wb2aT0", Date.now());
+    c.set("wb2aT0", now());
     await next();
     const h = c.res?.headers;
     if (!h) return;

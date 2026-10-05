@@ -7,7 +7,7 @@ import { modelsForApi } from "../services/resolveModel";
 import { responsesToChat, anthropicToChat } from "../services/compat";
 import { VirtualIDs } from "../services/autoroute";
 import { healthReport } from "../services/health";
-import { newTimeline, markSince } from "../services/timing";
+import { newTimeline, markSince, now } from "../services/timing";
 import type { CtxVars } from "../types";
 
 /**
@@ -18,7 +18,7 @@ import type { CtxVars } from "../types";
  * 只是 total 会偏小，不影响其余分段的准确性。
  */
 function timelineOf(c: any) {
-  const tl = newTimeline(Number(c.get("wb2aT0") ?? Date.now()));
+  const tl = newTimeline(Number(c.get("wb2aT0") ?? now()));
   const authMs = c.get("wb2aAuthMs");
   if (typeof authMs === "number") tl.seg.auth = authMs;
   return tl;
@@ -55,7 +55,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     const tl = timelineOf(c);
     // 读请求体单独计一段：它是从客户端 socket 里吸字节，长上下文（几十 KB 的
     // system + tools）时能到十几毫秒，且与上游毫无关系——纯本地开销，必须能被看见。
-    const tBody = Date.now();
+    const tBody = now();
     const body = await c.req.json().catch(() => ({}));
     markSince(tl, "body", tBody);
     const model = body.model || "cn:hy3";
@@ -69,7 +69,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
   // /v1/responses (OpenAI Responses API -> chat)
   app.post("/v1/responses", async (c) => {
     const tl = timelineOf(c);
-    const tBody = Date.now();
+    const tBody = now();
     const body = await c.req.json().catch(() => ({}));
     markSince(tl, "body", tBody);
     const chat = responsesToChat(body);
@@ -81,7 +81,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
   // /v1/messages (Anthropic Messages API -> chat)
   app.post("/v1/messages", async (c) => {
     const tl = timelineOf(c);
-    const tBody = Date.now();
+    const tBody = now();
     const body = await c.req.json().catch(() => ({}));
     markSince(tl, "body", tBody);
     const chat = anthropicToChat(body);

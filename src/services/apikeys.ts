@@ -1,6 +1,6 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import type { ApiKeyRow } from "../types";
-import { run, first } from "../storage/d1";
+import { run, first, getKeyByHash } from "../storage/d1";
 
 // 子密钥配额与管控（替代 internal/apikeys/apikeys.go 的 Verify / VerifyRequest /
 // Touch / Consume 四段）。
@@ -244,6 +244,83 @@ export async function consumeKey(env: Env, id: string, credit: number, tokens: n
   await run(env, "UPDATE apikeys SET used_credit = used_credit + ?, used_tokens = used_tokens + ? WHERE id = ?", [c, t, id]).catch(
     () => {},
   );
+}
+
+/**
+ * 子密钥查询的内存缓存。
+ *
+ * 存在理由（真机数据驱动）：每一次 /v1 调用都要为鉴权查一次 D1，实测 auth 段
+ * 在 123ms 与 247ms 之间反复横跳——同一把钥匙、同一个操作，能差出一倍。D1 库
+ * 是**单区域**的，而 Worker 跑在全球各 POP 上，这一跳要跨洋往返；叠加每个
+ * isolate 首次查询的冷连接，抖动完全不可控。而密钥行的变更频率是「天」量级的，
+ * 每请求付一次跨洋查询来换取理论上最新的一行数据，是纯粹的浪费。
+ *
+ * 为什么放在这里而不是 router 的调用现场：这里是密钥语义的归属地，把它和
+ * verifyKey / consumeKey 放一起，失效时机（改密钥就要失效）才不会被漏掉。
+ *
+ * 为什么**也缓存查不到的结果**：否则任何人拿一个不存在的 wbk_ 串反复打网关，
+ * 就是一条免费的 D1 放大通道（缓存 miss → 每次都落库）。负结果同样入 60s 缓存。
+ *
+ * 键取 sha256(token) 而非 token 本身：缓存里不出现任何可还原凭据的字节。
+ */
+/**
+ * KEY_CACHE_TTL_MS 缓存有效期 —— 这个值同时就是**配额判定的陈旧窗口**。
+ *
+ * 为什么不是越大越好：`verifyKey` 靠行里的 `used_tokens` / `used_credit` 判额度，
+ * 而 consumeKey 的累加是在别的 isolate 里写 D1 的。缓存一旦命中，本 isolate 看到
+ * 的就是一份旧计数——于是「配额已耗尽」这件事会晚 TTL 这么久才被拦住，表现为
+ * **超额放行**。存储代价换来的是抖动消失，但这个窗口本质上是「愿意多放行多少
+ * 额度」的经营决策，不是纯技术参数。所以这里刻意没有采纳「60~300s」：那会让
+ * 一把配额 1000 的钥匙在几分钟内超到什么程度完全不可控。
+ *
+ * 30s 的取舍：足够覆盖「同一轮对话的连续几请求」（这才是我们要消灭的抖动来源：
+ * 真人对话的轮间隔远短于它），又把超额窗口压在一次对话的量级内。
+ * 想进一步放宽之前，先确认你能接受那个窗口内的超额量。
+ *
+ * 管理面的显式改动（停用 / 改配额 / 删除）另有一条即时路径——invalidateKeyCache，
+ * 不走 TTL。见 routes/panel.ts 的调用点。
+ */
+const KEY_CACHE_TTL_MS = 30_000;
+/** KEY_CACHE_MAX 容量上限：防止恶意海量不同 key 把 isolate 内存吃穿。 */
+const KEY_CACHE_MAX = 1024;
+/** cache: hash → { ts, row }。row 为 null 即「查无此钥」的负结果。 */
+let keyCache: Map<string, { ts: number; row: ApiKeyRow | null }> = new Map();
+
+/**
+ * loadKeyByHash 带缓存地读子密钥（热路径：/v1 鉴权）。
+ *
+ * 与直接调 getKeyByHash 的唯一差别就是这层缓存；其余语义（查无此钥返回 null）
+ * 完全一致。管理面读写路径**不要**用它——改完立刻要看到的必须是真实现场。
+ */
+export async function loadKeyByHash(env: Env, keyHash: string): Promise<ApiKeyRow | null> {
+  const hit = keyCache.get(keyHash);
+  if (hit && Date.now() - hit.ts < KEY_CACHE_TTL_MS) return hit.row;
+  // 查失败**不入缓存**：把一次 D1 抖动固化成 60s 的「密钥不存在」会把正常流量
+  // 误伤成 401。宁可下次再查一次，也不要让网络抖动变成权限判决。
+  let row: ApiKeyRow | null;
+  try {
+    row = await getKeyByHash(env, keyHash);
+  } catch {
+    return null;
+  }
+  if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear(); // 满了整体清，简单可预测
+  keyCache.set(keyHash, { ts: Date.now(), row });
+  return row;
+}
+
+/**
+ * invalidateKeyCache 失效一条（或全部）子密钥缓存。
+ *
+ * 管理面每次改动密钥都必须调它，否则「停用/改配额/删除」会被内存里的旧行挡住，
+ * 最长 60s 不生效——面板点了停用、请求却还在放行，这是安全口径，不能只靠 TTL。
+ * 不传 hash 表示全清（批量操作 / 测试用）。
+ */
+export function invalidateKeyCache(hash?: string): void {
+  if (!hash) {
+    keyCache.clear();
+    return;
+  }
+  keyCache.delete(hash);
 }
 
 /** keyById 取子密钥（管理面用）。 */
