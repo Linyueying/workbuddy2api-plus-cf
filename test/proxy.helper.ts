@@ -19,13 +19,26 @@ export function makeAuth(uid: string): Auth {
   };
 }
 
-export function fakeEnv(auth: Auth) {
+export function fakeEnv(auth: Auth, opts: { pickAcquired?: boolean } = {}) {
   let releaseCount = 0;
+  // 记录每次 DO 调用的路径与载荷：跨 Worker RPC 合并是靠"少发几次"来兑现的，
+  // 光看返回值看不出来。
+  const calls: Array<{ path: string; body: any }> = [];
   const poolStub = {
     async fetch(req: Request) {
       const url = new URL(req.url);
       const p = url.pathname;
-      if (p === "/internal/pick") return new Response(JSON.stringify({ uid: auth.uid, auth }), { status: 200, headers: { "content-type": "application/json" } });
+      const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+      calls.push({ path: p, body });
+      if (p === "/internal/pick") {
+        // 默认模拟"已升级的 engine"：pick 自带 acquired。传 pickAcquired:false
+        // 可模拟旧版 engine（响应里没有该字段）→ 调用方必须补发显式 acquire。
+        const acquired = opts.pickAcquired !== false;
+        return new Response(JSON.stringify({ uid: auth.uid, auth, ...(acquired ? { acquired: true } : {}) }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
       if (p === "/internal/release") releaseCount++;
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
     },
@@ -61,7 +74,10 @@ export function fakeEnv(auth: Auth) {
     WB2A_DB: fakeDB,
     WB2A_LOGS: {},
     writes: sqlWrites,
+    calls,
     releaseCount: () => releaseCount,
+    countOf: (path: string) => calls.filter((c) => c.path === path).length,
+    callsOf: (path: string) => calls.filter((c) => c.path === path),
   } as any;
   return env;
 }

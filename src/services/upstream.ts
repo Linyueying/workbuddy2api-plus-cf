@@ -12,7 +12,7 @@ import {
   parseV3Config,
   type CatalogEntry,
 } from "./catalog";
-import { cacheKV, kvGetJSON, CACHE_KEY_MODELS, CACHE_KEY_MODELS_GLOBAL } from "../storage/kv";
+import { modelsSnapshot } from "./models-snapshot";
 
 // 上游 HTTP 封装（替代 internal/upstream/client.go）。全部走 fetch。
 // realm 感知的 base：cn = copilot.tencent.com / codebuddy.cn；global = workbuddy.ai。
@@ -126,9 +126,9 @@ export function needsRefresh(auth: Auth, withinMs = 10 * 60_000): boolean {
  * 反向 import 会成环。effort 表与模型目录同源同 TTL，读同一份缓存即可。
  */
 async function effortTables(env: Env, realm: Realm): Promise<EffortTables> {
-  const kv = cacheKV(env);
-  const key = realm === "global" ? CACHE_KEY_MODELS_GLOBAL : CACHE_KEY_MODELS;
-  const cached = await kvGetJSON<any[]>(kv, key).catch(() => null);
+  // 走进程内快照：与 resolveModel.realModelExists 读的是同一个 key，
+  // 每请求重复付两次 KV 读。见 services/models-snapshot.ts。
+  const cached = await modelsSnapshot(env, realm);
   const efforts: Record<string, string[]> = {};
   const defaults: Record<string, string> = {};
   for (const m of cached ?? []) {

@@ -33,6 +33,8 @@ export function extractRates(models: any[]): Record<string, string> {
 /** 目录刷新后更新倍率快照（listModels 命中上游时调用）。 */
 export async function storeModelRates(env: Env, realm: Realm, models: any[]): Promise<void> {
   await kvPutJSON(cacheKV(env), realm === "global" ? KEY_GLOBAL : KEY_CN, extractRates(models), TTL).catch(() => {});
+  // 新倍率立刻可见：否则刚刷完目录，选号仍按旧快照判「该模型是否收费」。
+  invalidateRateLookup();
 }
 
 /** 读某域倍率快照（无快照返回空表，不触发上游请求）。 */
@@ -43,9 +45,27 @@ export async function loadModelRates(env: Env, realm: Realm): Promise<Record<str
 
 /**
  * RateLookup 返回 pool-core 需要的 `modelRateOf(realm, model) => string` 查表。
- * 两域合并读一次（KV 极快，未命中返回空串 = 未知 → 保守放行）。
+ *
+ * 结果做进程内 60s 缓存：本函数被 PoolDO 的**每次 pick** 调用（选号在每条对话请求
+ * 的关键路径上），而一次调用是两次 KV 读（cn + global）。倍率快照本身 TTL 10 分钟
+ * 且只在目录刷新时变，跟着 pick 频率重复读没有意义——KV 免费额度 10 万次读/天，
+ * 光这一条每请求就吃掉 2 次。
  */
+const LOOKUP_TTL_MS = 60_000;
+let lookupCache: { ts: number; cn: Record<string, string>; gl: Record<string, string> } | null = null;
+
+/** invalidateRateLookup 目录刷新后调用（倍率与目录同源，目录变了倍率随之变）。 */
+export function invalidateRateLookup(): void {
+  lookupCache = null;
+}
+
 export async function rateLookup(env: Env): Promise<(realm: string, model: string) => string> {
+  if (lookupCache && Date.now() - lookupCache.ts < LOOKUP_TTL_MS) {
+    const { cn, gl } = lookupCache;
+    return (realm: string, model: string) => (realm === "global" ? gl[model] : cn[model]) ?? "";
+  }
+  // 两域合并读一次（KV 极快，未命中返回空串 = 未知 → 保守放行）。
   const [cn, gl] = await Promise.all([loadModelRates(env, "cn"), loadModelRates(env, "global")]);
+  lookupCache = { ts: Date.now(), cn, gl };
   return (realm: string, model: string) => (realm === "global" ? gl[model] : cn[model]) ?? "";
 }

@@ -37,15 +37,18 @@ describe("Workers 生命周期：响应返回后的写入必须挂 waitUntil", (
     }
   });
 
-  it("流式收尾（日志 / 记账 / 扣配额 / release）逐个挂了 waitUntil", () => {
+  it("流式收尾（日志 / 扣配额 / 带成本的 release）逐个挂了 waitUntil", () => {
     for (const call of [
       "waitUntil(\n            log(",
-      "waitUntil(recordCost(",
       "waitUntil(consumeKey(",
       'waitUntil(poolRPC(env, "/internal/release"',
     ]) {
       expect(proxySrc, `缺少 ${call}`).toContain(call);
     }
+    // 成本台账必须搭 release 的车一起发（合并跨 Worker 往返），不能退回单独的
+    // model-cost RPC —— 那会多一次跨 Worker HTTP 往返。
+    expect(proxySrc).toContain("release(costOf(");
+    expect(proxySrc).not.toContain("waitUntil(recordCost(");
   });
 
   // 单写守卫：占位 INSERT + 末帧 UPDATE 的老形态必须回不来。它有两个代价——
@@ -109,9 +112,9 @@ describe("waitUntil 接线 smoke", () => {
     await res.text();
     await Promise.allSettled(captured);
 
-    // 三个收尾点各挂一次：log + recordCost + release（未传 keyRow，无 consumeKey）。
+    // 收尾点逐个挂出：log + release（成本台账已并入 release；未传 keyRow，无 consumeKey）。
     // 漏挂任何一个都会在这里露出来——它就根本不会经过 waitUntil。
-    expect(captured.length).toBeGreaterThanOrEqual(3);
+    expect(captured.length).toBeGreaterThanOrEqual(2);
 
     // 单写：用量随唯一那条 INSERT 落清，不再有 UPDATE 回填。
     const inserts = env.writes.filter((w) => w.sql.includes("INSERT INTO request_logs"));

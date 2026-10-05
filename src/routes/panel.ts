@@ -85,6 +85,30 @@ const ACCT_USAGE_TTL_MS = 60_000;
 const ACCT_USAGE_HOURS = 24; // 与用量页缺省窗口一致
 let acctUsageCache: { at: number; byUid: Map<string, AccountUsageAgg> } | null = null;
 
+/**
+ * 用量页结果的进程内缓存。
+ *
+ * 为什么必须有：/panel/api/usage 是本项目**最贵的一笔账**。`queryUsageWindow`
+ * 扫 [from,to] 窗口内的全部日志行（上限 5 万），而 D1 免费额度按**扫描行数**计
+ * （500 万行/天）——不是返回行数。前端 60s 轮询一次，一天 1440 次刷新 × 窗口行数；
+ * 保留 7 天、日均 1 万请求时就是 1440 万行/天，额度三天见底，而且症状是"某天开始
+ * 用量页集体 500"，很难联想到是刷新太勤。
+ *
+ * 为什么 TTL 是 5 分钟而不是 60s：缓存 TTL 必须与轮询间隔**错开**才有意义。
+ * TTL 60s 配 60s 轮询等于每次都 miss（边界抖动下几乎必然 miss），缓存白加。
+ * 5 分钟 → 每 5 次刷新才扫一次 D1，扫描量降到 1/5。
+ *
+ * 缓存键按分钟取整：前端默认传滚动窗口（from/to 由 Date.now() 现算），
+ * 每次刷新的毫秒值都不同，不取整的话键永不命中。
+ */
+const USAGE_TTL_MS = 300_000;
+let usageCache: { key: string; at: number; body: unknown } | null = null;
+
+/** resetUsageCache 仅供测试：用量页缓存是模块级状态，跨用例会互相污染。 */
+export function resetUsageCache(): void {
+  usageCache = null;
+}
+
 async function accountUsageByUid(env: Env, hours = ACCT_USAGE_HOURS): Promise<Map<string, AccountUsageAgg>> {
   if (acctUsageCache && Date.now() - acctUsageCache.at < ACCT_USAGE_TTL_MS) return acctUsageCache.byUid;
   const to = Date.now();
@@ -491,6 +515,12 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const toMs = q.to ? Number(q.to) * 1000 : to;
     const fromMs = q.from ? Number(q.from) * 1000 : toMs - hours * 3600_000;
 
+    // 命中缓存直接回：连 /internal/list 这次 DO 调用也一并省掉。
+    const ckey = `${Math.floor(fromMs / 60_000)}|${Math.floor(toMs / 60_000)}`;
+    if (usageCache && usageCache.key === ckey && Date.now() - usageCache.at < USAGE_TTL_MS) {
+      return c.json(usageCache.body);
+    }
+
     // 昵称是明细表的润色项，拿不到就降级显示 uid —— 不能因为它失败就整页空。
     const accounts = ((await poolRPC(c.env, "/internal/list").catch(() => [])) as any[]) ?? [];
     const nicknames: Record<string, string> = {};
@@ -504,7 +534,10 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     // 用途单一——当 token 全 0 时，用户能一眼看到「库里到底存了什么」，
     // 区分「上游没回 usage」与「回了解析/写库失败」，不必再靠猜。
     const rawLatest = await queryRequestLogs(c.env, { limit: 5, from: fromMs, to: toMs }).catch(() => []);
-    return c.json({ ok: true, ...snap, raw_latest: rawLatest });
+    const body = { ok: true, ...snap, raw_latest: rawLatest };
+    // 只缓存成功结果：失败形态（snap 为 null）不该被缓存成 5 分钟的"空页面"。
+    usageCache = { key: ckey, at: Date.now(), body };
+    return c.json(body);
   });
   app.post("/panel/api/usage/save", async (c) => {
     return c.json({ ok: true });

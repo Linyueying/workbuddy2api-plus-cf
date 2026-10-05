@@ -273,6 +273,53 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     expect(env.writes.filter((w) => w.sql.includes("UPDATE request_logs"))).toHaveLength(0);
   });
 
+  // 跨 Worker RPC 合并：PoolDO 部署在独立 Worker 上，每次 poolRPC 都是一次完整
+  // HTTP 往返。能把"永远成对出现"的调用并成一次，是请求延迟里最实在的一块。
+  it("pick 自带 acquire 时不再单独发 /internal/acquire（关键路径少一次跨 Worker 往返）", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.countOf("/internal/pick")).toBe(1);
+    expect(env.callsOf("/internal/pick")[0].body.acquire).toBe(1);
+    expect(env.countOf("/internal/acquire")).toBe(0);
+  });
+
+  it("旧版 engine（pick 不带 acquired）→ 补发显式 acquire，并发闸门不能静默失效", async () => {
+    const env = fakeEnv(makeAuth("u1"), { pickAcquired: false });
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        return new Response(STREAM_WITH_USAGE, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.countOf("/internal/acquire")).toBe(1);
+  });
+
+  it("成功路径的两次 note 合并成一次 RPC（kinds 批量）", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    const notes = env.callsOf("/internal/note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body.kinds).toEqual(["model_block_clear", "success"]);
+  });
+
+  it("流式收尾：成本台账搭 release 的车一起发，不单独发 model-cost", async () => {
+    const env = envFor();
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.countOf("/internal/model-cost")).toBe(0);
+    const rel = env.callsOf("/internal/release");
+    expect(rel).toHaveLength(1);
+    expect(rel[0].body.cost).toEqual({ model: "hy3", credit: 1.5, tokens: 150 });
+  });
+
   it("流式请求结束后必须 release（回归：此前只 acquire 从不 release → inFlight 泄漏 → 全账号占满 → no_healthy_account）", async () => {
     const env = envFor();
     const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");

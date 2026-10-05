@@ -5,6 +5,7 @@ import { poolRPC } from "../durable/account-pool";
 import { storeModelRates } from "./rates";
 import { effortListing } from "./efforts";
 import { cacheKV, kvDelete, kvGetJSON, kvPutJSON, CACHE_KEY_MODELS, CACHE_KEY_MODELS_GLOBAL } from "../storage/kv";
+import { invalidateModelsSnapshot, modelsSnapshot } from "./models-snapshot";
 import { realmPrefix } from "./catalog";
 
 // 模型目录解析（替代 internal/upstream/models.go + server/resolve_model.go）。
@@ -119,6 +120,9 @@ export async function listModels(env: Env, realm: Realm, auth?: any): Promise<an
   }
   const ids = decorateModels(realm, raw).map((m: any) => ({ ...m, id: realmPrefix(realm, m.id ?? m.name) }));
   await kvPutJSON(kv, key, ids, MODELS_TTL);
+  // 进程内快照同步失效：realModelExists / effortTables 立刻看到新目录，
+  // 不用等 60s 的快照 TTL。
+  invalidateModelsSnapshot();
   // 探测成功 → 清负缓存标记。
   await kvDelete(kv, failKey(realm)).catch(() => {});
   // 倍率快照按裸模型名存（pool 侧按 (realm, 裸名) 查）。
@@ -134,8 +138,9 @@ export async function listModels(env: Env, realm: Realm, auth?: any): Promise<an
 export async function realModelExists(env: Env, name: string): Promise<boolean> {
   const { realm, model } = stripRealm(name);
   if (!model) return false;
-  const key = realm === "global" ? CACHE_KEY_MODELS_GLOBAL : CACHE_KEY_MODELS;
-  const cached = await kvGetJSON<any[]>(cacheKV(env), key).catch(() => null);
+  // 走进程内快照：本函数每请求都被 proxy 调用一次，而这个 key 同请求里
+  // upstream.effortTables 还要再读一遍。见 services/models-snapshot.ts。
+  const cached = await modelsSnapshot(env, realm);
   if (!cached?.length) return false;
   return cached.some((m: any) => m?.id === (realm === "global" ? "global:" : "cn:") + model);
 }

@@ -203,7 +203,9 @@ export async function proxyChat(
     let pickErr: string | undefined;
     let pickStatus: number | undefined;
     try {
-      pick = await poolRPC(env, "/internal/pick", "POST", { realm, model: bareModel, exclude: tried, stickyKey: sticky });
+      // acquire 随 pick 一起做：PoolDO 在独立 Worker 上，这两步原本是两次跨 Worker
+      // HTTP 往返，而它们永远成对出现（选到号就一定要占位）。合并后关键路径少一次。
+      pick = await poolRPC(env, "/internal/pick", "POST", { realm, model: bareModel, exclude: tried, stickyKey: sticky, acquire: 1 });
     } catch (e: any) {
       pickErr = String(e?.message ?? e);
       pickStatus = e?.poolStatus;
@@ -248,7 +250,10 @@ export async function proxyChat(
     const uid: string = pick.uid;
     tried.push(uid);
     let auth = pick.auth;
-    await poolRPC(env, "/internal/acquire", "POST", { uid }).catch(() => {});
+    // 兼容性兜底：engine Worker 还没升级（不含 acquire 合并）时，pick 响应里不会有
+    // acquired:true —— 补发一次显式 acquire。否则在途计数永远不增，
+    // max_in_flight 并发闸门会静默失效，但不报错，属于最难查的那类退化。
+    if (pick.acquired !== true) await poolRPC(env, "/internal/acquire", "POST", { uid }).catch(() => {});
 
     try {
       if (needsRefresh(auth)) {
@@ -290,8 +295,9 @@ export async function proxyChat(
       }
 
       // 成功：清该 (账号,模型) 的 11102 负缓存 + 记成功。
-      await poolRPC(env, "/internal/note", "POST", { uid, kind: "model_block_clear", model: bareModel }).catch(() => {});
-      await poolRPC(env, "/internal/note", "POST", { uid, kind: "success" }).catch(() => {});
+      // 两个事件一次 RPC 施加（kinds 批量），省一次跨 Worker 往返。
+      // 副作用与分两次发完全一致：applyNote 按 kinds 顺序逐个施加，最后统一落盘。
+      await poolRPC(env, "/internal/note", "POST", { uid, kinds: ["model_block_clear", "success"], model: bareModel }).catch(() => {});
 
       const routed = chain[ci] !== rawModel;
 
@@ -322,10 +328,11 @@ export async function proxyChat(
         // 用着用着全空」的根因）。正常结束走 onEnd；客户端中途断连时 streamChat 的
         // tap.flush 不触发，改由 request.signal 兜底。released 标志避免双重回收。
         let released = false;
-        const release = () => {
+        /** cost 一并带上，把「记成本台账 + 释放在途」合并成一次 RPC。 */
+        const release = (cost?: CostPayload) => {
           if (released) return;
           released = true;
-          waitUntil(poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {}));
+          waitUntil(poolRPC(env, "/internal/release", "POST", { uid, ...(cost ? { cost } : {}) }).catch(() => {}));
         };
         // 诊断：把上游真实返回的 usage 原文暂存，随日志一起写进 msg，
         // 便于面板日志页直接看到「上游到底回了什么 usage」（token 恒 0 时最关键）。
@@ -334,12 +341,11 @@ export async function proxyChat(
             rawUsage = raw;
           },
           onEnd: (usage) => {
-            waitUntil(recordCost(env, uid, bareModel, usage));
             // 上游若整条流都没给 usage，rawUsage 为空——写明确标记，便于区分
             // 「上游没回 usage」与「解析器认不出字段」这两种完全不同的原因。
             close(usage, usage ? undefined : "上游流内无 usage 帧");
             if (keyRow) waitUntil(consumeKey(env, keyRow.id, Number(usage?.credit ?? 0), Number(usage?.total_tokens ?? 0)));
-            release();
+            release(costOf(usage, bareModel));
           },
         });
         request.signal.addEventListener("abort", () => {
@@ -362,9 +368,9 @@ export async function proxyChat(
       // 空回复降级（auto_model.on_empty，默认开）：响应尚未写回，可直接换候选重试。
       if (autoCfg.on_empty && isEmptyCompletion(payload)) {
         // 空回复也是一次真实消耗：先记账再降级，否则换模型重试等于白嫖一次上游消耗。
-        await recordCost(env, uid, bareModel, payload?.usage);
         if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
-        await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
+        // 记账随 release 一起发（cost 字段），少一次跨 Worker 往返。
+        await poolRPC(env, "/internal/release", "POST", { uid, ...costArg(payload?.usage, bareModel) }).catch(() => {});
         if (advance()) {
           tried.push(uid); // 换模型后换一个号重试（同号第二次请求明显更慢且更易失败）
           continue;
@@ -374,9 +380,8 @@ export async function proxyChat(
         return openAIError(502, "empty_completion", "upstream returned empty completion");
       }
 
-      await recordCost(env, uid, bareModel, payload?.usage);
       if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
-      await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
+      await poolRPC(env, "/internal/release", "POST", { uid, ...costArg(payload?.usage, bareModel) }).catch(() => {});
       // 非流式此时才知道用量，日志在这里一次写清——不 await，别把响应拖到 D1 之后；
       // 但必须 waitUntil，否则响应一返回 Worker 就可能回收、这行日志永远落不了地。
       waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage));
@@ -425,12 +430,29 @@ async function note(env: Env, uid: string, c: Classified, model: string, bodyTex
   await poolRPC(env, "/internal/note", "POST", base).catch(() => {});
 }
 
-/** recordCost 成本台账：按 usage.credit / total_tokens 记实测单价。 */
-async function recordCost(env: Env, uid: string, model: string, usage: any): Promise<void> {
-  const total = Number(usage?.total_tokens ?? 0);
-  if (!(total > 0)) return;
-  const credit = Number(usage?.credit ?? 0);
-  await poolRPC(env, "/internal/model-cost", "POST", { uid, model, credit, tokens: Math.floor(total) }).catch(() => {});
+/**
+ * costOf 把上游 usage 收敛成 /internal/release 的 cost 载荷（无用量返回 undefined）。
+ *
+ * 存在理由：记成本台账与释放在途原本是两次 poolRPC（model-cost + release），
+ * 而 PoolDO 在独立 Worker 上——每一次都是跨 Worker HTTP 往返。两者永远前后脚
+ * 发生在同一次收尾里，合并成一次即可。
+ */
+interface CostPayload {
+  model: string;
+  credit: number;
+  tokens: number;
+}
+
+function costOf(usage: Usage | null | undefined, model: string): CostPayload | undefined {
+  const total = Number((usage as any)?.total_tokens ?? 0);
+  if (!(total > 0)) return undefined;
+  return { model, credit: Number((usage as any)?.credit ?? 0), tokens: Math.floor(total) };
+}
+
+/** costArg 同上，用于非流式：无用量时给空对象（展开后不带 cost 字段）。 */
+function costArg(usage: any, model: string): { cost: CostPayload } | Record<string, never> {
+  const c = costOf(usage, model);
+  return c ? { cost: c } : {};
 }
 
 /** parseRateReset 从 429 body 解析上游重置墙钟（epoch ms，UTC+8 解释）。 */

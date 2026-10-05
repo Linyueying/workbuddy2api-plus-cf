@@ -24,11 +24,14 @@ import { resolveSticky, bindSticky, countSticky } from "./session";
 // 纯逻辑在 pool-core.ts（本文件只做 IO 与状态写回），便于单测。
 //
 // RPC 协议（由 _worker.js 通过 env.POOL.get(id).fetch(subrequest) 调用）：
-//   POST /internal/pick        { realm, model?, exclude?: string[], stickyKey? }
+//   POST /internal/pick        { realm, model?, exclude?: string[], stickyKey?, acquire? }
 //   POST /internal/acquire     { uid }
-//   POST /internal/release     { uid }
-//   POST /internal/note        { uid, kind, model?, resetAt?, reason? }
+//   POST /internal/release     { uid, cost?: { model, credit, tokens } }
+//   POST /internal/note        { uid, kind | kinds: string[], model?, resetAt?, reason? }
 //   POST /internal/model-cost  { uid, model, credit, tokens }
+//
+// 带 acquire / kinds / cost 三个可选字段是为了压跨 Worker 往返次数：PoolDO 部署在
+// 独立 Worker 上，每次 RPC 都是一次完整 HTTP 往返。见各处字段的注释。
 //   POST /internal/credits     { uid, credits, creditsTotal, expiring?, earliestExpiry?, earliestRemaining? }
 //   POST /internal/add         { auth }
 //   POST /internal/remove      { uid }
@@ -341,6 +344,22 @@ export class PoolDO {
         const exclude: string[] = body.exclude ?? [];
         const stickyKeyName = body.stickyKey as string | undefined;
         const pcfg = await this.pickCfg(cfg);
+        // acquire=1：选号成功即在本次调用内占位，省掉调用方紧接着的第二次
+        // /internal/acquire 往返。PoolDO 是**独立 Worker**（Pages 不能自带 DO），
+        // 每一次 poolRPC 都是一次跨 Worker HTTP 往返——这是请求延迟里最大的一块
+        // 可压缩项，能合并的往返必须合并。
+        // 响应带 acquired:true 让调用方确认已占位；不带就说明 engine 还是旧版，
+        // 调用方补发一次显式 acquire（部署有先后时的兼容兜底）。
+        const wantAcquire = body.acquire === true || body.acquire === 1 || body.acquire === "1";
+        const acquireIn = async (uid: string): Promise<boolean> => {
+          if (!wantAcquire) return false;
+          const a = await this.getAcct(uid);
+          if (!a) return false;
+          a.inFlight++;
+          a.acquiredAt = now;
+          await this.putAcct(a);
+          return true;
+        };
 
         // 会话粘性：命中则优先复用同号（仍要过该模型健康 + 在途未满校验，
         // 与 Go PickByUIDForModel 同口径；不可用则解绑回落普通轮换）。
@@ -360,7 +379,8 @@ export class PoolDO {
               a2.usedSeq = ((await this.ctx.storage.get<number>(PICK_SEQ_KEY)) ?? 0) + 1;
               await this.ctx.storage.put(PICK_SEQ_KEY, a2.usedSeq);
               await this.putAcct(a2);
-              return json({ uid: a2.uid, auth: a2.auth, sticky: true });
+              const got = await acquireIn(a2.uid);
+              return json({ uid: a2.uid, auth: a2.auth, sticky: true, acquired: got });
             }
           }
         }
@@ -382,6 +402,7 @@ export class PoolDO {
             );
           }
           if (stickyKeyName) await bindSticky(this.ctx, stickyKeyName, relaxed.uid, cfg.session_sticky.ttl);
+          const gotRelaxed = await acquireIn(relaxed.uid);
           const ra = await this.getAcct(relaxed.uid);
           return json({
             uid: relaxed.uid,
@@ -389,9 +410,11 @@ export class PoolDO {
             explored: relaxed.explored,
             fallback: true,
             fallback_kind: "realm_relaxed",
+            acquired: gotRelaxed,
           });
         }
         if (stickyKeyName) await bindSticky(this.ctx, stickyKeyName, chosen.uid, cfg.session_sticky.ttl);
+        const got = await acquireIn(chosen.uid);
         const a = await this.getAcct(chosen.uid);
         return json({
           uid: chosen.uid,
@@ -399,6 +422,7 @@ export class PoolDO {
           explored: chosen.explored,
           fallback: chosen.fallback,
           fallback_kind: chosen.fallbackKind,
+          acquired: got,
         });
       }
 
@@ -414,6 +438,13 @@ export class PoolDO {
       if (p === "/internal/release") {
         const a = await this.getAcct(body.uid);
         if (!a) return notFound();
+        // cost: {model, credit, tokens} —— 流末「记成本台账 + 释放在途」合成一次
+        // RPC。二者本来就前后脚发生在同一个 onEnd 里，拆成两次要多付一次跨 Worker
+        // 往返和一个 DO 请求额度。tokens<=0 不记（无法折算单价，与 model-cost 同口径）。
+        const cost = body.cost as { model?: string; credit?: number; tokens?: number } | undefined;
+        if (cost && String(cost.model ?? "") && Number(cost.tokens ?? 0) > 0) {
+          this.noteModelCost(a, String(cost.model), Number(cost.credit ?? 0), Math.floor(Number(cost.tokens)), now);
+        }
         a.inFlight = Math.max(0, a.inFlight - 1);
         if (a.inFlight === 0) a.acquiredAt = 0;
         await this.putAcct(a);
@@ -423,10 +454,17 @@ export class PoolDO {
       if (p === "/internal/note") {
         const a = await this.getAcct(body.uid);
         if (!a) return notFound();
-        this.applyNote(a, body.kind, body.model, now, cfg, {
+        // kinds: string[] —— 一次 RPC 施加多个事件（如成功路径的
+        // model_block_clear + success）。跨 Worker 往返是延迟主项，能并就并。
+        // 单发形态 kind: string 保留兼容。
+        const kinds: string[] =
+          Array.isArray(body.kinds) && body.kinds.length ? body.kinds.map((k: unknown) => String(k)) : [String(body.kind ?? "")];
+        const opt = {
           resetAt: Number(body.resetAt ?? 0) || 0,
           reason: typeof body.reason === "string" ? body.reason : "",
-        });
+        };
+        for (const kind of kinds) this.applyNote(a, kind, body.model, now, cfg, opt);
+        // 只写一次 Storage：N 个 kind 一次落盘，而不是 N 次。
         await this.putAcct(a);
         return json({
           ok: true,

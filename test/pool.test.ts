@@ -364,6 +364,56 @@ describe("账号池 P1 状态机", () => {
     expect((await rpc(pool, "/internal/pick", "POST", { realm: "cn" })).status).toBe(503);
   });
 
+  // ── 跨 Worker RPC 合并 ────────────────────────────────────────────────
+  // PoolDO 跑在独立 Worker 上，每次 RPC = 一次完整 HTTP 往返。这三个字段把
+  // "永远成对出现"的调用并进同一次往返：pick+acquire、双 note、cost+release。
+  it("pick 带 acquire：选号成功即在同一次调用内占位（inFlight+1）", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
+    const p = await rpc(pool, "/internal/pick", "POST", { realm: "cn", acquire: 1 });
+    expect(p.json.uid).toBe("u1");
+    expect(p.json.acquired).toBe(true);
+    expect((await rpc(pool, "/internal/list")).json[0].inFlight).toBe(1);
+    // 不带 acquire 时不占位（保持旧语义，兼容未升级的调用方）。
+    const pool2 = newPool();
+    await rpc(pool2, "/internal/add", "POST", { auth: auth("u1") });
+    const p2 = await rpc(pool2, "/internal/pick", "POST", { realm: "cn" });
+    expect(p2.json.acquired).toBe(false);
+    expect((await rpc(pool2, "/internal/list")).json[0].inFlight).toBe(0);
+  });
+
+  it("note kinds 批量：一次 RPC 施加多个事件，且只落一次盘", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
+    await rpc(pool, "/internal/note", "POST", { uid: "u1", kind: "model_blocked", model: "hy3" });
+    const r = await rpc(pool, "/internal/note", "POST", { uid: "u1", kinds: ["model_block_clear", "success"] , model: "hy3" });
+    expect(r.json.ok).toBe(true);
+    // 负缓存已清 → 该模型恢复可选；success 也记到了（errTotal 不因成功增长）。
+    expect((await rpc(pool, "/internal/pick", "POST", { realm: "cn", model: "hy3" })).json.uid).toBe("u1");
+    // 单发形态仍然可用（兼容）。
+    const r2 = await rpc(pool, "/internal/note", "POST", { uid: "u1", kind: "success" });
+    expect(r2.json.ok).toBe(true);
+  });
+
+  it("release 带 cost：成本台账与释放在途一次做完", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
+    await rpc(pool, "/internal/credits", "POST", { uid: "u1", credits: 1000, creditsTotal: 1000 });
+    await rpc(pool, "/internal/pick", "POST", { realm: "cn", acquire: 1 });
+    const r = await rpc(pool, "/internal/release", "POST", { uid: "u1", cost: { model: "hy3", credit: 10, tokens: 1000 } });
+    expect(r.json.ok).toBe(true);
+    expect(r.json.inFlight).toBe(0);
+    const a = (await rpc(pool, "/internal/list")).json[0];
+    expect(a.inFlight).toBe(0);
+    // 台账已记（10 credit / 1000 token = 10/1k），余额内插扣减 1000-10=990。
+    expect(a.modelCost.hy3.costPer1k).toBeCloseTo(10, 5);
+    expect(a.credits).toBe(990);
+    // tokens<=0 不记台账（无法折算单价），但释放照常。
+    const r2 = await rpc(pool, "/internal/release", "POST", { uid: "u1", cost: { model: "hy4", credit: 5, tokens: 0 } });
+    expect(r2.json.ok).toBe(true);
+    expect((await rpc(pool, "/internal/list")).json[0].modelCost.hy4).toBeUndefined();
+  });
+
   it("list 暴露模型级冷却与成本台账（运维可观测性）", async () => {
     const pool = newPool();
     await rpc(pool, "/internal/add", "POST", { auth: auth("u1") });
