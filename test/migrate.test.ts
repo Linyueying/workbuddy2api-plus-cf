@@ -12,12 +12,14 @@ import { ensureSchema, resetSchemaCache } from "../src/storage/migrate";
 function makeD1(
   opts: {
     tables?: string[];
-    cols?: string[];
+    cols?: string[]; // apikeys 已有列
+    reqCols?: string[]; // request_logs 已有列
     failOn?: RegExp;
   } = {},
 ) {
   const tables = new Set(opts.tables ?? ["apikeys"]);
   const cols = new Set(opts.cols ?? []);
+  const reqCols = new Set(opts.reqCols ?? []);
   const executed: string[] = [];
 
   const d1 = {
@@ -30,11 +32,12 @@ function makeD1(
           // 模拟真实 SQLite：重复加列会报 duplicate column name
           const m = s.match(/ALTER TABLE (\w+) ADD COLUMN (\w+)/);
           if (m) {
+            const set = m[1] === "request_logs" ? reqCols : cols;
             const col = m[2];
-            if (cols.has(col)) {
+            if (set.has(col)) {
               throw new Error(`duplicate column name: ${col}`);
             }
-            cols.add(col);
+            set.add(col);
           }
           const ct = s.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
           if (ct) tables.add(ct[1]);
@@ -46,7 +49,10 @@ function makeD1(
             return { results: [...tables].map((n) => ({ name: n })) };
           }
           const p = s.match(/PRAGMA table_info\((\w+)\)/);
-          if (p) return { results: [...cols].map((n) => ({ name: n })) };
+          if (p) {
+            const set = p[1] === "request_logs" ? reqCols : cols;
+            return { results: [...set].map((n) => ({ name: n })) };
+          }
           return { results: [] };
         },
         async first() {
@@ -56,7 +62,7 @@ function makeD1(
     },
   } as any;
 
-  return { d1, executed, cols, tables };
+  return { d1, executed, cols, reqCols, tables };
 }
 
 /** 全新库：0001 的表已建（刚跑过）但 0002 的列全缺。 */
@@ -69,8 +75,8 @@ describe("D1 自动迁移", () => {
     resetSchemaCache();
   });
 
-  it("全新库：补齐 0002 的管控列 + 0004 的展示掩码", async () => {
-    const { d1, cols } = makeD1({ cols: [] });
+  it("全新库：补齐 0002/0004 的 apikeys 列 + 0005 的 request_logs 用量列", async () => {
+    const { d1, cols, reqCols } = makeD1({ cols: [], reqCols: [] });
     const r = await ensureSchema(envWith(d1));
     expect(r.status).toBe("ok");
     // 这份清单刻意写死在此处、不从 src 导出：迁移漏加任何一列都应在这里抓到，
@@ -81,9 +87,11 @@ describe("D1 自动迁移", () => {
         "last_ip", "req_count", "quota", "used_tokens", "quota_credit",
         "used_credit", "seq",
         "prefix", // 0004：对齐 Go Key.Prefix（明文前 12 字符）
+        "prompt_tokens", "completion_tokens", "credits", "cache_read_tokens", // 0005：request_logs 用量列
       ].sort(),
     );
-    expect(cols.size).toBe(14);
+    expect(cols.size).toBe(14); // apikeys 管控列 + 展示掩码
+    expect(reqCols.size).toBe(4); // request_logs 用量列
   });
 
   it("已迁移的库：不重复加列（ADD COLUMN 无 IF NOT EXISTS，重跑会炸）", async () => {
@@ -93,7 +101,8 @@ describe("D1 自动迁移", () => {
       "last_ip", "req_count", "quota", "used_tokens", "quota_credit",
       "used_credit", "seq", "prefix",
     ];
-    const { d1, executed } = makeD1({ cols: allCols });
+    const allReqCols = ["prompt_tokens", "completion_tokens", "credits", "cache_read_tokens"];
+    const { d1, executed } = makeD1({ cols: allCols, reqCols: allReqCols });
     const r = await ensureSchema(envWith(d1));
     expect(r.status).toBe("ok");
     expect(r.added_cols).toEqual([]);

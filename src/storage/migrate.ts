@@ -85,6 +85,19 @@ const COLS_0004: { name: string; ddl: string }[] = [
   { name: "prefix", ddl: "prefix TEXT NOT NULL DEFAULT ''" },
 ];
 
+// 0005：request_logs 用量列（与 migrations/0005_request_logs_usage_cols.sql 保持同步）。
+// 这 4 列在 0001 建表时尚不存在，原本靠首条日志 INSERT 失败时的懒自愈补列
+// （见 d1.ts 的 ensureUsageColumns）。但 Pages 零配置起量的新库更应在启动期就把列补好，
+// 与 apikeys 的列迁移同一套口径——避免「首个请求先 500 再自愈」的抖动，也兑现本文件
+// 开头「运行时 schema 必须与 migrations/*.sql 保持同步」的硬约束。
+// 每条都带默认值，保证老行读出来语义不变；这里主动补齐后，懒自愈仅作兜底。
+const COLS_REQLOGS: { name: string; ddl: string }[] = [
+  { name: "prompt_tokens", ddl: "prompt_tokens INTEGER NOT NULL DEFAULT 0" },
+  { name: "completion_tokens", ddl: "completion_tokens INTEGER NOT NULL DEFAULT 0" },
+  { name: "credits", ddl: "credits REAL NOT NULL DEFAULT 0" },
+  { name: "cache_read_tokens", ddl: "cache_read_tokens INTEGER NOT NULL DEFAULT 0" },
+];
+
 const INDEX_0002 = `CREATE INDEX IF NOT EXISTS idx_apikeys_seq ON apikeys(seq DESC)`;
 
 // 0003 的复合索引（与 migrations/0003_usage_metrics.sql 末两行保持同步）。
@@ -161,6 +174,20 @@ async function migrate(env: Env): Promise<MigrateState> {
       // 竞态：另一个 isolate 抢先加了同名列，不算失败
       if (isDuplicateColumn(e)) continue;
       throw new Error(`加列失败: ${c.name} → ${msgOf(e)}`);
+    }
+  }
+
+  // 2.5) request_logs 用量列：与 0005 的 SQL 迁移保持同步（见 COLS_REQLOGS 注释）。
+  // 与 apikeys 列迁移同一套探测 + 补列逻辑，duplicate column 同样吞掉。
+  const reqCols = await columnsOf(d1, "request_logs");
+  for (const c of COLS_REQLOGS) {
+    if (reqCols.has(c.name)) continue;
+    try {
+      await d1.prepare(`ALTER TABLE request_logs ADD COLUMN ${c.ddl}`).run();
+      added_cols.push(c.name);
+    } catch (e) {
+      if (isDuplicateColumn(e)) continue;
+      throw new Error(`加列失败: request_logs.${c.name} → ${msgOf(e)}`);
     }
   }
 
