@@ -89,6 +89,73 @@ export async function withTimeout(req: Request, ms: number): Promise<Response> {
   }
 }
 
+/**
+ * withStreamTimeouts 流式出站的三段超时：首字节 / 流间空闲 / 总时长。
+ *
+ * 为什么不能只用 withTimeout：`fetch()` 在**响应头到达时**就 resolve，原实现紧随
+ * 其后的 `finally { clearTimeout }` 会把总超时一起清掉——于是 120s 的总超时实际只
+ * 覆盖到首字节，流阶段完全裸奔。上游若半途卡住不发也不关（网关挂起、连接被中间
+ * 设备静默丢弃），这个请求会一直挂着：用户侧看到「转圈不结束」，Worker 侧持续占着
+ * 一个在途名额与一个出站连接，还会把 10ms CPU/请求的额度慢慢吃掉。
+ *
+ *   headerMs  首字节超时（upstream.header_timeout_seconds）——头都回不来，多半是
+ *             上游不可用，早失败让轮转去试下一个号；
+ *   idleMs    流间空闲超时（upstream.idle_timeout_seconds）——已开始出流后又静默，
+ *             每收到一个 chunk 就重置，因此不影响正常长回复；
+ *   totalMs   总时长兜底（upstream.timeout_seconds），覆盖整个流的生命周期。
+ *
+ * 三者任一触发 → abort 上游 fetch → 错误沿管道传到下游，请求按传输层失败处理
+ * （喂连败计数 → 降权/轮转），不会静默挂死。<=0 的配置值表示该段不设限。
+ */
+export async function withStreamTimeouts(
+  req: Request,
+  opt: { totalMs: number; headerMs: number; idleMs: number },
+): Promise<Response> {
+  const ctrl = new AbortController();
+  let h: ReturnType<typeof setTimeout> | undefined;
+  let i: ReturnType<typeof setTimeout> | undefined;
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const clearAll = () => {
+    clearTimeout(h);
+    clearTimeout(i);
+    clearTimeout(t);
+  };
+  if (opt.totalMs > 0) t = setTimeout(() => ctrl.abort(), opt.totalMs);
+  if (opt.headerMs > 0) h = setTimeout(() => ctrl.abort(), opt.headerMs);
+  /** armIdle 收到数据就重置空闲计时：正常长回复是持续有帧的，不会被误杀。 */
+  const armIdle = () => {
+    clearTimeout(i);
+    if (opt.idleMs > 0) i = setTimeout(() => ctrl.abort(), opt.idleMs);
+  };
+  try {
+    const res = await fetch(req, { signal: ctrl.signal });
+    clearTimeout(h); // 头已到达，首字节守卫功成身退
+    armIdle(); // 由此刻起转为「等第一个流块」的空闲守卫
+    if (!res.body) {
+      clearAll();
+      return res;
+    }
+    // 空闲守卫做成 TransformStream：每个 chunk 过手即重置计时，流结束/取消时清表，
+    // 免得残留的 timer 把 isolate 寿命拖长。
+    const guard = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        armIdle();
+        controller.enqueue(chunk);
+      },
+      flush() {
+        clearAll();
+      },
+      cancel() {
+        clearAll();
+      },
+    });
+    return new Response(res.body.pipeThrough(guard), { status: res.status, statusText: res.statusText, headers: res.headers });
+  } catch (e) {
+    clearAll();
+    throw e;
+  }
+}
+
 // ---- Token 刷新（两段式，网络 I/O 在锁外）----
 export async function refreshToken(env: Env, auth: Auth): Promise<Auth> {
   const base = basesFor(auth.realm, env);
@@ -178,7 +245,13 @@ export async function chatStream(
     headers,
     body: JSON.stringify(payload),
   });
-  return withTimeout(req, cfg.upstream.timeout_seconds * 1000);
+  // 流式出站必须带 header + idle 两段超时：只给总超时的话，它会在响应头到达时
+  // 就被清掉（withTimeout 的 finally），流阶段等于没有保护。见 withStreamTimeouts。
+  return withStreamTimeouts(req, {
+    totalMs: Number(cfg.upstream.timeout_seconds ?? 0) * 1000,
+    headerMs: Number(cfg.upstream.header_timeout_seconds ?? 0) * 1000,
+    idleMs: Number(cfg.upstream.idle_timeout_seconds ?? 0) * 1000,
+  });
 }
 
 // ---- 模型目录（两路并发合并）----

@@ -256,6 +256,9 @@ export async function proxyChat(
     if (pick.acquired !== true) await poolRPC(env, "/internal/acquire", "POST", { uid }).catch(() => {});
 
     try {
+      // 已升级的 engine 在 pick 里就顺带刷好了临期 token（freshAuth），这里判定为
+      // 「不临期」直接跳过 —— 省掉一次跨 Worker 往返。旧版 engine 返回的还是旧
+      // auth，判定仍成立，于是照原路补一次 refresh：功能不变，只是没省这一趟。
       if (needsRefresh(auth)) {
         const r = await poolRPC(env, "/internal/refresh", "POST", { uid }).catch(() => null);
         if (r?.auth) auth = r.auth;
@@ -368,7 +371,9 @@ export async function proxyChat(
       // 空回复降级（auto_model.on_empty，默认开）：响应尚未写回，可直接换候选重试。
       if (autoCfg.on_empty && isEmptyCompletion(payload)) {
         // 空回复也是一次真实消耗：先记账再降级，否则换模型重试等于白嫖一次上游消耗。
-        if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
+        // 扣配额挂 waitUntil（不影响下面是否重试）；release 仍 await——这条路径
+        // 后面可能 continue 重试，必须确认在途已释放才去选下一个号。
+        if (keyRow) waitUntil(consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0)));
         // 记账随 release 一起发（cost 字段），少一次跨 Worker 往返。
         await poolRPC(env, "/internal/release", "POST", { uid, ...costArg(payload?.usage, bareModel) }).catch(() => {});
         if (advance()) {
@@ -380,10 +385,13 @@ export async function proxyChat(
         return openAIError(502, "empty_completion", "upstream returned empty completion");
       }
 
-      if (keyRow) await consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0));
-      await poolRPC(env, "/internal/release", "POST", { uid, ...costArg(payload?.usage, bareModel) }).catch(() => {});
-      // 非流式此时才知道用量，日志在这里一次写清——不 await，别把响应拖到 D1 之后；
-      // 但必须 waitUntil，否则响应一返回 Worker 就可能回收、这行日志永远落不了地。
+      // 收尾三件（扣配额 / 带成本台账的 release / 日志）全部挂 waitUntil 并行发出，
+      // **不再 await**：响应体此刻已经在手，若还等这三次跨 Worker + D1 往返才返回，
+      // 就等于把 60-300ms 白加在每个非流式请求上——而它们对用户回包毫无影响。
+      // release 走 waitUntil 是安全的：waitUntil 的语义就是保证跑完，不会因 isolate
+      // 回收而丢；且这条路径后面直接 return，不存在「释放没生效就又去选号」的问题。
+      if (keyRow) waitUntil(consumeKey(env, keyRow.id, Number(payload?.usage?.credit ?? 0), Number(payload?.usage?.total_tokens ?? 0)));
+      waitUntil(poolRPC(env, "/internal/release", "POST", { uid, ...costArg(payload?.usage, bareModel) }).catch(() => {}));
       waitUntil(log(env, clientIP, userAgent, uid, rawModel, chain[ci], realm, "ok", 200, start, payload?.usage));
       return new Response(JSON.stringify(payload), {
         status: 200,

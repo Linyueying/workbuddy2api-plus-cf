@@ -1,7 +1,7 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import type { AccountState, Auth, PoolStatus, Realm, ModelCooldown, ModelCostEntry } from "../types";
 import { getConfig, type Config } from "../config";
-import { refreshToken } from "../services/upstream";
+import { refreshToken, needsRefresh } from "../services/upstream";
 import { rateLookup } from "../services/rates";
 import {
   pick as corePick,
@@ -134,6 +134,29 @@ export class PoolDO {
       if (this._order && !this._order.includes(a.uid)) this._order.push(a.uid);
     }
   }
+  /**
+   * freshAuth 选号命中后**就地**刷新临期 token，返回可直接出站的 auth。
+   *
+   * 存在理由：原流程是 proxy 拿到 pick 的 auth → 发现临期 → 再发一次
+   * /internal/refresh（跨 Worker 一次完整 HTTP 往返，30-150ms）→ DO 才去刷新。
+   * 而「选号」与「用这个号出站」永远连着发生，token 是否临期在 DO 里就能判，
+   * 没必要让调用方再跑一趟。
+   *
+   * 刷新失败不抛：返回旧 auth，让调用方照旧走它自己的兜底（再试一次）。
+   */
+  private async freshAuth(a: AccountState, now: number): Promise<Auth> {
+    if (!needsRefresh(a.auth)) return a.auth;
+    try {
+      const refreshed = await refreshToken(this.env, a.auth);
+      a.auth = refreshed;
+      a.refreshedAt = now;
+      await this.putAcct(a);
+      return refreshed;
+    } catch {
+      return a.auth;
+    }
+  }
+
   private async allAccts(): Promise<AccountState[]> {
     const byUid = await this.ensureState();
     const out: AccountState[] = [];
@@ -380,7 +403,7 @@ export class PoolDO {
               await this.ctx.storage.put(PICK_SEQ_KEY, a2.usedSeq);
               await this.putAcct(a2);
               const got = await acquireIn(a2.uid);
-              return json({ uid: a2.uid, auth: a2.auth, sticky: true, acquired: got });
+              return json({ uid: a2.uid, auth: await this.freshAuth(a2, now), sticky: true, acquired: got });
             }
           }
         }
@@ -406,7 +429,7 @@ export class PoolDO {
           const ra = await this.getAcct(relaxed.uid);
           return json({
             uid: relaxed.uid,
-            auth: ra?.auth,
+            auth: ra ? await this.freshAuth(ra, now) : undefined,
             explored: relaxed.explored,
             fallback: true,
             fallback_kind: "realm_relaxed",
@@ -418,7 +441,7 @@ export class PoolDO {
         const a = await this.getAcct(chosen.uid);
         return json({
           uid: chosen.uid,
-          auth: a?.auth,
+          auth: a ? await this.freshAuth(a, now) : undefined,
           explored: chosen.explored,
           fallback: chosen.fallback,
           fallback_kind: chosen.fallbackKind,

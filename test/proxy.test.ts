@@ -299,6 +299,39 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
     expect(env.countOf("/internal/acquire")).toBe(1);
   });
 
+  // token 临期刷新原本要占一次跨 Worker 往返（pick → 发现临期 → /internal/refresh）。
+  // 已升级的 engine 在 pick 里就刷好了，调用方拿到即新鲜，这一步应当整个消失。
+  it("pick 就地返回新鲜 token → 不再发 /internal/refresh", async () => {
+    const expiring = { ...makeAuth("u1"), expiresAt: Date.now() + 60_000 }; // 落在 10 分钟窗口内
+    const fresh = { ...makeAuth("u1"), expiresAt: Date.now() + 3600_000, accessToken: "at-fresh" };
+    const env = fakeEnv(expiring, { pickAuth: fresh });
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        return new Response(STREAM_WITH_USAGE, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.countOf("/internal/refresh")).toBe(0);
+  });
+
+  it("旧版 engine（pick 仍返回临期 token）→ 照旧补一次 refresh", async () => {
+    const expiring = { ...makeAuth("u1"), expiresAt: Date.now() + 60_000 };
+    const env = fakeEnv(expiring);
+    vi.stubGlobal("fetch", vi.fn(async (req: Request) => {
+      if (new URL((req as any).url).pathname.includes("/chat/completions")) {
+        return new Response(STREAM_WITH_USAGE, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(env.countOf("/internal/refresh")).toBe(1);
+  });
+
   it("成功路径的两次 note 合并成一次 RPC（kinds 批量）", async () => {
     const env = envFor();
     const res = await proxyChat(env, reqFor(), "cn:hy3", { model: "cn:hy3", stream: true, messages: [] }, "0.0.0.0", "");
@@ -331,7 +364,7 @@ describe("流式用量写入（占位 + 末帧回填）", () => {
 
   // 真实上游的 SSE 帧往往带 event: 行、且以 \r\n\r\n 分隔。旧实现的
   // replace(/^data:\s?/) 与 tail.split(/\n\n/) 在这两种形态下都会把 usage 静默丢掉，
-  // 而下游 sseTransform 仍能把正文完好转发给用户——于是症状就是
+  // 而下游的转发管线仍能把正文完好转发给用户——于是症状就是
   // 「对话一切正常，唯独用量页的输入/输出 Token 全是 0」。
   const STREAM_REAL_SHAPE =
     "event: message\r\n" +

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { PoolDO } from "../src/durable/account-pool";
 import type { Env } from "../worker-configuration.d.ts";
 import type { Auth } from "../src/types";
@@ -412,6 +412,43 @@ describe("账号池 P1 状态机", () => {
     const r2 = await rpc(pool, "/internal/release", "POST", { uid: "u1", cost: { model: "hy4", credit: 5, tokens: 0 } });
     expect(r2.json.ok).toBe(true);
     expect((await rpc(pool, "/internal/list")).json[0].modelCost.hy4).toBeUndefined();
+  });
+
+  it("pick 就地刷新临期 token（调用方不必再跑一趟 refresh RPC）", async () => {
+    const pool = newPool();
+    // expiresAt 落在 needsRefresh 的 10 分钟窗口内 → 选号时应被就地刷新。
+    const nearExpiry: Auth = { ...auth("u1"), expiresAt: Date.now() + 60_000 };
+    await rpc(pool, "/internal/add", "POST", { auth: nearExpiry });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ accessToken: "at-new", refreshToken: "rt-new", expiresIn: 3600 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    try {
+      const p = await rpc(pool, "/internal/pick", "POST", { realm: "cn" });
+      expect(p.json.auth.accessToken).toBe("at-new");
+      // 刷新结果必须落盘（写穿），否则下次还要再刷一次。
+      expect((await rpc(pool, "/internal/auth/u1")).json.accessToken).toBe("at-new");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("刷新失败不阻断选号：退回旧 token，由调用方兜底重试", async () => {
+    const pool = newPool();
+    await rpc(pool, "/internal/add", "POST", { auth: { ...auth("u1"), expiresAt: Date.now() + 60_000 } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 500 })));
+    try {
+      const p = await rpc(pool, "/internal/pick", "POST", { realm: "cn" });
+      expect(p.json.uid).toBe("u1");
+      expect(p.json.auth.accessToken).toBe("at-u1"); // 旧 token 仍在
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("list 暴露模型级冷却与成本台账（运维可观测性）", async () => {

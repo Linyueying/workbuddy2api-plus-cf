@@ -19,7 +19,7 @@ export function makeAuth(uid: string): Auth {
   };
 }
 
-export function fakeEnv(auth: Auth, opts: { pickAcquired?: boolean } = {}) {
+export function fakeEnv(auth: Auth, opts: { pickAcquired?: boolean; pickAuth?: Auth } = {}) {
   let releaseCount = 0;
   // 记录每次 DO 调用的路径与载荷：跨 Worker RPC 合并是靠"少发几次"来兑现的，
   // 光看返回值看不出来。
@@ -34,7 +34,10 @@ export function fakeEnv(auth: Auth, opts: { pickAcquired?: boolean } = {}) {
         // 默认模拟"已升级的 engine"：pick 自带 acquired。传 pickAcquired:false
         // 可模拟旧版 engine（响应里没有该字段）→ 调用方必须补发显式 acquire。
         const acquired = opts.pickAcquired !== false;
-        return new Response(JSON.stringify({ uid: auth.uid, auth, ...(acquired ? { acquired: true } : {}) }), {
+        // pickAuth：模拟「已升级的 engine 在 pick 内就地刷好了临期 token」——
+        // 返回的 auth 与入池的那份不同（新鲜）。不传则原样返回（旧版 engine）。
+        const authOut = opts.pickAuth ?? auth;
+        return new Response(JSON.stringify({ uid: auth.uid, auth: authOut, ...(acquired ? { acquired: true } : {}) }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
