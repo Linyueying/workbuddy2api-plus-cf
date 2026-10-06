@@ -218,16 +218,20 @@ export interface RequestLogEntry {
  *   models   子密钥的模型白名单；null = 不限（管理员恒为 null）
  *   keyRow   子密钥整行（配额累加与请求级校验用）；管理员为 null
  *
- * 计时两字段（wb2aT0 / wb2aAuthMs）是 Server-Timing 响应头的数据源，见
- * services/timing.ts：
- *   wb2aT0      请求进入网关的墙钟（由最外层 CORS 中间件打点，早于鉴权）
- *   wb2aAuthMs  鉴权耗时（毫秒）。**只有子密钥路径会设**——管理员走的是 Secret
- *               比对，耗时在微秒级，设进来只会让响应头多一个恒为 0 的字段。
- *               缺失即表示「鉴权不是瓶颈」，下游据此省略 auth 段。 */
+ * 计时三字段（wb2aT0 / wb2aMigrateMs / wb2aAuthMs）是 Server-Timing 响应头的
+ * 数据源，见 services/timing.ts：
+ *   wb2aT0         请求进入网关的墙钟（由最外层 CORS 中间件打点，早于一切）
+ *   wb2aMigrateMs  D1 自动迁移耗时（毫秒）。**只在本次请求真的付了迁移成本时
+ *                  才设**——热启动 await 的是已 resolve 的 promise，约 0ms，
+ *                  设进来只会让每个响应都平添一个恒为 0 的噪声字段。
+ *   wb2aAuthMs     鉴权耗时（毫秒）。**只有子密钥路径会设**——管理员走的是 Secret
+ *                  比对，耗时在微秒级，设进来只会让响应头多一个恒为 0 的字段。
+ *                  缺失即表示「鉴权不是瓶颈」，下游据此省略 auth 段。 */
 export interface CtxVars {
   role: "admin" | "key";
   models: string[] | null;
   keyRow: ApiKeyRow | null;
   wb2aT0?: number;
+  wb2aMigrateMs?: number;
   wb2aAuthMs?: number;
 }

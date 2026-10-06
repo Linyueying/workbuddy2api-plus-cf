@@ -8,6 +8,43 @@ import { registerLogin } from "./routes/login";
 import { registerAdmin } from "./routes/admin";
 import type { CtxVars } from "./types";
 import { now } from "./services/timing";
+import { isColdStart, markServed, uptimeMs } from "./services/boot";
+import { ensureSchema } from "./storage/migrate";
+
+// 会碰 D1 的路径才需要等迁移；纯静态资源不受影响（与 index.ts 的路由判定同源）。
+function needsSchema(p: string): boolean {
+  return (
+    p === "/" || p === "/status" || p === "/healthz" || p.startsWith("/v1/") || p.startsWith("/panel/api/")
+  );
+}
+
+// D1 自动迁移。Pages 的 Git 集成不跑数据库迁移，把这一步搬进 Worker，
+// 部署后首个请求即完成建表，无需手工 `db:init:remote`。
+//
+// 刻意放在**中间件**而非模块顶层：Workers 禁止在模块全局作用域做 I/O，
+// 而这里是请求上下文内，安全。结果用模块级 promise 缓存，后续请求零开销。
+//
+// 放在这里而不是 index.ts 的 app.fetch 之前，是为了让耗时能写进 CtxVars、
+// 进而出现在 Server-Timing 里——原先它是唯一一段完全隐形的关键路径开销，
+// 冷启动慢却看不出慢在哪。见 services/timing.ts 的 SEG_ORDER 注释。
+//
+// 迁移失败**不得**阻断请求：D1 未绑定/配额用尽时服务仍应返回明确错误，
+// 而不是全体 500。失败原因由 /healthz 的 d1_schema 项上报。
+let schemaWarned = false;
+async function autoMigrate(env: Env): Promise<void> {
+  try {
+    const r = await ensureSchema(env);
+    if (r.status === "error" && !schemaWarned) {
+      schemaWarned = true;
+      console.error("[migrate] D1 自动迁移失败:", r.error);
+    }
+  } catch (e) {
+    if (!schemaWarned) {
+      schemaWarned = true;
+      console.error("[migrate] D1 自动迁移异常:", String(e));
+    }
+  }
+}
 
 // 鉴权：Bearer api_key（管理员总钥匙，全权放行）或 wbk_ 子密钥（D1 内 key_hash，
 // 带停用/过期/双配额/IP/realm/模型白名单管控）。
@@ -65,8 +102,22 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (!m) return c.json({ error: { message: "unauthorized", type: "api_error", code: "unauthorized" } }, 401);
   const token = m[1];
-  const cfg = await getConfig(c.env);
   const isPanel = path.startsWith("/panel/");
+  const isSubKey = !isPanel && token.startsWith(PREFIX);
+
+  // 冷启动优化：配置（1 次 KV）与子密钥（1 次 D1）**互不依赖**，原先串行 await
+  // 等于把两段 RTT 相加。这里并行发起，总耗时取较慢者。
+  //
+  // 热启动时两者都命中进程内缓存（config 30s SWR / 子密钥 30s Map），开销为零，
+  // 所以这个改动只影响冷启动，稳态行为完全不变。
+  //
+  // sha256 是纯 CPU（crypto.subtle.digest，亚毫秒），必须先算出来才能查子密钥；
+  // 它不是 IO，放在并行之前不占用往返。
+  const hash = isSubKey ? await sha256Hex(token) : "";
+  const [cfg, subKeyRow] = await Promise.all([
+    getConfig(c.env),
+    isSubKey ? loadKeyByHash(c.env, hash).catch(() => null) : Promise.resolve(null),
+  ]);
 
   if (isPanel) {
     // 面板凭据：admin_key 优先；未单独配置时回退 api_key。
@@ -92,11 +143,11 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
     c.set("keyRow", null);
     return next();
   }
-  if (token.startsWith(PREFIX)) {
-    const hash = await sha256Hex(token);
+  if (isSubKey) {
     // 走带内存缓存的读：一次 /v1 调用只因鉴权就要跨洋查一趟 D1（实测 20~150ms 抖动），
     // 而密钥行是天量级变更的数据。见 services/apikeys.ts 的缓存注释。
-    const row = await loadKeyByHash(c.env, hash).catch(() => null);
+    // 这趟 D1 已在上面与 getConfig 并行发起，这里只是取结果。
+    const row = subKeyRow;
     // 只有子密钥路径才打 auth 段：这里是热路径上唯一一趟会被感知到的 IO。
     // 管理员分支是内存比对，记它只会平添噪声。
     c.set("wb2aAuthMs", now() - authStart);
@@ -149,6 +200,10 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     // 计时起点：这是**最先注册**的中间件，它的入口时刻最贴近「请求到达 Workers」，
     // 晚于此处的任何打点都会漏掉鉴权 / 路由匹配的耗时。
     c.set("wb2aT0", now());
+    // 冷启动快照必须在 await next() **之前**取：并发的首批请求要一起看到 true
+    // （它们同样在付 isolate 启动成本），等第一个请求走完才翻假。
+    const cold = isColdStart();
+    markServed();
     await next();
     const h = c.res?.headers;
     if (!h) return;
@@ -159,12 +214,33 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
       // Expose-Headers 是自定义响应头能否被浏览器 JS 读到的开关：同源不看它，
       // 但跨域客户端要认 X-WB2A-* 就必须列出，否则 headers.get() 恒为 null
       // ——头在 HTTP 层面明明存在，抓包看得到、代码读不到。
-      h.set("Access-Control-Expose-Headers", "Server-Timing, X-WB2A-Timing, X-WB2A-Routed-Model");
+      h.set(
+        "Access-Control-Expose-Headers",
+        "Server-Timing, X-WB2A-Timing, X-WB2A-Routed-Model, X-Cold-Start, X-Worker-Uptime",
+      );
+      // 冷启动标记：让「这次慢是不是冷启动」不再靠猜。uptime 是本 isolate 存活
+      // 毫秒，用来判断这个 isolate 是刚起来的还是跑了很久的。
+      h.set("X-Cold-Start", cold ? "1" : "0");
+      h.set("X-Worker-Uptime", String(Math.round(uptimeMs())));
     } catch {
       // 静态资源由 env.ASSETS.fetch 返回，其 headers 带 immutable guard，set 会抛
       // TypeError。静态页同源访问本就不需要 CORS，尽力而为即可，不必为它重建
       // 一遍 Response（那要复制整个 body 引用，纯属浪费）。
     }
+  });
+
+  // 自动迁移：必须在**鉴权之前**（鉴权要读 apikeys 表），且在计时起点之后
+  // （这样它才会被算进 total）。静态路径直接跳过，一次字符串比较而已。
+  app.use("*", async (c, next) => {
+    if (needsSchema(c.req.path)) {
+      const t = now();
+      await autoMigrate(c.env);
+      const ms = now() - t;
+      // 只有真付了成本才记段：热启动 await 的是已 resolve 的 promise（约 0ms），
+      // 无条件设进去会让每个响应都多一个恒为 0 的字段，把真正的冷启动现场淹掉。
+      if (ms > 0.5) c.set("wb2aMigrateMs", ms);
+    }
+    await next();
   });
 
   // 鉴权

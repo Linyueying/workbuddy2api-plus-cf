@@ -21,6 +21,9 @@ function timelineOf(c: any) {
   const tl = newTimeline(Number(c.get("wb2aT0") ?? now()));
   const authMs = c.get("wb2aAuthMs");
   if (typeof authMs === "number") tl.seg.auth = authMs;
+  // 迁移段：搬进中间件后才有得读。热启动不设该变量，段自然缺席。
+  const migrateMs = c.get("wb2aMigrateMs");
+  if (typeof migrateMs === "number") tl.seg.migrate = migrateMs;
   return tl;
 }
 

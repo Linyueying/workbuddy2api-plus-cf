@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { ensureSchema, resetSchemaCache } from "../src/storage/migrate";
+import { ensureSchema, resetSchemaCache, forceSchemaMigration } from "../src/storage/migrate";
 
 // 自动迁移的三条硬约束必须在测试里钉死：
 //   1. D1 prepare() 一次一条语句 → 表/索引/列都得单独跑；
@@ -200,5 +200,202 @@ describe("迁移模块的 Workers 约束", () => {
     resetSchemaCache();
     // 只导入、不调用 ensureSchema
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 冷启动优化：这两项是针对「冷启动首 Token 慢、热启动快」加的，必须钉死。
+//
+// 背景：迁移原本**每次冷启动固定 14 次串行 D1 往返**（8 条建表 + 3 条索引 +
+// sqlite_master + 2 个 PRAGMA），且完全跑在请求计时之外——冷启动慢却看不出慢在哪。
+// ---------------------------------------------------------------------------
+
+/** 内存 KV 假实现：够用即可，只覆盖 get/put/delete。 */
+function makeKV(initial: Record<string, string> = {}) {
+  const store = new Map(Object.entries(initial));
+  return {
+    store,
+    async get(k: string) {
+      return store.has(k) ? store.get(k)! : null;
+    },
+    async put(k: string, v: string) {
+      store.set(k, v);
+    },
+    async delete(k: string) {
+      store.delete(k);
+    },
+  } as any;
+}
+
+/**
+ * 带 batch() 的 D1 假实现，并统计**往返次数**。
+ *
+ * 往返 = 一次 batch() 调用 或 一次 prepare().run()/all() 调用。这是本次优化
+ * 真正要压缩的量：冷启动慢的本质就是串行往返太多，而不是每条 SQL 本身慢。
+ */
+function makeD1WithBatch() {
+  const executed: string[] = [];
+  let batches = 0;
+  let singles = 0;
+  const cols = new Set<string>();
+  const reqCols = new Set<string>();
+  const tables = new Set<string>(["apikeys"]);
+
+  function exec(sql: string) {
+    const s = sql.replace(/\s+/g, " ").trim();
+    executed.push(s);
+    const ct = s.match(/CREATE TABLE IF NOT EXISTS (\w+)/);
+    if (ct) tables.add(ct[1]);
+    const al = s.match(/ALTER TABLE (\w+) ADD COLUMN (\w+)/);
+    if (al) {
+      const set = al[1] === "request_logs" ? reqCols : cols;
+      if (set.has(al[2])) throw new Error(`duplicate column name: ${al[2]}`);
+      set.add(al[2]);
+    }
+    return { results: [] };
+  }
+  function query(sql: string) {
+    const s = sql.replace(/\s+/g, " ").trim();
+    executed.push(s);
+    if (/sqlite_master/.test(s)) return { results: [...tables].map((n) => ({ name: n })) };
+    const p = s.match(/PRAGMA table_info\((\w+)\)/);
+    if (p) {
+      const set = p[1] === "request_logs" ? reqCols : cols;
+      return { results: [...set].map((n) => ({ name: n })) };
+    }
+    return { results: [] };
+  }
+
+  const d1 = {
+    prepare(sql: string) {
+      return {
+        sql,
+        async run() {
+          singles++;
+          return exec(sql);
+        },
+        async all() {
+          singles++;
+          return query(sql);
+        },
+        async first() {
+          singles++;
+          return null;
+        },
+      };
+    },
+    async batch(stmts: any[]) {
+      batches++;
+      const out: any[] = [];
+      for (const st of stmts) {
+        // 读语句（PRAGMA/SELECT）返回 results，写语句返回 success —— 对齐真机 D1
+        if (/^\s*(PRAGMA|SELECT)/i.test(st.sql)) out.push({ results: query(st.sql).results });
+        else out.push({ success: true, results: exec(st.sql).results });
+      }
+      return out;
+    },
+  } as any;
+
+  return {
+    d1,
+    executed,
+    /** 总往返次数（batch 算 1 次，单条算 1 次）。 */
+    roundTrips: () => batches + singles,
+  };
+}
+
+describe("冷启动优化①：KV 版本门", () => {
+  beforeEach(() => {
+    resetSchemaCache();
+  });
+
+  it("版本达标：一次 KV 读就返回，**一条 SQL 都不发**", async () => {
+    const { d1, executed } = makeD1({ cols: [] });
+    const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any);
+    expect(r.status).toBe("ok");
+    expect(r.via).toBe("version_gate");
+    // 这是整个优化的核心断言：冷启动不再付 14 次 D1 往返
+    expect(executed.length).toBe(0);
+  });
+
+  it("版本落后：照跑迁移，并把新版本号写回 KV", async () => {
+    const { d1 } = makeD1({ cols: [] });
+    const kv = makeKV({ schema_version: "3" });
+    const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: kv } as any);
+    expect(r.status).toBe("ok");
+    expect(r.via).toBe("ddl");
+    expect(kv.store.get("schema_version")).toBe("5");
+  });
+
+  it("KV 未绑定：版本门不可用，退化照跑迁移（不能成为新的故障源）", async () => {
+    const { d1, executed } = makeD1({ cols: [] });
+    const r: any = await ensureSchema({ WB2A_DB: d1 } as any);
+    expect(r.status).toBe("ok");
+    expect(r.via).toBe("ddl");
+    expect(executed.length).toBeGreaterThan(0);
+  });
+
+  it("KV 读失败：同样退化照跑迁移", async () => {
+    const { d1, executed } = makeD1({ cols: [] });
+    const brokenKV = {
+      async get() {
+        throw new Error("kv down");
+      },
+      async put() {},
+    } as any;
+    const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: brokenKV } as any);
+    expect(r.status).toBe("ok");
+    expect(r.via).toBe("ddl");
+    expect(executed.length).toBeGreaterThan(0);
+  });
+
+  it("resetSchemaCache **不**穿透版本门：清缓存后仍走快路径", async () => {
+    // 这条是刻意的设计取舍：resetSchemaCache 是通用「清缓存」入口，被测试的
+    // beforeEach 普遍调用。若它也穿透版本门，版本门在测试里就永远走不到。
+    const { d1, executed } = makeD1({ cols: [] });
+    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any;
+    expect((await ensureSchema(env) as any).via).toBe("version_gate");
+    resetSchemaCache();
+    expect((await ensureSchema(env) as any).via).toBe("version_gate");
+    expect(executed.length).toBe(0);
+  });
+
+  it("forceSchemaMigration 才穿透版本门（运维强制重跑入口靠它生效）", async () => {
+    // KV 版本号写错、或手工改坏表结构需要重建时，必须能绕过「达标就跳过」。
+    const { d1, executed } = makeD1({ cols: [] });
+    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any;
+    expect((await ensureSchema(env) as any).via).toBe("version_gate");
+    expect(executed.length).toBe(0);
+
+    forceSchemaMigration();
+    const r: any = await ensureSchema(env);
+    expect(r.via).toBe("ddl");
+    expect(executed.length).toBeGreaterThan(0);
+  });
+});
+
+describe("冷启动优化②：batch 压缩往返", () => {
+  beforeEach(() => {
+    resetSchemaCache();
+  });
+
+  it("batch 可用时：14 次串行往返压到 4 次以内（且列照样补齐）", async () => {
+    const h = makeD1WithBatch();
+    const r: any = await ensureSchema({ WB2A_DB: h.d1 } as any);
+    expect(r.status).toBe("ok");
+    // 优化前是 14 次串行往返（8 建表 + 3 索引 + sqlite_master + 2 PRAGMA）
+    expect(h.roundTrips()).toBeLessThanOrEqual(4);
+    expect(h.roundTrips()).toBeLessThan(14);
+    // 压缩不能压掉正确性：18 列（14 apikeys + 4 request_logs）必须都补上
+    expect(r.added_cols?.length).toBe(18);
+  });
+
+  it("batch 不可用（老假实现）：退化逐条，行为与优化前一致", async () => {
+    // 保证能力探测的退化分支不会改变语义——别让「优化」变成「改行为」
+    const { d1, cols, reqCols } = makeD1({ cols: [], reqCols: [] });
+    const r = await ensureSchema({ WB2A_DB: d1 } as any);
+    expect(r.status).toBe("ok");
+    expect(cols.size).toBe(14);
+    expect(reqCols.size).toBe(4);
   });
 });

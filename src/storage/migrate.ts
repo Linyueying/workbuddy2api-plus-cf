@@ -8,11 +8,30 @@ import type { Env } from "../../worker-configuration.d.ts";
 // "推代码 → 部署 → 直接可用"。
 //
 // 三条硬约束：
-//   1. D1 的 prepare() 一次只能跑一条语句 → SQL 必须按 `;` 拆开逐条执行；
+//   1. D1 的 prepare() 一次只能跑一条语句 → 要么逐条跑，要么用 batch() 打包；
 //   2. SQLite 的 ALTER TABLE ADD COLUMN **不支持 IF NOT EXISTS**
 //      → 加列前必须 PRAGMA table_info 探测，否则重跑必炸 duplicate column；
 //   3. 多个 isolate 可能同时首次触发 → ADD COLUMN 存在竞态，
 //      必须吞掉 "duplicate column name" 而不是让它冒到调用方。
+//
+// ---------------------------------------------------------------------------
+// 冷启动优化（2026-10）：原先这段是**首 Token 延迟的最大单项**。
+//
+// 迁移原本跑在每个 API 请求、Hono 之前，且是纯串行的。即便数据库早已是最新
+// schema，它仍会老老实实走完 8 条 CREATE + 2 条 PRAGMA + 3 条索引 = **14 次
+// 串行 D1 往返**；而它的 promise 缓存是模块级的，isolate 一回收就重新付一遍。
+// 这正好解释「冷启动很慢、热启动很快」——热启动根本不用付这笔钱。
+//
+// 两层优化，组合起来把冷启动的迁移成本压到接近零：
+//
+//   ① 版本门：迁移成功后把版本号写进 KV。冷启动先花 **1 次 KV 读**（边缘、
+//      亚毫秒~几毫秒）确认版本达标，达标就完全跳过 DDL。省掉 14 次 D1 往返。
+//   ② batch 压缩：真需要迁移时（首次部署 / 版本号提升），用 d1.batch() 把
+//      往返数从 14 压到 3~4（9 条建表索引一批、3 条探测一批、缺列一批）。
+//
+// 版本门**失效即退化**，绝不成为新的故障源：KV 未绑定、读失败、值非法，
+// 一律当作「版本未知」照跑迁移。KV 是最终一致的，但这里只存一个单调递增的
+// 版本号，读到旧值最坏情况是多跑一次幂等迁移，读到新值才跳过——不会漏迁移。
 
 // 0001 的 DDL（与 migrations/0001_init.sql 保持同步，全部 IF NOT EXISTS）
 const SCHEMA_0001 = [
@@ -118,17 +137,40 @@ const INDEX_0003 = [
 
 export type MigrateState =
   | { status: "skipped"; reason: string }
-  | { status: "ok"; created: string[]; added_cols: string[] }
+  /** via 标明这次「ok」是怎么来的：version_gate = 命中版本门直接跳过（冷启动最优路径）；ddl = 真跑了迁移。 */
+  | { status: "ok"; created: string[]; added_cols: string[]; via?: "version_gate" | "ddl" }
   | { status: "error"; error: string; created: string[]; added_cols: string[] };
+
+/** 版本门在 KV 里的键。 */
+const SCHEMA_VERSION_KEY = "schema_version";
+/**
+ * 当前 schema 目标版本 = migrations/ 里最后一个文件的序号（0005 → 5）。
+ *
+ * ⚠️ 新增迁移文件时**必须**同步把这里 +1，否则版本门会让新迁移永远跑不到
+ * （旧版本号已经达标 → 直接跳过）。这是本机制唯一需要人工维护的地方。
+ */
+const SCHEMA_TARGET = 5;
 
 // 每个 isolate 只跑一次。用 promise 缓存而非布尔值：
 // 首个请求触发后，并发请求 await 同一个 promise，而不是各自重复探测。
 let inflight: Promise<MigrateState> | null = null;
 
+/**
+ * bypassGate 下一次 ensureSchema 是否**穿透**版本门。
+ *
+ * ⚠️ 只由 forceSchemaMigration() 置起，**不要**挂到 resetSchemaCache() 上。
+ * 后者是「清空模块级缓存」的通用入口，被测试的 beforeEach 普遍调用——若它也
+ * 置起这个标志，版本门在测试里就永远不会被走到，等于没写。
+ *
+ * 存在理由：运维点「强制重跑迁移」时，如果还去读 KV 版本、发现达标就跳过，
+ * 那这个入口就形同虚设了。置起后跑完即清。
+ */
+let bypassGate = false;
+
 /** 幂等：重复调用返回同一个结果，不会重复跑 DDL。 */
 export function ensureSchema(env: Env): Promise<MigrateState> {
   if (inflight) return inflight;
-  inflight = migrate(env).catch((e): MigrateState => ({
+  inflight = guarded(env).catch((e): MigrateState => ({
     status: "error",
     error: String(e?.message ?? e),
     created: [],
@@ -137,9 +179,75 @@ export function ensureSchema(env: Env): Promise<MigrateState> {
   return inflight;
 }
 
-/** 仅供测试/运维强制重跑（/panel/api/admin/migrate?force=1）。 */
+/**
+ * resetSchemaCache 清空模块级 promise 缓存，下次 ensureSchema 重新走一遍判定。
+ *
+ * 注意它**不**穿透版本门：清完缓存后若 KV 版本仍达标，照样跳过（这才是冷启动
+ * 想要的行为）。要强制真跑迁移请用 forceSchemaMigration()。
+ */
 export function resetSchemaCache(): void {
   inflight = null;
+}
+
+/**
+ * forceSchemaMigration 强制重跑一次迁移（穿透版本门）。
+ *
+ * 给运维兜底入口用（如 /panel/api/admin/migrate?force=1）：KV 版本号写错、
+ * 或手工改坏了表结构需要重建时，必须能绕过「版本达标就跳过」这条快路径。
+ */
+export function forceSchemaMigration(): void {
+  inflight = null;
+  bypassGate = true;
+}
+
+/**
+ * guarded 版本门包装：命中达标版本就跳过全部 DDL。
+ *
+ * 这里而不是在 migrate() 内部判，是为了让「跳过」这件事本身也是一个合法的
+ * MigrateState（via: "version_gate"），调用方（/healthz）能看出迁移是靠门跳过的
+ * 还是真跑过的。
+ */
+async function guarded(env: Env): Promise<MigrateState> {
+  const d1 = env.WB2A_DB;
+  if (!d1) return { status: "skipped", reason: "WB2A_DB 未绑定" };
+
+  if (!bypassGate) {
+    const v = await readSchemaVersion(env);
+    if (v !== null && v >= SCHEMA_TARGET) {
+      return { status: "ok", created: [], added_cols: [], via: "version_gate" };
+    }
+  }
+  bypassGate = false;
+
+  const r = await migrate(env);
+  // 只有真跑成功才写版本号：失败的话下次还得重试。
+  if (r.status === "ok") await writeSchemaVersion(env, SCHEMA_TARGET);
+  return r;
+}
+
+/** readSchemaVersion 读 KV 里的迁移版本号；拿不到返回 null（= 版本未知，照跑迁移）。 */
+async function readSchemaVersion(env: Env): Promise<number | null> {
+  const ns = env.WB2A_CONFIG as unknown as KVNamespace | undefined;
+  if (!ns || typeof ns.get !== "function") return null;
+  try {
+    const raw = await ns.get(SCHEMA_VERSION_KEY);
+    if (raw === null || raw === undefined || raw === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null; // KV 读失败不该阻断迁移——退化到老路径而已
+  }
+}
+
+/** writeSchemaVersion 写版本号。写失败无所谓，最坏是下次多跑一次幂等迁移。 */
+async function writeSchemaVersion(env: Env, v: number): Promise<void> {
+  const ns = env.WB2A_CONFIG as unknown as KVNamespace | undefined;
+  if (!ns || typeof ns.put !== "function") return;
+  try {
+    await ns.put(SCHEMA_VERSION_KEY, String(v));
+  } catch {
+    /* 静默：版本号只是加速手段，不是正确性依赖 */
+  }
 }
 
 async function migrate(env: Env): Promise<MigrateState> {
@@ -149,83 +257,133 @@ async function migrate(env: Env): Promise<MigrateState> {
   const created: string[] = [];
   const added_cols: string[] = [];
 
-  // 1) 表：DDL 自带 IF NOT EXISTS，直接跑即可。
-  for (const sql of SCHEMA_0001) {
-    try {
-      await d1.prepare(sql).run();
-    } catch (e) {
-      // 建表失败是硬故障，后面建索引/加列必然也失败，直接抛出
-      throw new Error(`DDL 失败: ${firstLine(sql)} → ${msgOf(e)}`);
-    }
-  }
+  // 1) 表 + 0002 索引：全部带 IF NOT EXISTS，天然幂等，打包成一批（1 次往返）。
+  //    建表失败是硬故障，后面建索引/加列必然也失败，直接抛出。
+  await runStatements(d1, [...SCHEMA_0001, INDEX_0002]);
+
+  // 2) 探测：表清单 + 两张表的列清单，打包成一批（1 次往返）。
+  //    原先这里是 3 次串行往返（sqlite_master + 2 个 PRAGMA）。
+  const [tableRows, apikeysCols, reqlogsCols] = await runQueries(d1, [
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    "PRAGMA table_info(apikeys)",
+    "PRAGMA table_info(request_logs)",
+  ]);
   // 表清单是固定的，建完即视为已建（首轮）或已存在（后续）；
   // 只在首次真正建出来时上报，便于 healthz 展示。
-  const existing = await tableNames(d1);
-  created.push(...existing);
+  created.push(...tableRows.map((x: any) => String(x?.name)));
+  const cols = new Set(apikeysCols.map((x: any) => String(x?.name)));
+  const reqCols = new Set(reqlogsCols.map((x: any) => String(x?.name)));
 
-  // 2) 列：ADD COLUMN 不支持 IF NOT EXISTS，先探测再补。
-  const cols = await columnsOf(d1, "apikeys");
-  for (const c of [...COLS_0002, ...COLS_0004]) {
-    if (cols.has(c.name)) continue;
-    try {
-      await d1.prepare(`ALTER TABLE apikeys ADD COLUMN ${c.ddl}`).run();
-      added_cols.push(c.name);
-    } catch (e) {
-      // 竞态：另一个 isolate 抢先加了同名列，不算失败
-      if (isDuplicateColumn(e)) continue;
-      throw new Error(`加列失败: ${c.name} → ${msgOf(e)}`);
-    }
+  // 3) 列：ADD COLUMN 不支持 IF NOT EXISTS，只补缺失的，打包成一批（0 或 1 次往返）。
+  const needApikeys = [...COLS_0002, ...COLS_0004].filter((c) => !cols.has(c.name));
+  const needReqlogs = COLS_REQLOGS.filter((c) => !reqCols.has(c.name));
+  if (needApikeys.length || needReqlogs.length) {
+    await runAlters(d1, needApikeys, needReqlogs, added_cols);
   }
 
-  // 2.5) request_logs 用量列：与 0005 的 SQL 迁移保持同步（见 COLS_REQLOGS 注释）。
-  // 与 apikeys 列迁移同一套探测 + 补列逻辑，duplicate column 同样吞掉。
-  const reqCols = await columnsOf(d1, "request_logs");
-  for (const c of COLS_REQLOGS) {
-    if (reqCols.has(c.name)) continue;
-    try {
-      await d1.prepare(`ALTER TABLE request_logs ADD COLUMN ${c.ddl}`).run();
-      added_cols.push(c.name);
-    } catch (e) {
-      if (isDuplicateColumn(e)) continue;
-      throw new Error(`加列失败: request_logs.${c.name} → ${msgOf(e)}`);
-    }
-  }
-
-  // 3) 索引
+  // 4) 0003 的复合索引：IF NOT EXISTS，老库重跑是 no-op。
+  //    建索引失败不阻断启动（索引只影响查询计划，缺了仍能正确出数），故只告警不抛。
   try {
-    await d1.prepare(INDEX_0002).run();
+    await runStatements(d1, INDEX_0003);
   } catch (e) {
-    throw new Error(`建索引失败: idx_apikeys_seq → ${msgOf(e)}`);
-  }
-  // 0003 的复合索引同样在此补齐：IF NOT EXISTS，老库重跑是 no-op。
-  // 建索引失败不阻断启动（索引只影响查询计划，缺了仍能正确出数），故只告警不抛。
-  for (const sql of INDEX_0003) {
-    try {
-      await d1.prepare(sql).run();
-    } catch (e) {
-      console.error(`[migrate] 建索引失败（跳过，不影响正确性）: ${firstLine(sql)} → ${msgOf(e)}`);
-    }
+    console.error(`[migrate] 建索引失败（跳过，不影响正确性）: ${msgOf(e)}`);
   }
 
-  return { status: "ok", created, added_cols };
+  return { status: "ok", created, added_cols, via: "ddl" };
 }
 
 // ---------------------------------------------------------------------------
+// 执行器：优先 batch()（一次往返跑多条），不可用时退化逐条。
+//
+// 为什么要做能力探测而不是直接用 batch：本仓库的单测用了一个只实现 prepare()
+// 的 D1 假实现，直接调 batch 会让 642 个测试全炸。真机 D1 一定有 batch，
+// 所以探测只是为了让「测试环境」和「生产环境」走同一份代码而不互相迁就。
+// ---------------------------------------------------------------------------
 
-async function tableNames(d1: D1Database): Promise<string[]> {
-  const r = await d1
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    .all<{ name: string }>();
-  return (r.results ?? []).map((x) => String(x.name));
+/** runStatements 执行一批写语句（建表/建索引），失败即抛。 */
+async function runStatements(d1: any, sqls: string[]): Promise<void> {
+  if (typeof d1.batch === "function") {
+    try {
+      await d1.batch(sqls.map((s) => d1.prepare(s)));
+      return;
+    } catch (e) {
+      // batch 不告知是哪一条失败，只能把原始错误抛出去（真机 D1 的报错里
+      // 通常带 SQL 文本，够定位；不值得为此退化回逐条再跑一遍）。
+      throw new Error(`DDL 失败: ${msgOf(e)}`);
+    }
+  }
+  for (const sql of sqls) {
+    try {
+      await d1.prepare(sql).run();
+    } catch (e) {
+      throw new Error(`DDL 失败: ${firstLine(sql)} → ${msgOf(e)}`);
+    }
+  }
 }
 
-async function columnsOf(d1: D1Database, table: string): Promise<Set<string>> {
-  try {
-    const r = await d1.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
-    return new Set((r.results ?? []).map((x) => String(x.name)));
-  } catch {
-    // 表不存在时 PRAGMA 会抛；调用方按"全部缺失"处理
-    return new Set();
+/** runQueries 执行一批读语句，按入参顺序返回结果行数组。 */
+async function runQueries(d1: any, sqls: string[]): Promise<any[][]> {
+  if (typeof d1.batch === "function") {
+    try {
+      const rs = await d1.batch(sqls.map((s) => d1.prepare(s)));
+      return rs.map((r: any) => r?.results ?? []);
+    } catch {
+      // batch 失败（典型：某张表还不存在，PRAGMA 直接抛）→ 退化逐条，
+      // 逐条版本对每条独立 try/catch，缺哪张表就按「列全部缺失」处理。
+    }
+  }
+  const out: any[][] = [];
+  for (const sql of sqls) {
+    try {
+      const r = await d1.prepare(sql).all();
+      out.push(r?.results ?? []);
+    } catch {
+      out.push([]);
+    }
+  }
+  return out;
+}
+
+/**
+ * runAlters 补缺失的列。
+ *
+ * 竞态处理是这里唯一的难点：多个 isolate 可能同时探测到「某列缺失」，
+ * 都去 ADD COLUMN，后到的必然撞 duplicate column name——这不算失败。
+ * batch 是「一条失败整批失败」，所以撞了就退化到逐条，逐条里逐列吞重复。
+ */
+async function runAlters(
+  d1: any,
+  needApikeys: { name: string; ddl: string }[],
+  needReqlogs: { name: string; ddl: string }[],
+  added_cols: string[],
+): Promise<void> {
+  const stmts = [
+    ...needApikeys.map((c) => ({ sql: `ALTER TABLE apikeys ADD COLUMN ${c.ddl}`, name: c.name, label: c.name })),
+    ...needReqlogs.map((c) => ({
+      sql: `ALTER TABLE request_logs ADD COLUMN ${c.ddl}`,
+      name: c.name,
+      label: `request_logs.${c.name}`,
+    })),
+  ];
+
+  if (typeof d1.batch === "function") {
+    try {
+      await d1.batch(stmts.map((s) => d1.prepare(s.sql)));
+      added_cols.push(...stmts.map((s) => s.name));
+      return;
+    } catch {
+      // 整批失败，退化逐条（下面会吞掉 duplicate column）
+    }
+  }
+
+  for (const s of stmts) {
+    try {
+      await d1.prepare(s.sql).run();
+      added_cols.push(s.name);
+    } catch (e) {
+      if (isDuplicateColumn(e)) continue; // 另一个 isolate 抢先加过，不算失败
+      throw new Error(`加列失败: ${s.label} → ${msgOf(e)}`);
+    }
   }
 }
 

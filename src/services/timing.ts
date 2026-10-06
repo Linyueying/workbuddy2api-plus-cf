@@ -83,7 +83,14 @@ export function addElapsed(tl: Timeline, name: string, ms: number): void {
  * 对象插入顺序取决于代码执行路径（错误路径会跳过若干段），直接遍历会让每次
  * 响应的字段顺序都不同，diff 起来很痛苦。固定按关键路径排，缺哪段就少哪段。
  */
-const SEG_ORDER = ["auth", "body", "cfg", "prompt", "models", "pick", "refresh", "note", "upstream"];
+// migrate 段是 2026-10 补的：自动迁移原本跑在 Hono 之外（index.ts 里 await 完才
+// app.fetch），是**唯一一段不在任何中间件计时范围内**的关键路径开销——冷启动时
+// 它才是真正的大头，却在响应头里完全隐形，优化无从验证。现在迁移搬进中间件并
+// 记到这里，它排在 auth 之前，因为它的的确确发生在鉴权之前。
+//
+// 热启动请求该段约 0（await 的是已 resolve 的 promise），不会污染正常响应；
+// 只有真正付了迁移成本的那个请求才会显示出一个大数——这正是要抓的冷启动现场。
+const SEG_ORDER = ["migrate", "auth", "body", "cfg", "prompt", "models", "pick", "refresh", "note", "upstream"];
 
 /** round1 保留一位小数，去掉浮点尾数（0.30000000000000004 这种不该出现在头里）。 */
 function round1(v: number): string {
