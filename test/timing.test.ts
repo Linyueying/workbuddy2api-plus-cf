@@ -286,12 +286,40 @@ describe("端到端：中间件链把计时接通", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("X-WB2A-Timing")).not.toContain("auth=");
   });
+
+  it("冷启动观测落地：X-Cold-Start / X-Worker-Uptime 存在且跨域可读", async () => {
+    vi.stubGlobal("fetch", mockOK());
+    const env = mkHttpEnv();
+    await env.WB2A_CONFIG.put("config", JSON.stringify({ api_key: "sk-main" }));
+    invalidateConfig();
+
+    const a = new Hono<{ Bindings: Env }>();
+    buildApp(a as any);
+    const res = await a.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: "Bearer sk-main" },
+        body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [] }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    // 没有这个标记，「这次慢到底是冷启动还是热启动」只能靠猜——
+    // 而两者要改的东西完全不同（前者砍启动期 I/O，后者砍请求路径 I/O）。
+    expect(res.headers.get("X-Cold-Start")).toMatch(/^[01]$/);
+    expect(Number(res.headers.get("X-Worker-Uptime"))).toBeGreaterThanOrEqual(0);
+    // 跨域客户端要能读到这两个头，必须列进 Expose-Headers，否则 JS 恒为 null
+    const expose = res.headers.get("Access-Control-Expose-Headers") ?? "";
+    expect(expose).toContain("X-Cold-Start");
+    expect(expose).toContain("X-Worker-Uptime");
+  });
 });
 
 describe("埋点守卫（静态）", () => {
   const proxySrc = readFileSync(new URL("../src/services/proxy.ts", import.meta.url), "utf8");
   const routerSrc = readFileSync(new URL("../src/router.ts", import.meta.url), "utf8");
   const apiSrc = readFileSync(new URL("../src/routes/api.ts", import.meta.url), "utf8");
+  const timingSrc = readFileSync(new URL("../src/services/timing.ts", import.meta.url), "utf8");
 
   it("每一段的计时点位都在（删掉任何一处都会让该段永远不出现）", () => {
     expect(proxySrc).toContain('markSince(tl, "cfg"');
@@ -302,6 +330,25 @@ describe("埋点守卫（静态）", () => {
     expect(proxySrc).toContain('addElapsed(tl, "pick"');
     expect(proxySrc).toContain('tl.seg.note = 0');
     expect(proxySrc).toContain('markSince(tl, "upstream"');
+  });
+
+  it("migrate 段埋点在位（它曾是完全隐形的关键路径开销）", () => {
+    // 迁移原本 await 在 app.fetch 之前、任何中间件计时范围之外，是冷启动最大
+    // 单项开销却在响应头里完全看不到。现在搬进 router 中间件，经 CtxVars 传
+    // 给 api.ts 写进时间线。三处任一处被删，该段就永远不出现——故静态守卫。
+    expect(routerSrc).toContain('c.set("wb2aMigrateMs"');
+    expect(apiSrc).toContain("tl.seg.migrate =");
+    // 段名必须进了输出顺序表，否则 timingHeaders 会把它当作「未知段」排到最后
+    expect(timingSrc).toContain('"migrate"');
+  });
+
+  it("迁移必须在鉴权之前、且在计时起点之后（顺序错了 migrate 段就没意义）", () => {
+    const t0At = routerSrc.indexOf('c.set("wb2aT0"');
+    const migAt = routerSrc.indexOf("await autoMigrate(c.env)");
+    expect(t0At).toBeGreaterThan(-1);
+    expect(migAt).toBeGreaterThan(-1);
+    // t0 先打点，迁移后跑 —— 否则 total 里根本不含迁移耗时
+    expect(t0At).toBeLessThan(migAt);
   });
 
   it("全链路只用 now()，不许混 Date.now()（两种时钟相减会让归因数据报废）", () => {
