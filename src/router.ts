@@ -8,7 +8,7 @@ import { registerLogin } from "./routes/login";
 import { registerAdmin } from "./routes/admin";
 import type { CtxVars } from "./types";
 import { now } from "./services/timing";
-import { isColdStart, markServed, uptimeMs } from "./services/boot";
+import { uptimeMs, newCacheProbe, cacheStatus, type CacheProbe } from "./services/boot";
 import { ensureSchema } from "./storage/migrate";
 
 // 会碰 D1 的路径才需要等迁移；纯静态资源不受影响（与 index.ts 的路由判定同源）。
@@ -114,9 +114,14 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
   // sha256 是纯 CPU（crypto.subtle.digest，亚毫秒），必须先算出来才能查子密钥；
   // 它不是 IO，放在并行之前不占用往返。
   const hash = isSubKey ? await sha256Hex(token) : "";
+  // 缓存命中探针：让 X-Auth-Cache / X-Models-Cache 能回答「这次请求在关键路径上
+  // 付了几次后端往返」，把冷启动从「isolate 刚起来」和「cache TTL 到期」两成因分开。
+  const probe = c.get("cacheProbe") as CacheProbe | undefined;
   const [cfg, subKeyRow] = await Promise.all([
-    getConfig(c.env),
-    isSubKey ? loadKeyByHash(c.env, hash).catch(() => null) : Promise.resolve(null),
+    getConfig(c.env, { onCache: (h) => probe?.config.push(h) }),
+    isSubKey
+      ? loadKeyByHash(c.env, hash, { onCache: (h) => probe?.key.push(h) }).catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   if (isPanel) {
@@ -200,10 +205,10 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     // 计时起点：这是**最先注册**的中间件，它的入口时刻最贴近「请求到达 Workers」，
     // 晚于此处的任何打点都会漏掉鉴权 / 路由匹配的耗时。
     c.set("wb2aT0", now());
-    // 冷启动快照必须在 await next() **之前**取：并发的首批请求要一起看到 true
-    // （它们同样在付 isolate 启动成本），等第一个请求走完才翻假。
-    const cold = isColdStart();
-    markServed();
+    // 每请求一份的缓存命中探针：鉴权中间件与 proxy 都会往里填 hit/miss，
+    // 最后在这里汇总成 X-Auth-Cache / X-Models-Cache。
+    const probe = newCacheProbe();
+    c.set("cacheProbe", probe);
     await next();
     const h = c.res?.headers;
     if (!h) return;
@@ -216,12 +221,28 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
       // ——头在 HTTP 层面明明存在，抓包看得到、代码读不到。
       h.set(
         "Access-Control-Expose-Headers",
-        "Server-Timing, X-WB2A-Timing, X-WB2A-Routed-Model, X-Cold-Start, X-Worker-Uptime",
+        "Server-Timing, X-WB2A-Timing, X-WB2A-Routed-Model, X-Cold-Start, X-Worker-Uptime, X-Auth-Cache, X-Models-Cache",
       );
-      // 冷启动标记：让「这次慢是不是冷启动」不再靠猜。uptime 是本 isolate 存活
-      // 毫秒，用来判断这个 isolate 是刚起来的还是跑了很久的。
-      h.set("X-Cold-Start", cold ? "1" : "0");
+      // X-Worker-Uptime：本 isolate 已存活毫秒（= Date.now() - 模块加载时刻）。
+      // 用来判断这个 isolate 是刚起来的还是跑了很久的——这是区分三种状态的关键轴之一。
       h.set("X-Worker-Uptime", String(Math.round(uptimeMs())));
+      // 缓存命中观测：把「isolate 刚起来」与「cache TTL 到期」两种冷启动成因分开，
+      // 否则两者混在一起 p95 没有统计意义（见 services/boot.ts 注释）。
+      const authHit = (() => {
+        const list = [cacheStatus(probe.config), cacheStatus(probe.key)].filter(
+          (x): x is "hit" | "miss" => x !== null,
+        );
+        return list.length ? (list.includes("miss") ? "miss" : "hit") : null;
+      })();
+      const modelsHit = cacheStatus(probe.models);
+      if (authHit || modelsHit) {
+        if (authHit) h.set("X-Auth-Cache", authHit);
+        if (modelsHit) h.set("X-Models-Cache", modelsHit);
+        // X-Cold-Start 重写为「是否发生过缓存 miss」：1 = 本次请求关键路径至少付了
+        // 一次后端往返。这比「isolate 首请求」更有用——后者和缓存实际命中无关（见分析）。
+        // 只在确有缓存读发生的路径上输出，避免静态/健康检查冒出无意义字段。
+        h.set("X-Cold-Start", authHit === "miss" || modelsHit === "miss" ? "1" : "0");
+      }
     } catch {
       // 静态资源由 env.ASSETS.fetch 返回，其 headers 带 immutable guard，set 会抛
       // TypeError。静态页同源访问本就不需要 CORS，尽力而为即可，不必为它重建
@@ -235,10 +256,10 @@ export function buildApp(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     if (needsSchema(c.req.path)) {
       const t = now();
       await autoMigrate(c.env);
-      const ms = now() - t;
-      // 只有真付了成本才记段：热启动 await 的是已 resolve 的 promise（约 0ms），
-      // 无条件设进去会让每个响应都多一个恒为 0 的字段，把真正的冷启动现场淹掉。
-      if (ms > 0.5) c.set("wb2aMigrateMs", ms);
+      // 不论是否命中版本门都记：热启动 await 的是已 resolve 的 promise（≈0ms），
+      // 输出 migrate;dur=0 而不是省略——否则版本门生效后的「零成本」现场反而看不见，
+      // 无法确认优化真的生效（见分析：migrate 跳过时也要输出 migrate;dur=0）。
+      c.set("wb2aMigrateMs", now() - t);
     }
     await next();
   });

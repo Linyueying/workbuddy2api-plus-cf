@@ -8,6 +8,7 @@ import { responsesToChat, anthropicToChat } from "../services/compat";
 import { VirtualIDs } from "../services/autoroute";
 import { healthReport } from "../services/health";
 import { newTimeline, markSince, now } from "../services/timing";
+import type { CacheProbe } from "../services/boot";
 import type { CtxVars } from "../types";
 
 /**
@@ -66,7 +67,7 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
     const req = c.req.raw;
     // 系统提示词改写不在这里做：它必须与降级重试共享同一份状态，由 proxyChat
     // 在轮转循环内统一裁决（对齐 Go handler.go 的改写位置）。
-    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c), tl);
+    return proxyChat(c.env, req, model, body, clientIP(req, cfg.trust_proxy), req.headers.get("user-agent") || "", c.get("keyRow") ?? null, waitUntilOf(c), tl, c.get("cacheProbe") as CacheProbe | undefined);
   });
 
   // /v1/responses (OpenAI Responses API -> chat)

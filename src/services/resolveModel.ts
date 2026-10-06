@@ -135,12 +135,16 @@ export async function listModels(env: Env, realm: Realm, auth?: any): Promise<an
  * 用途：虚拟模型名与上游同名时的让位判定（override=true 才接管），
  * 对齐 server.realModelExists。
  */
-export async function realModelExists(env: Env, name: string): Promise<boolean> {
+export async function realModelExists(
+  env: Env,
+  name: string,
+  opts?: { onCache?: (hit: boolean) => void },
+): Promise<boolean> {
   const { realm, model } = stripRealm(name);
   if (!model) return false;
   // 走进程内快照：本函数每请求都被 proxy 调用一次，而这个 key 同请求里
   // upstream.effortTables 还要再读一遍。见 services/models-snapshot.ts。
-  const cached = await modelsSnapshot(env, realm);
+  const cached = await modelsSnapshot(env, realm, { onCache: opts?.onCache });
   if (!cached?.length) return false;
   return cached.some((m: any) => m?.id === (realm === "global" ? "global:" : "cn:") + model);
 }

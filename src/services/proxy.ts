@@ -11,6 +11,7 @@ import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
 import { insertRequestLog } from "../storage/d1";
 import { newTimeline, markSince, addElapsed, withTiming, headersWithTiming, now, type Timeline } from "./timing";
+import type { CacheProbe } from "./boot";
 import type { Usage } from "./sse";
 
 // 反向代理 + 多账号轮转 + 模型编排（替代 internal/server/handler.go 的
@@ -160,10 +161,18 @@ export async function proxyChat(
    * 缺省自建一张：单测直连本函数时不会崩，只是 total 会偏小。
    */
   tl: Timeline = newTimeline(),
+  /**
+   * probe 每请求一份的缓存命中探针（见 services/boot.ts）。
+   *
+   * 只用来喂 X-Auth-Cache / X-Models-Cache 这几个观测头——把「isolate 刚起来」
+   * 和「cache TTL 到期」两种冷启动成因区分开。缺省留空（单测直连本函数时
+   * 不报错，只是收不到缓存命中数据）。
+   */
+  probe?: CacheProbe,
 ): Promise<Response> {
   const tCfg = now();
   await primeConfig(env);
-  const cfg = await getConfig(env);
+  const cfg = await getConfig(env, { onCache: (h) => probe?.config.push(h) });
   markSince(tl, "cfg", tCfg);
   const autoCfg = autoConfigOf(cfg);
   const start = Date.now();
@@ -189,7 +198,7 @@ export async function proxyChat(
     return p;
   });
   const tModels = now();
-  const existsP = realModelExists(env, rawModel)
+  const existsP = realModelExists(env, rawModel, { onCache: (h) => probe?.models.push(h) })
     .catch(() => false)
     .then((exists) => {
       tl.seg.models = Math.max(0, now() - tModels);

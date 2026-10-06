@@ -12,6 +12,8 @@ import {
 import { Hono } from "hono";
 import { buildApp } from "../src/router";
 import { invalidateConfig } from "../src/config";
+import { invalidateKeyCache } from "../src/services/apikeys";
+import { invalidateModelsSnapshot } from "../src/services/models-snapshot";
 import { proxyChat, openAIError } from "../src/services/proxy";
 import type { Env } from "../worker-configuration.d.ts";
 import { readFileSync } from "node:fs";
@@ -312,6 +314,44 @@ describe("端到端：中间件链把计时接通", () => {
     const expose = res.headers.get("Access-Control-Expose-Headers") ?? "";
     expect(expose).toContain("X-Cold-Start");
     expect(expose).toContain("X-Worker-Uptime");
+  });
+
+  it("缓存命中头：首次请求走后端(miss)，同 isolate 二次命中(hit)", async () => {
+    vi.stubGlobal("fetch", mockOK());
+    const env = mkHttpEnv();
+    await env.WB2A_CONFIG.put("config", JSON.stringify({ api_key: "sk-main" }));
+    // 复位全部模块级缓存，保证「首次请求」真的是 miss，二次才是 hit
+    invalidateConfig();
+    invalidateKeyCache();
+    invalidateModelsSnapshot();
+
+    const a = new Hono<{ Bindings: Env }>();
+    buildApp(a as any);
+    const req = (auth: string) =>
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${auth}` },
+        body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+    // 第一次：冷缓存，config(KV) / key(D1) / models(KV) 三个读全 miss
+    const r1 = await a.fetch(req("wbk_abc"), env);
+    expect(r1.status).toBe(200);
+    expect(r1.headers.get("X-Auth-Cache")).toBe("miss");
+    expect(r1.headers.get("X-Models-Cache")).toBe("miss");
+    // X-Cold-Start 已重写为「是否发生过缓存 miss」：全 miss → 1
+    expect(r1.headers.get("X-Cold-Start")).toBe("1");
+
+    // 第二次：同 isolate，模块级缓存已热，应全部 hit
+    const r2 = await a.fetch(req("wbk_abc"), env);
+    expect(r2.status).toBe(200);
+    expect(r2.headers.get("X-Auth-Cache")).toBe("hit");
+    expect(r2.headers.get("X-Models-Cache")).toBe("hit");
+    expect(r2.headers.get("X-Cold-Start")).toBe("0");
+
+    const expose = r2.headers.get("Access-Control-Expose-Headers") ?? "";
+    expect(expose).toContain("X-Auth-Cache");
+    expect(expose).toContain("X-Models-Cache");
   });
 });
 

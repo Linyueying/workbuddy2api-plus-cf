@@ -347,10 +347,16 @@ async function loadConfig(env: Env): Promise<Config> {
  * 一致性由两处兜住：面板保存配置时 saveConfig 会清缓存（改的那个 isolate 立即可
  * 见）；其余 isolate 最多滞后一个刷新周期。这对「改完配置立刻生效」完全够用。
  */
-export async function getConfig(env: Env): Promise<Config> {
+export async function getConfig(
+  env: Env,
+  opts?: { onCache?: (hit: boolean) => void },
+): Promise<Config> {
   const nowTs = Date.now();
   if (cache) {
-    if (nowTs - cache.ts < CONFIG_FRESH_MS) return cache.cfg;
+    if (nowTs - cache.ts < CONFIG_FRESH_MS) {
+      opts?.onCache?.(true);
+      return cache.cfg;
+    }
     if (nowTs - cache.ts < CONFIG_STALE_MS) {
       // 后台刷新不去 await：这是本函数存在的全部意义——把 KV 往返从首字节路径上
       // 移除。refreshing 去重，避免陈旧窗口内的 N 个并发请求打出 N 次 KV 读。
@@ -366,12 +372,19 @@ export async function getConfig(env: Env): Promise<Config> {
             refreshing = null;
           });
       }
+      // 本请求未 await KV（旧值直接返回 + 后台刷新），视为命中。
+      opts?.onCache?.(true);
       return cache.cfg;
     }
-    // 超过 STALE：不敢再用，回落同步读。
-    return await refreshNow(env);
+    // 超过 STALE：不敢再用，回落同步读（真·miss，付了 KV 往返）。
+    const cfg = await refreshNow(env);
+    opts?.onCache?.(false);
+    return cfg;
   }
-  return await refreshNow(env);
+  // 无缓存：冷启动必经，必须 await（否则拿不到 api_key 全站 401）。
+  const cfg = await refreshNow(env);
+  opts?.onCache?.(false);
+  return cfg;
 }
 
 /** refreshNow 同步读一次并落缓存（冷启动 / 数据过旧时的回落路径）。 */

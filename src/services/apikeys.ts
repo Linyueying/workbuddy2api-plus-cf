@@ -292,9 +292,16 @@ let keyCache: Map<string, { ts: number; row: ApiKeyRow | null }> = new Map();
  * 与直接调 getKeyByHash 的唯一差别就是这层缓存；其余语义（查无此钥返回 null）
  * 完全一致。管理面读写路径**不要**用它——改完立刻要看到的必须是真实现场。
  */
-export async function loadKeyByHash(env: Env, keyHash: string): Promise<ApiKeyRow | null> {
+export async function loadKeyByHash(
+  env: Env,
+  keyHash: string,
+  opts?: { onCache?: (hit: boolean) => void },
+): Promise<ApiKeyRow | null> {
   const hit = keyCache.get(keyHash);
-  if (hit && Date.now() - hit.ts < KEY_CACHE_TTL_MS) return hit.row;
+  if (hit && Date.now() - hit.ts < KEY_CACHE_TTL_MS) {
+    opts?.onCache?.(true);
+    return hit.row;
+  }
   // 查失败**不入缓存**：把一次 D1 抖动固化成 60s 的「密钥不存在」会把正常流量
   // 误伤成 401。宁可下次再查一次，也不要让网络抖动变成权限判决。
   let row: ApiKeyRow | null;
@@ -305,6 +312,7 @@ export async function loadKeyByHash(env: Env, keyHash: string): Promise<ApiKeyRo
   }
   if (keyCache.size >= KEY_CACHE_MAX) keyCache.clear(); // 满了整体清，简单可预测
   keyCache.set(keyHash, { ts: Date.now(), row });
+  opts?.onCache?.(false);
   return row;
 }
 

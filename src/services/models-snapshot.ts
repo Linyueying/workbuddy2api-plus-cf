@@ -41,10 +41,17 @@ export function invalidateModelsSnapshot(): void {
  * modelsSnapshot 取该 realm 的模型目录（只读 KV 缓存，不触发任何上游探测）。
  * 未就绪返回空数组——调用方按「目录不可用」处理，与既有语义一致。
  */
-export async function modelsSnapshot(env: Env, realm: Realm): Promise<any[]> {
+export async function modelsSnapshot(
+  env: Env,
+  realm: Realm,
+  opts?: { onCache?: (hit: boolean) => void },
+): Promise<any[]> {
   const key = realm === "global" ? "gl" : "cn";
   const nowMs = Date.now();
-  if (snapStore.ts[key] && nowMs - snapStore.ts[key] < SNAPSHOT_TTL_MS) return snapStore.data[key];
+  if (snapStore.ts[key] && nowMs - snapStore.ts[key] < SNAPSHOT_TTL_MS) {
+    opts?.onCache?.(true);
+    return snapStore.data[key];
+  }
   const kv = cacheKV(env);
   // 只取当前 realm 的那一个 key：见 snapStore 的注释。
   const raw = await kvGetJSON<any[]>(kv, realm === "global" ? CACHE_KEY_MODELS_GLOBAL : CACHE_KEY_MODELS).catch(
@@ -52,5 +59,6 @@ export async function modelsSnapshot(env: Env, realm: Realm): Promise<any[]> {
   );
   snapStore.data[key] = Array.isArray(raw) ? raw : [];
   snapStore.ts[key] = nowMs;
+  opts?.onCache?.(false);
   return snapStore.data[key];
 }

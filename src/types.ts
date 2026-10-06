@@ -1,5 +1,7 @@
 // 全局共享类型（跨层契约：账号凭证 / 池内状态 / D1 行 / 上游错误分类）。
 
+import type { CacheProbe } from "./services/boot";
+
 /** Realm 上游域：cn = 国内版（copilot.tencent.com），global = 国际版（workbuddy.ai）。 */
 export type Realm = "cn" | "global";
 
@@ -221,12 +223,15 @@ export interface RequestLogEntry {
  * 计时三字段（wb2aT0 / wb2aMigrateMs / wb2aAuthMs）是 Server-Timing 响应头的
  * 数据源，见 services/timing.ts：
  *   wb2aT0         请求进入网关的墙钟（由最外层 CORS 中间件打点，早于一切）
- *   wb2aMigrateMs  D1 自动迁移耗时（毫秒）。**只在本次请求真的付了迁移成本时
- *                  才设**——热启动 await 的是已 resolve 的 promise，约 0ms，
- *                  设进来只会让每个响应都平添一个恒为 0 的噪声字段。
+ *   wb2aMigrateMs  D1 自动迁移耗时（毫秒）。**每次需要迁移的路径都设**——热启动
+ *                  await 的是已 resolve 的 promise，约 0ms，输出 migrate;dur=0
+ *                  而非省略，以便确认版本门生效（见 services/boot.ts 的观测说明）。
  *   wb2aAuthMs     鉴权耗时（毫秒）。**只有子密钥路径会设**——管理员走的是 Secret
  *                  比对，耗时在微秒级，设进来只会让响应头多一个恒为 0 的字段。
- *                  缺失即表示「鉴权不是瓶颈」，下游据此省略 auth 段。 */
+ *                  缺失即表示「鉴权不是瓶颈」，下游据此省略 auth 段。
+ *   cacheProbe    每请求一份的缓存命中探针（见 services/boot.ts）。由 CORS 中间件
+ *                  建好，鉴权与 proxy 通过各缓存读的 onCache 回调填 hit/miss，
+ *                  最后汇总成 X-Auth-Cache / X-Models-Cache / X-Cold-Start。 */
 export interface CtxVars {
   role: "admin" | "key";
   models: string[] | null;
@@ -234,4 +239,5 @@ export interface CtxVars {
   wb2aT0?: number;
   wb2aMigrateMs?: number;
   wb2aAuthMs?: number;
+  cacheProbe?: CacheProbe;
 }
