@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { getCreditsDetailed, getCredits, creditPackages, isAlreadyCheckin, primeConfig } from "../src/services/upstream";
+import { displayName, toAccountBalance, summarizeBalance, balanceLines } from "../src/services/balance";
 import type { Env } from "../worker-configuration.d.ts";
 import type { Auth } from "../src/types";
 
@@ -268,5 +269,79 @@ describe("isAlreadyCheckin", () => {
     expect(isAlreadyCheckin({ code: 14001, msg: "今日已签到" })).toBe(true);
     expect(isAlreadyCheckin({ code: 0, msg: "今天已签到" })).toBe(true);
     expect(isAlreadyCheckin({ code: 0, msg: "ok" })).toBe(false);
+  });
+});
+
+describe("客户端余额视图（/v1/credits 支撑）", () => {
+  /** 造一条 CreditAccount（credit.ts 的运营口径结构）。 */
+  function acct(over: Partial<any> = {}) {
+    return {
+      uid: "u_1", nickname: "Tom", realm: "cn",
+      remain: 100, used: 20, size: 120, packages: 1, ok: true,
+      ...over,
+    };
+  }
+
+  it("displayName 优先昵称，缺昵称时退回 uid 前 8 位", () => {
+    expect(displayName("Tom", "u_1234567890")).toBe("Tom");
+    // 与 prettyReport 的取名口径一致，三处对同一个号显示同一个名字
+    expect(displayName("", "u_1234567890")).toBe("u_123456");
+    expect(displayName("", "short")).toBe("short");
+  });
+
+  it("toAccountBalance 把 remain 映射为 amount，失败号为 null 不折成 0", () => {
+    expect(toAccountBalance(acct()).amount).toBe(100);
+    // 关键：失败号必须是 null。折成 0 会让前端把「查询失败」误读成「余额花光了」
+    const bad = toAccountBalance(acct({ remain: null, ok: false, error: "http 401" }));
+    expect(bad.amount).toBe(null);
+    expect(bad.ok).toBe(false);
+    expect(bad.error).toBe("http 401");
+  });
+
+  it("余额恰好为 0 与查询失败必须可区分", () => {
+    const zero = toAccountBalance(acct({ remain: 0 }));
+    const failed = toAccountBalance(acct({ remain: null, ok: false }));
+    expect(zero.amount).toBe(0);
+    expect(zero.ok).toBe(true);
+    expect(failed.amount).toBe(null);
+    expect(failed.ok).toBe(false);
+  });
+
+  it("summarizeBalance 只累加成功的号，失败号不计入总数", () => {
+    // 对齐 aggregateCredits 口径：失败若当 0 累加，总数会静默变小
+    const v = summarizeBalance([
+      toAccountBalance(acct({ uid: "a", remain: 100 })),
+      toAccountBalance(acct({ uid: "b", remain: null, ok: false, error: "boom" })),
+      toAccountBalance(acct({ uid: "c", remain: 50 })),
+    ]);
+    expect(v.total).toBe(150);
+    expect(v.ok).toBe(2);
+    expect(v.count).toBe(3);
+  });
+
+  it("balanceLines 渲染成「名字: 余额」逐行格式（用户指定格式）", () => {
+    const v = summarizeBalance([
+      toAccountBalance(acct({ uid: "a", nickname: "账号a", remain: 12.5 })),
+      toAccountBalance(acct({ uid: "b", nickname: "账号b", remain: 100 })),
+    ]);
+    expect(balanceLines(v)).toEqual(["账号a: 12.50", "账号b: 100.00"]);
+  });
+
+  it("balanceLines 保留失败账号可见性（不要静默省略）", () => {
+    // 只列成功号会让「少了一个号」看起来像压根没配置过
+    const v = summarizeBalance([
+      toAccountBalance(acct({ nickname: "账号a", remain: 10 })),
+      toAccountBalance(acct({ nickname: "账号b", remain: null, ok: false, error: "http 502" })),
+    ]);
+    const lines = balanceLines(v);
+    expect(lines[0]).toBe("账号a: 10.00");
+    expect(lines[1]).toContain("账号b");
+    expect(lines[1]).toContain("http 502");
+  });
+
+  it("空池不炸：total 0 / count 0 / lines 空", () => {
+    const v = summarizeBalance([]);
+    expect(v).toEqual({ total: 0, ok: 0, count: 0, accounts: [] });
+    expect(balanceLines(v)).toEqual([]);
   });
 });

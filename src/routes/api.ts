@@ -7,6 +7,7 @@ import { modelsForApi } from "../services/resolveModel";
 import { responsesToChat, anthropicToChat } from "../services/compat";
 import { VirtualIDs } from "../services/autoroute";
 import { healthReport } from "../services/health";
+import { fetchAccountBalances, summarizeBalance, balanceLines } from "../services/balance";
 import { newTimeline, markSince, now } from "../services/timing";
 import type { CacheProbe } from "../services/boot";
 import type { CtxVars } from "../types";
@@ -116,6 +117,38 @@ export function registerApi(app: Hono<{ Bindings: Env; Variables: CtxVars }>) {
       data.push({ id, object: "model", created: 0, owned_by: "workbuddy", virtual: true });
     }
     return c.json({ object: "list", data });
+  });
+
+  // /v1/credits —— 余额查询（外部客户端 / 余额插件消费）
+  //
+  // 与 /panel/api/credits 的分工：那个是 admin 密钥访问的运营日报（含 used/size
+  // 与失败清单，走 prettReport 的多行格式）；本接口是**调用密钥 / 子密钥**可达的
+  // 客户端余额视图，回答「还剩多少」，并按 `<名字>: <余额>` 逐账号列出。
+  //
+  // 响应里同时给两种形态，适配不同消费方：
+  // - data.total_usage：单值，供只认一个数字的余额插件直接读（对齐截图配置的
+  //   「结果 JSON 键 = data.total_usage」）。语义是**剩余积分总量**。
+  // - data.lines / data.accounts：逐账号明细，供 App 自己渲染列表。
+  //
+  // 注意 realm 默认不过滤（查全池）。传 ?realm=cn|global 可只查单区。
+  app.get("/v1/credits", async (c) => {
+    const realm = c.req.query("realm") || undefined;
+    // 只允许 cn / global，其余值当作「不过滤」，避免脏参数把查询范围意外收窄成空。
+    const scope = realm === "cn" || realm === "global" ? realm : undefined;
+    const accounts = await fetchAccountBalances(c.env, scope);
+    const view = summarizeBalance(accounts);
+    const data = {
+      // 结果 JSON 键的落点：剩余积分总量（只计查询成功的账号）。
+      total_usage: view.total,
+      // 便于插件同时展示「有几个号能用」，也为后续可能的展示留扩展位。
+      total: view.total,
+      ok: view.ok,
+      count: view.count,
+      lines: balanceLines(view),
+      accounts: view.accounts,
+    };
+    // 兼容两种包裹习惯：OpenAI 风格走顶层 data；插件若按 {ok,data} 取也读得到。
+    return c.json({ object: "credits", ts: Math.floor(Date.now() / 1000), data, ok: true });
   });
 
   // /status
