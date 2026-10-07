@@ -72,10 +72,25 @@ function memD1(seed: any[]) {
   };
 }
 
+/**
+ * 日志行的时间戳一律相对「当下」生成，不能写死绝对时刻。
+ *
+ * 曾经这里钉的是 1791200000000（2026-10-05），而 /panel/api/request_metrics
+ * 的默认窗口是 hours=24 —— 传了 hours 才算范围，from = now-24h 参与 SQL 过滤。
+ * 于是只要真实时钟走过那条数据一天，整批行就落到窗口外被滤光，completed 恒 0，
+ * 测试随日历必然转红（本地隔天复现、CI 上莫名其妙挂掉，都是这个成因）。
+ *
+ * 改为 now 前推若干秒/分：三条行仍保持 10s 间隔的先后关系，且恒定落在任一
+ * 合理窗口内。断言里改用这些常量而非字面量，避免两处各写一遍又漂移。
+ */
+const T0 = Date.now() - 60_000; // 一分钟前，稳在 24h / 1h 窗口内
+const T1 = T0 + 10_000;
+const T2 = T0 + 20_000;
+
 const ROWS = [
-  { id: 10, ts: 1791200000000, channel: "chat", outcome: "success", model: "cn:hy3", uid: "uid-aaaabbbbcccc1111", status: 200, ms: 1200, prompt_tokens: 100, completion_tokens: 200, credits: 0.5 },
-  { id: 11, ts: 1791200100000, channel: "chat", outcome: "http_error", model: "cn:hy3", uid: "uid-aaaabbbbcccc1111", status: 502, ms: 300, prompt_tokens: 0, completion_tokens: 0, credits: 0 },
-  { id: 12, ts: 1791200200000, channel: "sys", outcome: "interrupted", model: null, uid: null, status: 0, ms: 50, prompt_tokens: 0, completion_tokens: 0, credits: 0 },
+  { id: 10, ts: T0, channel: "chat", outcome: "success", model: "cn:hy3", uid: "uid-aaaabbbbcccc1111", status: 200, ms: 1200, prompt_tokens: 100, completion_tokens: 200, credits: 0.5 },
+  { id: 11, ts: T1, channel: "chat", outcome: "http_error", model: "cn:hy3", uid: "uid-aaaabbbbcccc1111", status: 502, ms: 300, prompt_tokens: 0, completion_tokens: 0, credits: 0 },
+  { id: 12, ts: T2, channel: "sys", outcome: "interrupted", model: null, uid: null, status: 0, ms: 50, prompt_tokens: 0, completion_tokens: 0, credits: 0 },
 ];
 
 function mkEnv(rows: any[]) {
@@ -121,7 +136,7 @@ describe("运行日志页：请求记录表字段归一", () => {
     const j: any = await res.json();
     expect(j.entries).toHaveLength(3);
     const e = j.entries.find((x: any) => x.request_id === 10);
-    expect(e.time).toBe(1791200000000);
+    expect(e.time).toBe(T0);
     expect(e.account).toBe("uid-aaaabbbbcccc1111"); // uid → account
     expect(e.duration_ms).toBe(1200); // ms → duration_ms
     expect(e.request_id).toBe(10); // id → request_id
