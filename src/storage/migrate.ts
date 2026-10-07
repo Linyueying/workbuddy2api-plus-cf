@@ -98,7 +98,7 @@ const COLS_0002: { name: string; ddl: string }[] = [
 ];
 
 // 0004：子密钥展示掩码（与 migrations/0004_apikey_prefix.sql 保持同步）。
-// Go apikeys.Key.Prefix 存的是**明文前 12 字符**，供列表页显示 `wbk_1a2b3c…`，
+// Go apikeys.Key.Prefix 存的是**明文前 12 字符**，供列表页显示 `sk-1a2b3c…`，
 // 既不落明文也让管理员能认出是哪一把。CF 此前缺这一列，列表那格恒为空。
 const COLS_0004: { name: string; ddl: string }[] = [
   { name: "prefix", ddl: "prefix TEXT NOT NULL DEFAULT ''" },

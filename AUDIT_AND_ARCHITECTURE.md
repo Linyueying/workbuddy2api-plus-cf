@@ -37,7 +37,7 @@
 | GET | `/` | — | 302 → `/panel/` | — |
 | — | `/panel/*` | — | 转发给面板 handler（见 1.2） | — |
 
-> 子密钥 `wbk_` 前缀：在 `withAuth` 中优先判定（命中 `apikeys.Store` 则放行，不再比管理员 api_key）。`/v1/models` 仅下发该密钥白名单内的模型。
+> 子密钥 `sk-` 前缀：在 `withAuth` 中优先判定（命中 `apikeys.Store` 则放行，不再比管理员 api_key）。`/v1/models` 仅下发该密钥白名单内的模型。
 
 ### 1.2 管理面板 API（`internal/panel/panel.go`，`routes()`）
 
@@ -395,7 +395,7 @@ workbuddy2api-pages/
 ### 7.5 关键设计点（确保前端零改动）
 
 - **路径完全一致**：`/v1/*`、`/panel/*` 原样保留；`_worker.js` 把 `/panel/` 静态资源走 `env.ASSETS.fetch`，`/panel/api/*` 与 `/v1/*` 走 Hono/PoolDO。
-- **鉴权一致**：面板与 API 均 `Authorization: Bearer <api_key>`（或 `wbk_` 子密钥），与原 `withAuth` 同口径。
+- **鉴权一致**：面板与 API 均 `Authorization: Bearer <api_key>`（或 `sk-` 子密钥），与原 `withAuth` 同口径。
 - **响应字段一致**：`/status`、`/panel/api/overview`、`/v1/models` 的字段名逐字保留（前端靠这些字段渲染）。
 - **错误信封一致**：`{error:{message,type:"api_error",code,gateway_hint?}}`，错误 `code` 名（如 `content_blocked`、`prompt_too_long`、`upstream_credits_exhausted`）逐字保留。
 

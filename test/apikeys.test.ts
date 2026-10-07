@@ -39,8 +39,8 @@ function key(over: Partial<ApiKeyRow> = {}): ApiKeyRow {
 }
 
 describe("常量与归一", () => {
-  it("PREFIX 是 wbk_", () => {
-    expect(PREFIX).toBe("wbk_");
+  it("PREFIX 是 sk-", () => {
+    expect(PREFIX).toBe("sk-");
   });
 
   it("normRealm 只认 cn/global，其余（含空）当不限", () => {

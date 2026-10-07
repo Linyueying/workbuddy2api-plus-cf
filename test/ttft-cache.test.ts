@@ -49,7 +49,7 @@ beforeEach(() => {
 
 describe("C2 子密钥内存缓存", () => {
   const row = {
-    id: "k1", key_hash: "h1", name: "n", prefix: "wbk_x", models: "[]", created_at: 0, last_used: 0,
+    id: "k1", key_hash: "h1", name: "n", prefix: "sk-x", models: "[]", created_at: 0, last_used: 0,
     enabled: 1, expires_at: 0, realm: "", ip_allowlist: "[]", max_ips: 0, ips: "[]", last_ip: "",
     req_count: 0, quota: 0, used_tokens: 0, quota_credit: 0, used_credit: 0, seq: 1,
   };

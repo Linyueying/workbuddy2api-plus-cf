@@ -19,6 +19,7 @@ import {
   insertKey,
   patchKey,
   deleteKey,
+  purgeLegacyKeys,
   maxKeySeq,
   quotaUsage,
   run,
@@ -27,7 +28,7 @@ import { getUsage } from "../storage/usage";
 // 子密钥内存缓存的失效钩子：管理面每改一次密钥行都必须调它。
 // 否则「停用 / 改配额 / 清零用量 / 轮换」会被隔离内存里的旧行挡住最长 30s
 // ——其中轮换尤其严重：旧明文在缓存有效期内仍能通过鉴权，等于轮换没有立即生效。
-import { invalidateKeyCache } from "../services/apikeys";
+import { invalidateKeyCache, PREFIX } from "../services/apikeys";
 import { kvGetJSON, CACHE_KEY_OUTPUT_PROBES, cacheKV } from "../storage/kv";
 import { forEachAccount, runCreditReport, runTrialBatch, prettyReport } from "../services/tasks";
 import { creditPackages, getCredits } from "../services/upstream";
@@ -127,13 +128,13 @@ async function accountUsageByUid(env: Env, hours = ACCT_USAGE_HOURS): Promise<Ma
 function genKey(): string {
   const b = new Uint8Array(24);
   crypto.getRandomValues(b);
-  return "wbk_" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return "sk-" + [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 /**
  * keyPrefix 取明文前 12 字符做展示掩码（对齐 Go apikeys 里 `plain[:12]`）。
  *
- * 12 这个长度是刻意选的：够露出 `wbk_` + 足够区分同一账号下的多把钥匙，
+ * 12 这个长度是刻意选的：够露出 `sk-` + 足够区分同一账号下的多把钥匙，
  * 又不足以让人拿它去猜剩下的 48 位。
  */
 function keyPrefix(plain: string): string {
@@ -142,8 +143,11 @@ function keyPrefix(plain: string): string {
 /**
  * genAdminKey 生成面板登录口令：`sk-` + base64url(18 字节随机)。
  *
- * 格式刻意对齐 Go cmd/server/config.go 的 WriteDefault（`"sk-" + base64.RawURLEncoding(18B)`），
- * 与分发给下游的 `wbk_` 子密钥在**肉眼层面**就区分得开：一个管面板，一个管调用。
+ * 格式刻意对齐 Go cmd/server/config.go 的 WriteDefault（`"sk-" + base64.RawURLEncoding(18B)`）。
+ *
+ * 与子密钥（genKey）同样是 `sk-` 开头，但两者字符集不同、且靠**路径**分流：
+ * 面板口令只在 /panel/* 被认，子密钥只在 /v1/* 被认，同一请求不会走两条分支。
+ * 面板口令用作 /v1 调用会被当作子密钥去查 D1、查不到即 401 —— 结论一致。
  */
 function genAdminKey(): string {
   const b = new Uint8Array(18);
@@ -517,6 +521,26 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     invalidateKeyCache();
     return c.json({ ok: true });
   });
+
+  // POST /panel/api/keys/purge-legacy —— 清理前缀迁移遗留的旧子密钥记录。
+  //
+  // 背景：子密钥前缀由 `wbk_` 改成了 `sk-`（为兼容客户端的密钥形状校验）。
+  // 旧记录在库里**已经不可用**（鉴权只认 sk-），但它们的 prefix 列还挂着
+  // `wbk_…`，会留在列表里让管理员误以为「这把还能用」。
+  //
+  // 为什么不做成自动迁移：删数据是不可逆的破坏性动作，不该藏在每次请求都可能
+  // 触发的 ensureSchema 里。管理员可能只是想留档，必须由人显式点一下。
+  //
+  // 判据：prefix 不以当前 PREFIX 开头即视为遗留（不硬编码 "wbk_"——万一将来
+  // 前缀再改，这条清理逻辑自动跟着走，不会留下第二个硬编码的坑）。
+  app.post("/panel/api/keys/purge-legacy", async (c) => {
+    const removed = await purgeLegacyKeys(c.env, PREFIX).catch(() => -1);
+    if (removed < 0) return c.json({ ok: false, error: "purge failed" }, 500);
+    // 整表删了一批行，进程内那份密钥缓存整体作废（无法逐条精确失效）。
+    invalidateKeyCache();
+    return c.json({ ok: true, removed, prefix: PREFIX });
+  });
+
   // POST /reset 语义**必须与 Go 一致**：清零已用额度，而不是换密钥
   //（Go internal/panel/keys.go 的 keysReset 调的是 ResetUsage）。
   // 此前这里做了密钥轮换，而前端按钮文案写的是「重置用量统计」——管理员以为

@@ -961,7 +961,7 @@ function pickUsage(cur, u) {
 |---|---|---|
 | `cfg.api_key` | 调用主钥匙，全权放行 `/v1/*` | `authMiddleware` |
 | `cfg.admin_key` | 面板登录口令，**只进 `/panel/`** | `authMiddleware` |
-| `wbk_*` 子密钥 | 分发密钥（带配额/IP/白名单） | `authMiddleware` + `proxyChat` |
+| `sk-*` 子密钥 | 分发密钥（带配额/IP/白名单） | `authMiddleware` + `proxyChat` |
 
 ```ts
 if (isPanel) {
@@ -970,7 +970,7 @@ if (isPanel) {
                            : !!(cfg.api_key && timingSafeEqual(token, cfg.api_key));
   ...
 }
-// 接口凭据：只认 api_key 与 wbk_ 子密钥，admin_key 在此一律不认
+// 接口凭据：只认 api_key 与 sk- 子密钥，admin_key 在此一律不认
 ```
 
 > **这是「登录与调用分离」的实质所在：面板口令泄露也换不来一次模型调用。**
@@ -1062,7 +1062,7 @@ let keyCache = new Map<string, { ts: number; row: ApiKeyRow | null }>();
 |---|---|
 | **TTL 同时就是配额陈旧窗口** | `verifyKey` 靠行里 `used_tokens` 判额度，而 `consumeKey` 在别的 isolate 写 D1。缓存命中时看到的是旧计数，**「配额已耗尽」会晚 TTL 才拦住 → 超额放行** |
 | **刻意不采纳 60~300s** | 注释明确：这是「愿意多放行多少额度」的**经营决策，不是纯技术参数**。会让一把配额 1000 的钥匙在几分钟内超到什么程度完全不可控 |
-| **负结果也入缓存** | 否则任何人拿一个不存在的 `wbk_` 串反复打网关，就是**一条免费的 D1 放大通道** |
+| **负结果也入缓存** | 否则任何人拿一个不存在的 `sk-` 串反复打网关，就是**一条免费的 D1 放大通道** |
 | **查失败（异常）不入缓存** | 「把一次 D1 抖动固化成 60s 的『密钥不存在』会把正常流量误伤成 401。**宁可下次再查一次，也不要让网络抖动变成权限判决。**」 |
 | **键取 `sha256(token)`** | 缓存里不出现任何可还原凭据的字节 |
 

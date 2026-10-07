@@ -151,14 +151,14 @@ export interface Classified {
   rotate: boolean;
 }
 
-/** 子密钥（wbk_ 前缀）。零值 = 不受限（对齐 Go apikeys.Key 的字段默认值）。 */
+/** 子密钥（sk- 前缀）。零值 = 不受限（对齐 Go apikeys.Key 的字段默认值）。 */
 export interface ApiKeyRow {
   id: string;
   key_hash: string;
   name: string;
   /**
    * 展示掩码：明文的**前 12 字符**（对齐 Go apikeys.Key.Prefix 的 `plain[:12]`）。
-   * 目的是让列表页能显示 `wbk_1a2b3c…` —— 既不落明文，管理员又能认出是哪一把。
+   * 目的是让列表页能显示 `sk-1a2b3c…` —— 既不落明文，管理员又能认出是哪一把。
    * 该字段在密钥轮换时必须同步更新：留在旧掩码上会指向一把已失效的钥匙。
    */
   prefix: string;
@@ -216,7 +216,7 @@ export interface RequestLogEntry {
 
 /** CtxVars Hono context 变量（鉴权中间件 → 路由 handler 的共享载荷）。
  *
- *   role     "admin"（管理员总钥匙）| "key"（wbk_ 子密钥）
+ *   role     "admin"（管理员总钥匙）| "key"（sk- 子密钥）
  *   models   子密钥的模型白名单；null = 不限（管理员恒为 null）
  *   keyRow   子密钥整行（配额累加与请求级校验用）；管理员为 null
  *

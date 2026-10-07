@@ -150,6 +150,24 @@ export async function deleteKey(env: Env, id: string): Promise<void> {
   await run(env, "DELETE FROM apikeys WHERE id = ?", [id]);
 }
 
+/**
+ * purgeLegacyKeys 删除 prefix 不匹配当前前缀的遗留子密钥行，返回删除条数。
+ *
+ * 用于前缀变更（wbk_ → sk-）后清理旧记录：这些行在鉴权层已经不可用，但会
+ * 留在列表里让管理员误判「这把还能用」。
+ *
+ * prefix 为空的行走 `IS NULL OR = ''` 一并清掉——它们是更早的、连掩码都还没
+ * 落库的版本，同样不可能通过当前鉴权。
+ */
+export async function purgeLegacyKeys(env: Env, prefix: string): Promise<number> {
+  const r = await run(
+    env,
+    "DELETE FROM apikeys WHERE prefix IS NULL OR prefix = '' OR prefix NOT LIKE ?",
+    [prefix.replace(/[%_]/g, (m) => "\\" + m) + "%"],
+  );
+  return Number(r?.meta?.changes ?? 0) || 0;
+}
+
 /** maxKeySeq 当前最大创建序号（新建时 +1；同刻创建靠它分先后）。 */
 export async function maxKeySeq(env: Env): Promise<number> {
   const r = await first<any>(env, "SELECT COALESCE(MAX(seq), 0) AS s FROM apikeys");

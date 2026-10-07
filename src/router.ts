@@ -46,7 +46,7 @@ async function autoMigrate(env: Env): Promise<void> {
   }
 }
 
-// 鉴权：Bearer api_key（管理员总钥匙，全权放行）或 wbk_ 子密钥（D1 内 key_hash，
+// 鉴权：Bearer api_key（管理员总钥匙，全权放行）或 sk- 子密钥（D1 内 key_hash，
 // 带停用/过期/双配额/IP/realm/模型白名单管控）。
 //
 // 状态码分类刻意不同于普通 4xx（对齐 Go apikeys）：停用过期 403、配额用尽 429、
@@ -140,7 +140,7 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
     return next();
   }
 
-  // 接口凭据：只认调用主钥匙与 wbk_ 子密钥，**admin_key 在此一律不认**。
+  // 接口凭据：只认调用主钥匙与 sk- 子密钥，**admin_key 在此一律不认**。
   // 这是「登录与调用分离」的实质所在：面板口令泄露也换不来一次模型调用。
   if (cfg.api_key && timingSafeEqual(token, cfg.api_key)) {
     c.set("role", "admin");

@@ -197,7 +197,7 @@ function mkHttpEnv() {
   const kv = new Map<string, string>();
   // 子密钥行：verifyKey 只看 enabled / expires_at / 双配额 / IP，全给零值即放行。
   const keyRow = {
-    id: "k-1", key_hash: "h", name: "n", prefix: "wbk_x", models: "[]", created_at: 0, last_used: 0,
+    id: "k-1", key_hash: "h", name: "n", prefix: "sk-x", models: "[]", created_at: 0, last_used: 0,
     enabled: 1, expires_at: 0, realm: "", ip_allowlist: "[]", max_ips: 0, ips: "[]", last_ip: "",
     req_count: 0, quota: 0, used_tokens: 0, quota_credit: 0, used_credit: 0, seq: 1,
   };
@@ -248,7 +248,7 @@ describe("端到端：中间件链把计时接通", () => {
     const res = await a.fetch(
       new Request("https://x/v1/chat/completions", {
         method: "POST",
-        headers: { "content-type": "application/json", Authorization: "Bearer wbk_abc" },
+        headers: { "content-type": "application/json", Authorization: "Bearer sk-abc" },
         body: JSON.stringify({ model: "cn:hy3", stream: false, messages: [{ role: "user", content: "hi" }] }),
       }),
       env,
@@ -335,7 +335,7 @@ describe("端到端：中间件链把计时接通", () => {
       });
 
     // 第一次：冷缓存，config(KV) / key(D1) / models(KV) 三个读全 miss
-    const r1 = await a.fetch(req("wbk_abc"), env);
+    const r1 = await a.fetch(req("sk-abc"), env);
     expect(r1.status).toBe(200);
     expect(r1.headers.get("X-Auth-Cache")).toBe("miss");
     expect(r1.headers.get("X-Models-Cache")).toBe("miss");
@@ -343,7 +343,7 @@ describe("端到端：中间件链把计时接通", () => {
     expect(r1.headers.get("X-Cold-Start")).toBe("1");
 
     // 第二次：同 isolate，模块级缓存已热，应全部 hit
-    const r2 = await a.fetch(req("wbk_abc"), env);
+    const r2 = await a.fetch(req("sk-abc"), env);
     expect(r2.status).toBe(200);
     expect(r2.headers.get("X-Auth-Cache")).toBe("hit");
     expect(r2.headers.get("X-Models-Cache")).toBe("hit");

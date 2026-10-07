@@ -131,7 +131,7 @@ async function createKey(app: any, env: any, body: any = { name: "k1" }) {
 }
 
 describe("面板密钥：明文一次性展示", () => {
-  it("创建返回 plain，且格式与 Go 对齐（wbk_ + 48 位十六进制）", async () => {
+  it("创建返回 plain，且格式与 Go 对齐（sk- + 48 位十六进制）", async () => {
     const { DB } = memDB();
     const app = mkApp(DB);
     const env = panelEnv(DB);
@@ -140,8 +140,8 @@ describe("面板密钥：明文一次性展示", () => {
     expect(r.ok).toBe(true);
     // 前端 showIssued(r.plain) 读的就是这个字段——缺了它明文框是空的。
     expect(typeof r.plain).toBe("string");
-    expect(r.plain).toMatch(/^wbk_[0-9a-f]{48}$/); // Go: rand 24 字节 → hex → 48 字符
-    expect(r.plain.startsWith("wbk_")).toBe(true);
+    expect(r.plain).toMatch(/^sk-[0-9a-f]{48}$/); // Go: rand 24 字节 → hex → 48 字符
+    expect(r.plain.startsWith("sk-")).toBe(true);
     // 同时保留 key 字段：Go 的契约是 {"key":k,"plain":plain} 两个都给。
     expect(r.key).toBe(r.plain);
   });
@@ -162,7 +162,7 @@ describe("面板密钥：明文一次性展示", () => {
     const r = await createKey(app, panelEnv(DB));
 
     expect(rows[0].prefix).toBe(r.plain.slice(0, 12));
-    expect(rows[0].prefix.startsWith("wbk_")).toBe(true);
+    expect(rows[0].prefix.startsWith("sk-")).toBe(true);
   });
 
   it("每次创建的明文互不相同", async () => {
@@ -214,7 +214,7 @@ describe("面板密钥：reset 与 rotate 的语义分离", () => {
     );
     const j = (await res.json()) as any;
     expect(j.ok).toBe(true);
-    expect(j.plain).toMatch(/^wbk_[0-9a-f]{48}$/);
+    expect(j.plain).toMatch(/^sk-[0-9a-f]{48}$/);
     expect(j.plain).not.toBe(s.plain);
 
     expect(s.rows[0].key_hash).not.toBe(before);

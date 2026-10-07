@@ -46,9 +46,9 @@ describe("密钥明文契约（静态守卫）", () => {
     expect(calls.every((c) => /showIssued\(r\.plain/.test(c)), String(calls)).toBe(true);
   });
 
-  it("genKey 产出格式必须 anchored 在 wbk_ + hex（与 Go 的 Prefix + hex(24B) 同形）", () => {
+  it("genKey 产出格式必须 anchored 在 sk- + hex（与 Go 的 Prefix + hex(24B) 同形）", () => {
     const g = panelSrc.slice(panelSrc.indexOf("function genKey"), panelSrc.indexOf("function keyPrefix"));
-    expect(g).toContain('"wbk_"');
+    expect(g).toContain('"sk-"');
     expect(g).toMatch(/new Uint8Array\(24\)/); // Go: var buf [24]byte
   });
 

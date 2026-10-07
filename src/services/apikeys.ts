@@ -6,7 +6,7 @@ import { run, first, getKeyByHash } from "../storage/d1";
 // Touch / Consume 四段）。
 //
 // 与管理员总钥匙的关系：config.api_key 是管理员总钥匙，全权放行零回归；本模块
-// 只管 wbk_ 前缀的分发子密钥，各自带积分额度、token 额度、IP 名单、模型白名单、
+// 只管 sk- 前缀的分发子密钥，各自带积分额度、token 额度、IP 名单、模型白名单、
 // realm 归属与有效期。
 //
 // 状态码口径与 Go / workbuddy-manager 的 key 分发对齐（**分类刻意不同于普通 4xx**，
@@ -18,8 +18,18 @@ import { run, first, getKeyByHash } from "../storage/d1";
 // 落盘差异：Go 侧是 data/keys.json 原子替换 + 全局锁；这里落 D1，用带条件的
 // UPDATE 累加用量（`WHERE used_tokens + ? <= quota` 一类），天然免锁且并发安全。
 
-/** PREFIX 子密钥前缀（同时是「是否归本模块处理」的判据）。 */
-export const PREFIX = "wbk_";
+/**
+ * PREFIX 子密钥前缀（同时是「是否归本模块处理」的判据）。
+ *
+ * 历史：原为 `wbk_`（workbuddy key）。改用 `sk-` 是因为多数 OpenAI 兼容客户端
+ * 会**在前端校验密钥形状**，只放行 `sk-` 开头；`wbk_` 会被本地直接拦下，
+ * 表现为"密钥格式不对"，根本发不出请求。
+ *
+ * ⚠️ 判定条件里**不含** `isPanel` 之外的额外区分：面板登录口令（genAdminKey）
+ * 同样是 `sk-` 开头，两者靠**路径**分流（面板口令只在 /panel/* 认，子密钥只在
+ * /v1/* 认），同一请求不会同时走两条分支，故不存在歧义。
+ */
+export const PREFIX = "sk-";
 
 /**
  * timingSafeEqual 常量时间字符串比较（凭据比对专用，勿用于其它场景）。
@@ -258,7 +268,7 @@ export async function consumeKey(env: Env, id: string, credit: number, tokens: n
  * 为什么放在这里而不是 router 的调用现场：这里是密钥语义的归属地，把它和
  * verifyKey / consumeKey 放一起，失效时机（改密钥就要失效）才不会被漏掉。
  *
- * 为什么**也缓存查不到的结果**：否则任何人拿一个不存在的 wbk_ 串反复打网关，
+ * 为什么**也缓存查不到的结果**：否则任何人拿一个不存在的 sk- 串反复打网关，
  * 就是一条免费的 D1 放大通道（缓存 miss → 每次都落库）。负结果同样入 60s 缓存。
  *
  * 键取 sha256(token) 而非 token 本身：缓存里不出现任何可还原凭据的字节。
