@@ -327,6 +327,7 @@ curl -X POST https://<your-pages.dev>/panel/api/scheduler/arm -H "Authorization:
 | `POST /v1/responses` | OpenAI Responses API → chat 兼容 |
 | `POST /v1/messages` | Anthropic Messages API → chat 兼容 |
 | `GET /v1/models` | 模型目录（子密钥按白名单过滤）|
+| `GET /v1/credits` | 余额查询（剩余积分 + 逐账号清单，供外部 App / 余额插件）|
 | `GET /status` / `GET /healthz` | 池状态 / 健康检查 |
 | `POST /panel/api/login/start` `GET /panel/api/login/poll` `GET /panel/api/login/regions` | OAuth 设备流 |
 | `GET /panel/api/overview` `/logs` `/models` `/request_logs` `/usage` `/packages` | 面板数据 |
@@ -365,6 +366,72 @@ curl -sD - -o /dev/null -X POST https://<你的域名>/v1/chat/completions \
   -H "Authorization: Bearer <KEY>" -H "Content-Type: application/json" \
   -d '{"model":"cn:hy3","messages":[{"role":"user","content":"hi"}]}' | grep -i 'x-wb2a-timing\|server-timing'
 ```
+
+### 余额查询：`GET /v1/credits`
+
+给**外部客户端**（App、余额插件、状态页）用的余额接口。与面板的 `/panel/api/credits` 是两条通道，不要混：
+
+| | `GET /v1/credits` | `GET /panel/api/credits` |
+|---|---|---|
+| 鉴权 | 调用主钥匙 / `wbk_` 子密钥 | `admin_key`（管理凭据）|
+| 视角 | 客户端：**还剩多少** | 运营：remain/used/size + 失败清单 |
+| 形态 | 单值 + 逐账号行 | 全池日报（四行汇总）|
+| 典型调用方 | App、余额插件 | 面板、CLI `wb2api credit` |
+
+**接入参数**（余额插件类客户端常见三段式配置）：
+
+| 配置项 | 值 |
+|---|---|
+| API Base Url | `https://<你的域名>/v1` |
+| 余额 API 路径 | `/credits` |
+| 结果 JSON 键 | `data.total_usage` |
+
+**请求**：
+
+```bash
+# 主钥匙或子密钥均可；?realm=cn|global 可限定只查单区（省略则查全池）
+curl -s https://<你的域名>/v1/credits \
+  -H "Authorization: Bearer <KEY>" | jq
+```
+
+**响应**：
+
+```json
+{
+  "object": "credits",
+  "ts": 1791200000,
+  "ok": true,
+  "data": {
+    "total_usage": 1540,
+    "total": 1540,
+    "ok": 2,
+    "count": 2,
+    "lines": ["账号a: 1200.00", "账号b: 340.00"],
+    "accounts": [
+      { "name": "账号a", "uid": "u_aaaa1111", "realm": "cn", "amount": 1200, "ok": true },
+      { "name": "账号b", "uid": "u_bbbb2222", "realm": "cn", "amount": 340, "ok": true }
+    ]
+  }
+}
+```
+
+字段语义：
+
+| 字段 | 含义 |
+|---|---|
+| `data.total_usage` | **剩余积分总量**（只累加查询成功的账号）。余额插件读这一个键即可 |
+| `data.total` | 同上，别名，便于 `{ok,data}` 风格的客户端 |
+| `data.ok` / `data.count` | 查询成功的账号数 / 账号总数 |
+| `data.lines` | 逐账号 `名字: 余额` 行，直接可渲染 |
+| `data.accounts[].amount` | 单账号剩余积分；**查询失败为 `null`（不是 0）** |
+| `data.accounts[].name` | 昵称，缺失时退回 uid 前 8 位（与面板、日报取名口径一致）|
+
+两点行为约定：
+
+- **失败账号不会被静默省略**，`amount` 给 `null`、`lines` 里给 `名字: — (原因)`。这样「某个号查询失败」和「某个号余额为 0」在前端可区分——把失败折成 0 会让人误以为额度花光了。
+- **脏 `realm` 参数不会被当作过滤条件**：只认 `cn`/`global`，其余值一律按「不过滤」处理，避免一个拼错的参数把查询范围收窄成空池。
+
+查询失败不阻断整体：单个账号失败只影响它自己那行，接口恒返回 200。全池逐账号查询走 **3 路并发**（不是串行），避免账号多时把响应时间拉长。
 
 ---
 
