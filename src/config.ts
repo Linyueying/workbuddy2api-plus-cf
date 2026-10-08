@@ -4,7 +4,7 @@ import type { Env } from "../worker-configuration.d.ts";
 declare const process: { env: Record<string, string | undefined> };
 
 // 替代 Go 的 config.go：加载/归一/校验配置。
-// 非敏感配置整体存 KV(WB2A_CONFIG, key="config")；敏感项（api_key/device_token/upstash）
+// 非敏感配置整体存 KV(WB2A_CONFIG, key="config")；敏感项（api_key/device_token）
 // 走 Secrets，不在此处。WB2A_* 环境变量可覆盖默认值。
 
 export interface UpstreamConfig {
@@ -107,7 +107,6 @@ export interface Config {
    * append（开头连续 system 块后叠加）。非法值在读取时归一为 passthrough。
    */
   prompt: { mode: string; file: string; text: string };
-  upstash: { url: string; token: string };
   pool: PoolConfig;
   session_sticky: SessionStickyConfig;
   /**
@@ -192,7 +191,6 @@ export const DEFAULT_CONFIG: Config = {
   // 默认 passthrough（对齐 Go Default()）：透传客户端原始 system，不做网关注入。
   // file = WB2A_CACHE 里的键名（Go 是磁盘路径，Workers 无文件系统）。
   prompt: { mode: "passthrough", file: "", text: "" },
-  upstash: { url: "", token: "" },
   pool: {
     max_in_flight: 2,
     max_in_flight_global: 4,

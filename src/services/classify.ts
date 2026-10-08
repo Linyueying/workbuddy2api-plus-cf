@@ -82,16 +82,27 @@ export function classify(status: number, bodyText: string): Classified {
   if (status >= 500) {
     return err("ErrServer", 503, "upstream_error", msg, "server", false, true, "server");
   }
-  // 7. 内容被拦截 -> 不罚号，降级重试
+  // 7. 内容被拦截 -> 不罚号，**不跨账号轮转**（下文 proxy 会做「同账号降级重试」）。
   //    marker 三条与 Go upstream.contentBlockedMarkers 逐字一致。上游**不**返回
   //    code="content_blocked"，只回审核文案；早前这里按 code 判等于永不命中，
   //    降级重试路径（prompt.Degraded）形同虚设。保留 code 形态兼容自定义网关。
+  //
+  //    rotate 必须 false：内容能否通过审核由**请求内容**决定，换任何账号都会撞同一
+  //    条审核规则，跨账号轮转是纯浪费（见本文件顶部 CONTENT_BLOCKED_MARKERS 的注记）。
+  //    proxy 里的「降级重试」是同一账号换系统提示词再试一次，语义不同，由 proxy 自行
+  //    实现，不走这里的 rotate。
   if (code === "content_blocked" || CONTENT_BLOCKED_MARKERS.some(hasLow)) {
-    return err("ErrContentBlocked", 400, "content_blocked", msg, "none", false, true, "content_blocked");
+    return err("ErrContentBlocked", 400, "content_blocked", msg, "none", false, false, "content_blocked");
   }
-  // 8. 参数错误 11101 -> 不罚号，仍轮转
+  // 8. 参数错误 11101 -> 不罚号，**不轮转，直接透传**。
+  //    （原为「不罚号，仍轮转」）请求体/参数是**请求本身的属性**，与选哪个账号无关：
+  //    同一份 body 打到任何账号，上游都会 deterministic 地回同一个 11101，换号重试
+  //    不可能变成功。而 proxy 的循环里只有 passthrough:true 才会立即返回——
+  //    rotate:false 只是「不退避 sleep」，下一轮照样重选账号再打一次上游。
+  //    因此这里必须与同类请求级错误 11115（prompt_too_long）一致给 passthrough:true，
+  //    否则一次参数错误的请求会白白烧掉多个账号的上游往返与在途名额。
   if (code === "11101" || has("11101")) {
-    return err("ErrBadParams", 400, "bad_params", msg, "none", false, true, "bad_params");
+    return err("ErrBadParams", 400, "bad_params", msg, "none", true, false, "bad_params");
   }
   // 9. 提示词过长 11115 -> 不罚号，不轮转，透传
   if (code === "11115" || has("11115")) {

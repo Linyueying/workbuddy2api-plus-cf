@@ -60,23 +60,6 @@ const SCHEMA_0001 = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_reqlogs_ts ON request_logs(ts DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_reqlogs_uid ON request_logs(uid)`,
-  `CREATE TABLE IF NOT EXISTS usage (
-     hour INTEGER NOT NULL,
-     model TEXT NOT NULL,
-     realm TEXT NOT NULL,
-     tokens INTEGER NOT NULL DEFAULT 0,
-     cnt INTEGER NOT NULL DEFAULT 0,
-     PRIMARY KEY (hour, model, realm)
-   )`,
-  `CREATE TABLE IF NOT EXISTS task_queue (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     uid TEXT NOT NULL,
-     task_id TEXT NOT NULL,
-     status TEXT NOT NULL DEFAULT 'pending',
-     created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL
-   )`,
-  `CREATE INDEX IF NOT EXISTS idx_taskqueue_uid ON task_queue(uid, status)`,
 ];
 
 // 0002 的新增列（与 migrations/0002_apikey_quota.sql 保持同步）。
@@ -135,6 +118,23 @@ const INDEX_0003 = [
   `CREATE INDEX IF NOT EXISTS idx_reqlogs_usage_uid ON request_logs(ts DESC, uid)`,
 ];
 
+/**
+ * DROP_LEGACY 清掉历史遗留的**永不写入**的空表（对应 migrations/0006_drop_unused_tables.sql）。
+ *
+ * 这两张表由 0001 建出，但全仓从未有任何代码读写它们：
+ *   - `usage`       按小时预聚合的旧用量表，唯一的写入函数 recordUsage **从未被调用**，
+ *                   用量口径早已迁到 request_logs 实时聚合；
+ *   - `task_queue`  任务中心队列，实际任务状态全走 PoolDO 内部存储，D1 这张表从未被碰。
+ *
+ * 即：任何由本项目建出来的库，这两张表**必定是空的**，DROP 不会丢任何真实数据。
+ *
+ * ⚠️ 这里刻意与 0003 复合索引共用同一批 batch —— 迁移的往返次数是冷启动的关键指标
+ * （真机优化目标 ≤4 次往返，见 test/migrate.test.ts 的 roundTrips 断言），为清理空表
+ * 单独发起一次往返等于把优化成果退回去。两者同属「缺了不影响正确性」的非阻塞操作，
+ * 合并是自然的。
+ */
+const DROP_LEGACY = [`DROP TABLE IF EXISTS usage`, `DROP TABLE IF EXISTS task_queue`];
+
 export type MigrateState =
   | { status: "skipped"; reason: string }
   /** via 标明这次「ok」是怎么来的：version_gate = 命中版本门直接跳过（冷启动最优路径）；ddl = 真跑了迁移。 */
@@ -144,12 +144,16 @@ export type MigrateState =
 /** 版本门在 KV 里的键。 */
 const SCHEMA_VERSION_KEY = "schema_version";
 /**
- * 当前 schema 目标版本 = migrations/ 里最后一个文件的序号（0005 → 5）。
+ * 当前 schema 目标版本 = migrations/ 里最后一个文件的序号（0006 → 6）。
  *
  * ⚠️ 新增迁移文件时**必须**同步把这里 +1，否则版本门会让新迁移永远跑不到
  * （旧版本号已经达标 → 直接跳过）。这是本机制唯一需要人工维护的地方。
+ *
+ * 0006（清理 usage / task_queue）尤其依赖这一步：已上线实例的 KV 里存的是 5，
+ * 只有把目标抬到 6，它们才会在**首个请求**时重跑迁移、把历史空表真正 DROP 掉。
+ * 不抬版本号的话，版本门会继续「达标即跳过」，线上残留就永远清不掉。
  */
-const SCHEMA_TARGET = 5;
+const SCHEMA_TARGET = 6;
 
 // 每个 isolate 只跑一次。用 promise 缓存而非布尔值：
 // 首个请求触发后，并发请求 await 同一个 promise，而不是各自重复探测。
@@ -281,12 +285,12 @@ async function migrate(env: Env): Promise<MigrateState> {
     await runAlters(d1, needApikeys, needReqlogs, added_cols);
   }
 
-  // 4) 0003 的复合索引：IF NOT EXISTS，老库重跑是 no-op。
-  //    建索引失败不阻断启动（索引只影响查询计划，缺了仍能正确出数），故只告警不抛。
+  // 4) 0003 的复合索引 + 0006 的历史空表清理：都带 IF (NOT) EXISTS，老库重跑是 no-op。
+  //    两者都失败不阻断启动（索引只影响查询计划，遗留空表不影响任何查询），故只告警不抛。
   try {
-    await runStatements(d1, INDEX_0003);
+    await runStatements(d1, [...INDEX_0003, ...DROP_LEGACY]);
   } catch (e) {
-    console.error(`[migrate] 建索引失败（跳过，不影响正确性）: ${msgOf(e)}`);
+    console.error(`[migrate] 建索引/清理历史空表失败（跳过，不影响正确性）: ${msgOf(e)}`);
   }
 
   return { status: "ok", created, added_cols, via: "ddl" };

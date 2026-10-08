@@ -29,22 +29,6 @@ CREATE TABLE IF NOT EXISTS request_logs (
 CREATE INDEX IF NOT EXISTS idx_reqlogs_ts ON request_logs(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_reqlogs_uid ON request_logs(uid);
 
-CREATE TABLE IF NOT EXISTS usage (
-  hour   INTEGER NOT NULL,
-  model  TEXT NOT NULL,
-  realm  TEXT NOT NULL,
-  tokens INTEGER NOT NULL DEFAULT 0,
-  cnt    INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (hour, model, realm)
-);
-
--- 任务中心队列（可选，用于跨实例共享任务状态）
-CREATE TABLE IF NOT EXISTS task_queue (
-  id       INTEGER PRIMARY KEY AUTOINCREMENT,
-  uid      TEXT NOT NULL,
-  task_id  TEXT NOT NULL,
-  status   TEXT NOT NULL DEFAULT 'pending',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_taskqueue_uid ON task_queue(uid, status);
+-- 0006_drop_unused_tables.sql 会清掉早期版本在这里建过、但从未有任何代码读写的
+-- 两张表（usage 按小时预聚合用量 / task_queue 任务中心队列）。它们在本项目中恒为空。
+-- 新库不再创建这两张表；已存在的旧库由自动迁移（或手工执行 0006）DROP 掉。

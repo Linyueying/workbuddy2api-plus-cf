@@ -345,11 +345,13 @@ export async function deleteRequestLogsByIds(env: Env, ids: number[]): Promise<n
 }
 
 // ---------- 用量 ----------
-// 0001 建的 usage 表（hour,model,realm,tokens,cnt）已废弃：它按小时预聚合且无
-// uid，面板要的「按账号」「prompt/completion 拆分」「credit」「缓存命中」全都
-// 出不来；更要命的是它的写入函数 recordUsage 从未被任何地方调用。用量改从
-// request_logs 实时聚合——那才是唯一真实在被写的表。表保留不删：历史数据不动，
-// 也不值得为一张空表写 DROP（万一有人已经在用）。
+// 用量一律从 request_logs 实时聚合——那是唯一真实在被写的表（见 services/usage-agg.ts）。
+//
+// 早期这里另有 0001 建的 usage 表（hour,model,realm,tokens,cnt）：按小时预聚合且没有
+// uid，面板要的「按账号」「prompt/completion 拆分」「credit」「缓存命中」全都出不来；
+// 更要命的是它唯一的写入函数 recordUsage **从未被任何地方调用**，建成至今一直是空的。
+// 该表与其唯一读写函数已在 0006 迁移中彻底删除（DROP），本模块不再留有任何残留：
+// 新库不再建它，已上线的旧库由自动迁移在首个请求时 DROP 掉。
 
 /** UsageRow 用量聚合的输入行：单次请求一级，未聚合。 */
 export interface UsageRow {
@@ -486,19 +488,5 @@ export async function usageByAccountWindow(env: Env, from: number, to: number): 
   ).catch(() => []);
 }
 
-export async function recordUsage(env: Env, model: string, realm: string, tokens: number, ts: number): Promise<void> {
-  await run(
-    env,
-    `INSERT INTO usage (hour, model, realm, tokens, cnt) VALUES (?, ?, ?, ?, 1)
-     ON CONFLICT(hour, model, realm) DO UPDATE SET tokens = tokens + excluded.tokens, cnt = cnt + 1`,
-    [Math.floor(ts / 3600000) * 3600000, model, realm, tokens],
-  );
-}
-
-export async function queryUsage(env: Env, from: number, to: number): Promise<any[]> {
-  return all(
-    env,
-    `SELECT hour, model, realm, tokens, cnt FROM usage WHERE hour >= ? AND hour <= ? ORDER BY hour`,
-    [Math.floor(from / 3600000) * 3600000, Math.floor(to / 3600000) * 3600000],
-  );
-}
+// 注：usage 表的 recordUsage / queryUsage 已随 0006 迁移一并删除——那张表从未有任何
+// 调用方写入，为空表；用量口径统一走 queryUsageWindow + services/usage-agg.ts。

@@ -148,10 +148,33 @@ describe("D1 自动迁移", () => {
   });
 
   it("DDL 失败：报出具体语句，但不阻断（由调用方 catch）", async () => {
-    const { d1 } = makeD1({ cols: [], failOn: /CREATE TABLE IF NOT EXISTS usage/ });
+    // 早期这里用 usage 表做失败注入；usage 已随 0006 迁移删除，改用仍在建的表。
+    const { d1 } = makeD1({ cols: [], failOn: /CREATE TABLE IF NOT EXISTS request_logs/ });
     const r = await ensureSchema(envWith(d1)).catch((e) => ({ status: "error", error: String(e.message) }));
     expect(r.status).toBe("error");
-    expect(r.error).toContain("usage");
+    expect(r.error).toContain("request_logs");
+  });
+
+  // 0006：usage / task_queue 是从未被读写的空表，已下线。
+  // 新库不再建它们；已上线的旧库必须靠自动迁移主动 DROP——只删代码里的 CREATE 是
+  // 清不掉线上残留的（已经存在的表不会自己消失）。
+  it("0006：不再创建 usage / task_queue（死表）", async () => {
+    const { d1, executed, tables } = makeD1({ cols: [] });
+    const r = await ensureSchema(envWith(d1));
+    expect(r.status).toBe("ok");
+    expect(executed.some((s) => /CREATE TABLE IF NOT EXISTS usage\b/.test(s))).toBe(false);
+    expect(executed.some((s) => /CREATE TABLE IF NOT EXISTS task_queue\b/.test(s))).toBe(false);
+    expect(tables.has("usage")).toBe(false);
+    expect(tables.has("task_queue")).toBe(false);
+  });
+
+  it("0006：对旧库 DROP 掉遗留的空表（否则线上残留清不掉）", async () => {
+    const { d1, executed } = makeD1({ cols: [] });
+    const r = await ensureSchema(envWith(d1));
+    expect(r.status).toBe("ok");
+    // 关键：清理语句必须真的发出去，且与 0003 复合索引同批（不额外增加冷启动往返）
+    expect(executed.some((s) => /DROP TABLE IF EXISTS usage/.test(s))).toBe(true);
+    expect(executed.some((s) => /DROP TABLE IF EXISTS task_queue/.test(s))).toBe(true);
   });
 
   // 回归：这两条索引原本只存在于 migrations/0003_usage_metrics.sql 里，而 Pages 部署
@@ -311,7 +334,7 @@ describe("冷启动优化①：KV 版本门", () => {
 
   it("版本达标：一次 KV 读就返回，**一条 SQL 都不发**", async () => {
     const { d1, executed } = makeD1({ cols: [] });
-    const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any);
+    const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "6" }) } as any);
     expect(r.status).toBe("ok");
     expect(r.via).toBe("version_gate");
     // 这是整个优化的核心断言：冷启动不再付 14 次 D1 往返
@@ -324,7 +347,7 @@ describe("冷启动优化①：KV 版本门", () => {
     const r: any = await ensureSchema({ WB2A_DB: d1, WB2A_CONFIG: kv } as any);
     expect(r.status).toBe("ok");
     expect(r.via).toBe("ddl");
-    expect(kv.store.get("schema_version")).toBe("5");
+    expect(kv.store.get("schema_version")).toBe("6");
   });
 
   it("KV 未绑定：版本门不可用，退化照跑迁移（不能成为新的故障源）", async () => {
@@ -353,7 +376,7 @@ describe("冷启动优化①：KV 版本门", () => {
     // 这条是刻意的设计取舍：resetSchemaCache 是通用「清缓存」入口，被测试的
     // beforeEach 普遍调用。若它也穿透版本门，版本门在测试里就永远走不到。
     const { d1, executed } = makeD1({ cols: [] });
-    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any;
+    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "6" }) } as any;
     expect((await ensureSchema(env) as any).via).toBe("version_gate");
     resetSchemaCache();
     expect((await ensureSchema(env) as any).via).toBe("version_gate");
@@ -363,7 +386,7 @@ describe("冷启动优化①：KV 版本门", () => {
   it("forceSchemaMigration 才穿透版本门（运维强制重跑入口靠它生效）", async () => {
     // KV 版本号写错、或手工改坏表结构需要重建时，必须能绕过「达标就跳过」。
     const { d1, executed } = makeD1({ cols: [] });
-    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "5" }) } as any;
+    const env = { WB2A_DB: d1, WB2A_CONFIG: makeKV({ schema_version: "6" }) } as any;
     expect((await ensureSchema(env) as any).via).toBe("version_gate");
     expect(executed.length).toBe(0);
 

@@ -1,0 +1,25 @@
+-- 0006：清理从未被读写的遗留空表。
+--
+-- 用法：wrangler d1 execute WB2A_DB --local --file=./migrations/0006_drop_unused_tables.sql
+--       wrangler d1 execute WB2A_DB --remote --file=./migrations/0006_drop_unused_tables.sql
+--
+-- 为什么要删这两张表
+-- ---------------------------------------------------------------------------
+-- usage        0001 建的按小时预聚合用量表（hour/model/realm/tokens/cnt）。
+--              唯一的写入函数 recordUsage **从未被任何代码调用**；用量口径早已迁到
+--              request_logs 实时聚合（见 src/storage/usage.ts 顶部注记）。
+-- task_queue   任务中心队列预留表。实际任务状态全走 PoolDO 内部存储
+--              （src/services/tasks.ts 经 poolRPC 读写），D1 这张表从未被勾选。
+--
+-- 即：由本项目建出来的库里，这两张表**必定是空的**，DROP 不会删掉任何真实数据。
+--
+-- 线上如何被清理
+-- ---------------------------------------------------------------------------
+-- 主要是**运行时自动迁移**（src/storage/migrate.ts）：本次改动把 SCHEMA_TARGET 抬到 6，
+-- 已上线实例在首个请求时会穿透版本门重跑迁移，在其中的非阻塞步骤里 DROP 掉这两张表
+-- （DROP_LEGACY，与 0003 复合索引同一批 batch，不增加冷启动往返）。
+-- 本文件是给「手工执行 / 想先看清 DDL 再用」的路径用的（等价 npm run db:init 会跑到它）。
+--
+-- 用法同 0001：幂等（DROP TABLE IF EXISTS），重复执行安全。
+DROP TABLE IF EXISTS usage;
+DROP TABLE IF EXISTS task_queue;

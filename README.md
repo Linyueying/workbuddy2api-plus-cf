@@ -199,7 +199,11 @@ wrangler pages secret put WB2A_DEVICE_TOKEN --project-name workbuddy2api-pages  
 ### 4.3 初始化 D1 + 构建部署
 
 **建表已自动化**：Worker 在首个请求时自检并建表（见 `src/storage/migrate.ts`），
-部署后无需任何手工步骤。空库 → 首次访问 `/healthz` 即完成 4 表 5 索引 19 列的搭建。
+部署后无需任何手工步骤。空库 → 首次访问 `/healthz` 即完成 `apikeys` / `request_logs` 两张表及其索引、列的搭建（DDL 见 `migrations/`，由 `src/storage/migrate.ts` 在 Worker 进程内执行）。
+
+> **历史遗留的空表会自动清理**：早期版本曾建过 `usage`（按小时预聚合用量）与 `task_queue`（任务中心队列）两张表，但**从未有任何代码读写**它们（用量口径早已迁到 `request_logs`，任务状态实际走 PoolDO 内部存储）。0006 迁移已把它们连同相关代码一起删除。
+> 新库不再创建这两张表；**已上线的旧库**会在本次部署后的**首个请求**自动 `DROP` 掉（版本号已抬到 6，使版本门失效并重跑迁移）。想先看清 DDL 也可手工执行 `migrations/0006_drop_unused_tables.sql`。清理失败只告警、不阻断启动。
+> `npm run preflight -- --remote` 若仍查到这两张表，会给一条提示而不会判为缺表。
 
 ```bash
 npm run build                # esbuild 生成 dist/_worker.js + 拷贝前端

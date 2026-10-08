@@ -5,8 +5,8 @@ import { buildUsageSnapshot, type UsageSnapshot } from "../services/usage-agg";
 // 用量读取（替代 internal/usage/*）。
 //
 // 数据源是 request_logs —— 唯一真实在被写的请求表，带上 0003 迁移加的 token/credit
-// 列就够了。0001 那张 usage 表不再参与：它按小时预聚合且没有 uid，面板要的逐账号
-// 维度出不来；而它的写入函数 recordUsage 从未有人调用，建成至今一直是空的。
+// 列就够了。0001 那张 usage 表早已不参与（按小时预聚合、无 uid，面板维度出不来，
+// 且写入函数 recordUsage 从未有人调用），现已由 0006 迁移彻底 DROP 并删除相关函数。
 
 export interface UsageOptions {
   from: number;

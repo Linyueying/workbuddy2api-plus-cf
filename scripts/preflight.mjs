@@ -293,12 +293,19 @@ if (remote) {
       { stdio: ["ignore", "pipe", "pipe"], cwd: root },
     ));
     const remoteTables = [...o.matchAll(/"name":\s*"(\w+)"/g)].map((m) => m[1]);
-    const need = ["apikeys", "request_logs", "usage", "task_queue"];
+    // usage / task_queue 是早期建过、但从未有任何代码读写的空表，已由 0006 迁移 DROP
+    // （自动迁移在建 `npm run deploy` 后首个请求时会清掉）。故这里**不再要求**它们存在，
+    // 反之：若还查到它们，说明线上遗留尚未清理干净，提示一次。
+    const need = ["apikeys", "request_logs"];
+    const legacy = ["usage", "task_queue"].filter((t) => remoteTables.includes(t));
     const absent = need.filter((t) => !remoteTables.includes(t));
     if (absent.length) {
       bad(`远端缺表：${absent.join(", ")} → 先跑 node scripts/db-init.mjs --remote`);
     } else {
       ok(`远端表齐：${remoteTables.join(", ")}`);
+    }
+    if (legacy.length) {
+      warn(`远端仍有遗留空表 ${legacy.join(", ")}（0006 迁移未生效）→ 部署后访问一次 /healthz 触发自动清理，或手工执行 migrations/0006_drop_unused_tables.sql`);
     }
     // apikeys 的 15 个管控列
     const o2 = out(execFileSync(

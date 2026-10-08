@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 // Cloudflare Pages + Durable Objects 绑定声明（单行来源）。
-// Secrets（WB2A_API_KEY / WB2A_ADMIN_KEY / WB2A_DEVICE_TOKEN / WB2A_UPTASH_TOKEN）通过
+// Secrets（WB2A_API_KEY / WB2A_ADMIN_KEY / WB2A_DEVICE_TOKEN）通过
 // `wrangler secret put` 注入，不会出现在仓库或本文件里。
 
 interface Env {
@@ -33,8 +33,6 @@ interface Env {
   WB2A_ADMIN_KEY?: string;
   /** 设备 token（可选，原 device_token_file / WB2A_DEVICE_TOKEN）。 */
   WB2A_DEVICE_TOKEN?: string;
-  /** 原 Upstash token（可选；本项目已用纯 DO 替代，保留以备横向扩展）。 */
-  WB2A_UPTASH_TOKEN?: string;
 }
 
 export {};
