@@ -6,6 +6,10 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null, queueRefreshTimer = null;
+/* 进入视图时「即时同刷 + 轮询改道」的定时器（见 enterView）。只用于延迟触发，
+   真正干活的是 loadOverview——它自带 in-flight 合并与时间闸门，所以并发触发
+   不会打出重复请求。 */
+let viewSyncTimer = null, viewPollTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
@@ -320,6 +324,36 @@ $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKe
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志', keys: 'API 密钥' };
+
+/* enterView 每次进入视图时同步一次数据（切换视图 / 切回标签页共用）。
+
+   为什么延后一轮：go() 在同一轮里还要调本视图的 load*，同步执行会立刻发两个请求
+   （live DOM 上被 in-flight 合并挡下来没问题，但单测的异步 mock 会看到两次）。
+   推迟到下一轮，让那条先发出去。
+
+   账号池额外做「轮询改道」：把 60s 计时器从进入时刻重新起算。原来的相位是页面
+   加载时刻且进入视图时不清零，会出现「刚刷到新数据、又立刻空等一个周期」的错位。
+   改道后刷新时机变成确定的 t=0 / 60s / 120s。
+
+   注意这里**只重排计时器**，第一次同步由上面那个 setTimeout 负责。早先版本在
+   改道回调里又补了一次 sync()，结果进视图固定发两次请求——已去掉。 */
+function enterView(v) {
+  clearTimeout(viewSyncTimer);
+  clearTimeout(viewPollTimer);
+  if (v !== 'accounts' && v !== 'logs') return;   // 只有这两个由 60s 轮询维护
+  viewSyncTimer = setTimeout(() => {
+    if (view !== v) return;                       // 已切走则作废
+    if (v === 'accounts') loadOverview(true);
+    else loadLogs();
+  }, 0);
+  if (v !== 'accounts') return;
+  viewPollTimer = setTimeout(() => {
+    if (view !== v) return;
+    if (refTimer) clearInterval(refTimer);
+    refTimer = setInterval(refreshVisible, REFRESH_IDLE_MS);
+  }, REFRESH_IDLE_MS);
+}
+
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -332,6 +366,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') reattachQueueView();
+  enterView(v);
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -416,6 +451,42 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+}
+
+/* 进入视图时的强制刷新闸门（见 enterView）。两个旋钮：
+     OVERVIEW_GATE_MS  刚刚同步刷过的窗口——这个窗口内「进入视图」的重复触发
+                       （来回点导航、屏幕旋转的 resize 等）不再补一次；
+     POLL_FORCE_MS     轮询自身周期。刷新点落在「本周期已跑过轮询」之后时，
+                       说明距上次真实刷新还不到一个周期，没必要再补。
+   两个都是纯本地时间戳比对，不打接口。 */
+const OVERVIEW_GATE_MS = 2000;
+const POLL_FORCE_MS = REFRESH_IDLE_MS;
+let ovFlight = null, ovDoneAt = 0, ovPollAt = 0;
+
+/**
+ * refreshOverview 刷新概览/账号池数据。
+ *
+ * @param quiet   失败时是否静默（轮询/后台刷新一律静默，别弹toast打断操作）
+ * @param force   跳过时间闸门。定时轮询（而非进入视图）必须传 true ——
+ *                否则窗口对不上时轮询会被自己「刚刷过」的闸门吞掉，刷新反而变少。
+ */
+function refreshOverview(quiet, force) {
+  const t = Date.now();
+  // 并发合并：同一时刻最多一个在途请求。调用方在别处（start / 首屏）也各打了一次，
+  // 没有这层就会出现两个请求同时打 Durable Object，且后回来的覆盖先回来的。
+  if (ovFlight) return ovFlight;
+  if (!force) {
+    // 距上次「刚同步过」不足闸门值 → 这次是冗余触发，不补请求
+    if (t - ovDoneAt < OVERVIEW_GATE_MS) return Promise.resolve();
+    // 刷新点在本轮轮询之后 → 数据只比轮询结果新一点，等下一次轮询更完整
+    if (ovPollAt > ovDoneAt) return Promise.resolve();
+  }
+  const p = loadOverview(quiet).finally(() => {
+    ovDoneAt = Date.now();
+    if (ovFlight === p) ovFlight = null;
+  });
+  ovFlight = p;
+  return p;
 }
 
 async function loadOverview(quiet) {
@@ -1252,14 +1323,21 @@ $('btnRefresh').onclick = async () => {
 const REFRESH_IDLE_MS = 60000;
 const REFRESH_QUEUE_MS = 5000;
 function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
+  // 打一个「本轮轮询已发生」的戳：进入视图时的补刷据此判断距上次真实刷新够不够
+  // 一个周期（见 refreshOverview 的闸门）。必须早于请求本身打——请求要等网络，
+  // 拿它的完成时刻做比较会把自己算进「刚刷过」而永远不补。
+  ovPollAt = Date.now();
+  // force：轮询的语义就是「无论如何刷新一次」，不能反过来被闸门吃掉。
+  if (view === 'accounts') refreshOverview(true, true);
   else if (view === 'logs') loadLogs();
 }
 function refreshQueueView() {
   if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
-  loadOverview(true);
+  // 走 refreshOverview 而不是 loadOverview：首次进入视图（go → enterView）也会
+  // 请求一次，两条路径合并成一个在途请求，避免刚打开面板就连打两个 overview。
+  refreshOverview(true, true);
   loadPanelKeyRow();
   if (refTimer) clearInterval(refTimer);
   if (queueRefreshTimer) clearInterval(queueRefreshTimer);
@@ -3096,3 +3174,22 @@ function mobileDecorateAll() {
   if (document.body) start();
   else document.addEventListener('DOMContentLoaded', start);
 })();
+
+/* ── 切回标签页时同步当前视图 ─────────────────────────────────────────
+   切走期间 `view` 没变、计时器却照常空转：浏览器通常会把后台标签的 setInterval
+   节流到分钟级甚至更久，回来看到的往往是切走那一刻的陈旧数据。这里在 visible
+   事件上补一次当前视图的同步。
+
+   同一次切回可能派发多个事件（Chromium 实测 visibilitychange 与 pageshow 各一发），
+   全部经 refreshOverview 的闸门与在途合并收敛，不会打出重复请求。
+
+   刻意不看 document.visibilityState：Firefox 在切换标签时先报 hidden 再报
+   visible，但「切到别的应用」只报一次 hidden。只在 visible 上动作会漏掉
+   后者——那是用户最需要新数据的场景（切走很久、回来就干活）。反正 hidden 时
+   同步也发不出去，还不如让它照跑，由闸门兜底。 */
+function syncVisibleView() {
+  if (view === 'accounts') refreshOverview(true);
+  else if (view === 'logs') loadLogs();
+}
+if (typeof document !== 'undefined') addEventListener('visibilitychange', syncVisibleView);
+addEventListener('pageshow', syncVisibleView);
