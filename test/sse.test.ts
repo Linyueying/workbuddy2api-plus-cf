@@ -246,3 +246,142 @@ describe("streamChat 单流透传", () => {
     expect(text).toContain("纯正文帧");
   });
 });
+
+// 思维链增量合并（deep thinking）。
+//
+// 上游按**词**下发思考：{"reasoning_content":"the"}、{"reasoning_content":"user"}
+// 各占一帧。逐帧透传时客户端把每帧当成一条独立思考条目渲染，界面上出现
+//     深度思考: the
+//     深度思考: user
+// 而正确形态是「深度思考: the user」。这里钉住合并行为与它的各个边界。
+describe("streamChat 思维链增量合并", () => {
+  /** 解析下发帧，返回每帧的类型与内容，便于断言帧边界。 */
+  function parseFrames(text: string): Array<{ kind: string; text?: string }> {
+    return text
+      .split("\n\n")
+      .filter((f) => f.trim())
+      .map((f) => {
+        const p = f.replace(/^data: /, "");
+        if (p === "[DONE]") return { kind: "done" };
+        const j = JSON.parse(p);
+        const ch = j.choices?.[0];
+        const d = ch?.delta ?? {};
+        const hasReason = d.reasoning_content != null;
+        const hasContent = d.content != null;
+        // 混合帧（同时带 reasoning 与 content）单列一类：它不参与合并，
+        // 断言时必须能把它与「纯思考帧」区分开，否则辅助函数自己就把两种情况
+        // 混成一种，测试等于没测。
+        if (hasReason && hasContent) return { kind: "mixed" };
+        if (hasReason) return { kind: "reason", text: d.reasoning_content };
+        if (hasContent) return { kind: "content", text: d.content };
+        return { kind: "other" };
+      });
+  }
+
+  it("相邻思考片段被并成一帧（逐词 → 整句）", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "the" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: " " } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "user" } }] }) +
+      ev({ choices: [{ index: 0, delta: { content: "Hello" } }] }) +
+      "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    const fs = parseFrames(await res.text());
+    // 关键断言：思考只占**一帧**，且内容是整句而不是逐词。
+    expect(fs.filter((f) => f.kind === "reason")).toHaveLength(1);
+    expect(fs[0]).toEqual({ kind: "reason", text: "the user" });
+    expect(fs.some((f) => f.kind === "content" && f.text === "Hello")).toBe(true);
+  });
+
+  it("思考与正文的边界不被跨越：两段思考分开，正文夹在中间", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "A1" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "A2" } }] }) +
+      ev({ choices: [{ index: 0, delta: { content: "X" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "B1" } }] }) +
+      ev({ choices: [{ index: 0, delta: { content: "Y" } }] }) +
+      "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    const fs = parseFrames(await res.text());
+    expect(fs).toEqual([
+      { kind: "reason", text: "A1A2" },
+      { kind: "content", text: "X" },
+      { kind: "reason", text: "B1" },
+      { kind: "content", text: "Y" },
+      { kind: "done" },
+    ]);
+  });
+
+  it("混合帧（reasoning 与 content 同帧）不参与合并", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "T", content: "C" } }] }) + "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    const fs = parseFrames(await res.text());
+    // 该帧原样放行：仍是一帧同时带两个字段的形态，不能被拆开、也不能被吞掉。
+    expect(fs).toEqual([{ kind: "mixed" }, { kind: "done" }]);
+  });
+
+  it("reasoning 字段名（非 reasoning_content）同样合并", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning: "R1" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning: "R2" } }] }) +
+      "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    // 该字段名不在识别列表里 → 逐帧透传，内容不丢（宁可不多合，也不能吞）。
+    const text = await res.text();
+    expect(text).toContain("R1");
+    expect(text).toContain("R2");
+  });
+
+  it("末尾思考在 [DONE] 之前被冲出（不丢内容）", async () => {
+    // 上游最后几帧挤在同一块、且没有空行终结：flush 路径必须把攒着的思考发出去。
+    const body = ev({ choices: [{ index: 0, delta: { reasoning_content: "末尾思考" } }] });
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    const fs = parseFrames(await res.text());
+    expect(fs[0]).toEqual({ kind: "reason", text: "末尾思考" });
+    expect(fs[fs.length - 1]).toEqual({ kind: "done" });
+  });
+
+  it("usage 帧不被合并吞掉（记账依赖末帧）", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "T" } }] }) +
+      ev({ choices: [{ index: 0, delta: { content: "Z" } }] }) +
+      ev({ usage: { credit: 9, total_tokens: 99 } }) +
+      "data: [DONE]\n\n";
+    let got: any = null;
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {
+      onEnd: (u) => void (got = u),
+    });
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(got).toEqual({ credit: 9, total_tokens: 99 });
+  });
+
+  it("coalesceReasoning:false 回落逐帧透传（排障开关）", async () => {
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "x" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "y" } }] }) +
+      "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {
+      coalesceReasoning: false,
+    });
+    const fs = parseFrames(await res.text());
+    expect(fs.filter((f) => f.kind === "reason")).toHaveLength(2);
+  });
+
+  it("帧结构完整：合并帧自带 data: 前缀与空行终结（回归裸文本 bug）", async () => {
+    // 曾经把合并结果当裸文本塞进流里（漏 data: 前缀与 JSON 包装），
+    // 客户端解析失败、整段思考表现为凭空消失。这里逐帧断言可解析。
+    const body =
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "a" } }] }) +
+      ev({ choices: [{ index: 0, delta: { reasoning_content: "b" } }] }) +
+      ev({ choices: [{ index: 0, delta: { content: "out" } }] }) +
+      "data: [DONE]\n\n";
+    const res = streamChat(new Response(body, { status: 200 }), new Request("https://x"), {});
+    const text = await res.text();
+    for (const f of text.split("\n\n").filter((x) => x.trim())) {
+      expect(f.startsWith("data: ")).toBe(true); // 没有裸文本混入
+    }
+    expect(text.split("\n\n").filter((x) => x.trim())).toHaveLength(3); // 思考 + 正文 + DONE
+  });
+});

@@ -107,6 +107,14 @@ export interface StreamOpts {
    * 记录上游真实返回的 usage 结构（排查「有日志但 token 全 0」时最关键的一环）。
    */
   onUsageRaw?: (raw: string) => void;
+  /**
+   * coalesceReasoning 关闭思维链增量合并（默认开启）。
+   *
+   * 默认开启的原因见 coalesceReasoningDeltas 的注释：上游按「词」下发思考片段，
+   * 逐帧透传会让客户端把它们当成互不相干的行渲染。这里留一个关掉的开关，
+   * 是为了出问题时能一键回到逐帧透传做对比，而不必改代码重新部署。
+   */
+  coalesceReasoning?: boolean;
 }
 
 /** hasTokens usage 是否带真实 token 字段（用于跳过空对象 {} / 占位帧）。 */
@@ -149,12 +157,79 @@ function pickUsage(cur: Usage | null, u: Usage | null): Usage | null {
   return cur ?? u; // 全是空对象时至少留个占位，flush 再兜底
 }
 
+/** 思维链增量帧的字段名（各上游叫法不一，逐个探测后取出片段）。 */
+const REASONING_FIELDS = ["reasoning_content", "reasoning"] as const;
+
+/**
+ * flushReasoning 把攒下的思考片段冲成一帧（若无内容则不产出）。
+ *
+ * 统一走这里产出，是为了让「冲帧」只有一个形态：`out` 数组里放的**永远是
+ * 可直接下发的完整 SSE 事件文本**。早先版本把裸内容字符串也塞进 out，调用方
+ * 把它当事件原样下发（补 `\n\n`），漏了 `data: ` 前缀与 JSON 包装，客户端
+ * 解析失败、整段思考表现为凭空消失。
+ */
+function flushReasoning(pending: string): string | null {
+  if (!pending) return null;
+  return "data: " + JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: pending } }] }) + "\n\n";
+}
+
+/**
+ * coalesceReasoningDeltas 观察一帧，决定是攒下来还是原样放行。
+ *
+ * 返回 `{ out, pending }`：
+ *   - `out`  是要下发的**完整 SSE 事件**数组（含尾部空行），可能为空；
+ *   - `pending` 是新的待攒片段（原 pending + 本帧片段，或空串表示未在攒）。
+ *
+ * 合并判据见下方注释；核心是「只有纯 reasoning 增量帧才攒，其余帧先把攒下的
+ * 冲出去再放行」，这样思考与正文的边界、finish_reason / usage 的时序都不被破坏。
+ */
+function coalesceReasoningDeltas(pending: string, evt: string): { out: string[]; pending: string } {
+  // 遇到任何非纯 reasoning 帧，先冲后放（顺序不可颠倒）。
+  // evt 补上空行终结 —— out 的契约是「完整事件」，调用方不再补分隔符。
+  const passthrough = (): { out: string[]; pending: string } => {
+    const flushed = flushReasoning(pending);
+    const ev = evt.endsWith("\n\n") ? evt : evt + "\n\n";
+    return { out: flushed ? [flushed, ev] : [ev], pending: "" };
+  };
+
+  // 非 data 帧（comment / event: 等）原样透传，不打断合并状态。
+  const payload = dataPayloadOf(evt);
+  if (!payload || payload === "[DONE]") return passthrough();
+  let j: any;
+  try {
+    j = JSON.parse(payload);
+  } catch {
+    // 解析不了就当作不透明帧：先冲干净再原样放行，避免把纯文本混进 JSON 流。
+    return passthrough();
+  }
+  const choices = j?.choices;
+  if (!Array.isArray(choices) || choices.length !== 1) return passthrough();
+  const ch = choices[0];
+  const delta = ch?.delta;
+  // 纯 reasoning 帧的判据：只有一个 reasoning 字段、非空字符串，且不带
+  // content / tool_calls / finish_reason / role / usage。任一不满足就不合并。
+  if (!delta || typeof delta !== "object" || Array.isArray(delta)) return passthrough();
+  if (ch.finish_reason != null) return passthrough();
+  if (delta.content != null || delta.tool_calls != null || delta.role != null) return passthrough();
+  // usage 与正文分帧时同样要先冲（本帧若带 usage 说明是收尾帧）。
+  if (j.usage != null) return passthrough();
+  const keys = Object.keys(delta);
+  if (keys.length !== 1 || !(REASONING_FIELDS as readonly string[]).includes(keys[0])) return passthrough();
+  const frag = delta[keys[0]];
+  if (typeof frag !== "string" || frag === "") return passthrough();
+  // 纯 reasoning 增量：攒起来，暂不下发。
+  return { out: [], pending: pending + frag };
+}
+
 /** 逐块规范化透传上游 SSE；客户端断开清理上游；旁路捕获 usage 供成本记账。 */
 export function streamChat(upstreamRes: Response, request: Request, opts: StreamOpts = {}): Response {
   const body = upstreamRes.body as ReadableStream<Uint8Array>;
   let usage: Usage | null = null;
   let buf = "";
   let seenDone = false;
+  // 思维链合并缓冲：非空表示「已攒了若干 reasoning 片段还没下发」。
+  let pendingReasoning = "";
+  const coalesce = opts.coalesceReasoning !== false;
   // 解析与转发合在**单个** TransformStream 里。
   //
   // 原实现是两级管道：`tap`（decode → 切分 → 每帧 JSON.parse）再串
@@ -176,19 +251,48 @@ export function streamChat(upstreamRes: Response, request: Request, opts: Stream
           usage = pickUsage(usage, u);
         }
         if (/\[DONE\]/.test(evt)) seenDone = true;
-        controller.enqueue(encode(evt + "\n\n"));
+        if (!coalesce) {
+          controller.enqueue(encode(evt + "\n\n"));
+          continue;
+        }
+        // 合并相邻思维链增量（见 coalesceReasoningDeltas）。攒着的片段在遇到
+        // 正文/收尾帧时才冲出去，所以下发顺序与上游语义顺序一致。
+        // `out` 里的每一项都已是含空行终结的完整事件，直接下发。
+        const r = coalesceReasoningDeltas(pendingReasoning, evt);
+        pendingReasoning = r.pending;
+        for (const out of r.out) controller.enqueue(encode(out));
       }
     },
     flush(controller) {
       // 流末尾最后一帧常常没有空行终结，会留在 buf 里；它位置最晚，理应优先于
       // transform 期间捕获到的任何一帧。这里逐帧扫（而非对整个残留直接 JSON.parse），
       // 免得异常残留多帧时整块解析失败、把末帧用量吞掉。
+      let pendingUsage: Usage | null = null;
       for (const p of buf.split(/\n\n/)) {
+        if (!p.trim()) continue;
         const u = usageOf(p);
-        if (u) usage = pickUsage(usage, u);
+        if (u) pendingUsage = pickUsage(pendingUsage, u);
+        if (coalesce) {
+          // 残留里可能还夹着思维链片段（上游最后几帧挤在同一块里），必须照常合并，
+          // 否则末尾那段思考会整段丢掉。coalesceReasoningDeltas 对非思维链帧会原样
+          // 放行，所以这里不必再分拣——它的 out 已是可直接下发的完整事件。
+          const r = coalesceReasoningDeltas(pendingReasoning, p);
+          pendingReasoning = r.pending;
+          for (const out of r.out) controller.enqueue(encode(out));
+        } else {
+          controller.enqueue(encode(p + "\n\n"));
+        }
       }
-      const tail = buf.trim();
-      if (tail) controller.enqueue(encode(tail.endsWith("\n") ? tail : tail + "\n"));
+      usage = pickUsage(usage, pendingUsage);
+      // 收尾：把还攒着的思考冲出去，再补 [DONE]。
+      //
+      // ⚠️ 这里**不再**补发 buf 残留。上面的循环已把残留里的每一帧都处理过一遍
+      // （思维链帧并进合并缓冲、其余帧原样下发），再发一次 buf 等于把最后几帧
+      // 重复下发——客户端会重复渲染一段正文。原实现在这里发 buf 是因为它没有
+      // 逐个处理残留；现在处理了，这一句必须去掉。
+      const flushed = flushReasoning(pendingReasoning);
+      if (flushed) controller.enqueue(encode(flushed));
+      pendingReasoning = "";
       if (!seenDone) controller.enqueue(encode("data: [DONE]\n\n"));
       opts.onEnd?.(usage);
     },
