@@ -453,14 +453,16 @@ function renderAccounts(list) {
   }).join('');
 }
 
-/* 进入视图时的强制刷新闸门（见 enterView）。两个旋钮：
+/* 进入视图的刷新闸门（见 enterView / refreshOverview）。纯本地时间戳比对，不打接口。
      OVERVIEW_GATE_MS  刚刚同步刷过的窗口——这个窗口内「进入视图」的重复触发
-                       （来回点导航、屏幕旋转的 resize 等）不再补一次；
-     POLL_FORCE_MS     轮询自身周期。刷新点落在「本周期已跑过轮询」之后时，
-                       说明距上次真实刷新还不到一个周期，没必要再补。
-   两个都是纯本地时间戳比对，不打接口。 */
+                       （来回点导航、屏幕旋转的 resize 等）不再补一次。
+   注意：这里**不要**引用 REFRESH_IDLE_MS。它声明在文件后半段（轮询一节），
+   而本行处于顶层同步求值路径上；顶层读一个后置的 const 会直接抛 TDZ
+   （"Cannot access 'REFRESH_IDLE_MS' before initialization"），导致整份脚本
+   从这一行起中断求值，后续所有按钮/导航绑定与 start() 全部不执行——表现为
+   「好多功能都不能用」。本轮询周期的判断改在 refreshOverview 内部用
+   ovPollAt/ovDoneAt 两个时间戳表达，不依赖该常量。 */
 const OVERVIEW_GATE_MS = 2000;
-const POLL_FORCE_MS = REFRESH_IDLE_MS;
 let ovFlight = null, ovDoneAt = 0, ovPollAt = 0;
 
 /**
