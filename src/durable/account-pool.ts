@@ -486,6 +486,17 @@ export class PoolDO {
           resetAt: Number(body.resetAt ?? 0) || 0,
           reason: typeof body.reason === "string" ? body.reason : "",
         };
+        // 记下施加前的状态，用于识别「这次调用是否造成了显著跃变」。
+        // 调用方（proxy）据此写系统日志——**DO 自己不写 D1**：DO 有严格的并发
+        // 约束，在选号热路径上插一次 D1 往返会拖慢每一个请求。
+        const before = {
+          status: a.status,
+          cooling: (a.cooldownUntil ?? 0) > now,
+          coolingKind: String(a.cooldownKind ?? ""),
+          breaker: (a.breakerUntil ?? 0) > now,
+          degrade: (a.degradeUntil ?? 0) > now,
+          disabledReason: String(a.disabledReason ?? ""),
+        };
         for (const kind of kinds) this.applyNote(a, kind, body.model, now, cfg, opt);
         // 只写一次 Storage：N 个 kind 一次落盘，而不是 N 次。
         await this.putAcct(a);
@@ -497,6 +508,9 @@ export class PoolDO {
           breakerUntil: a.breakerUntil ?? 0,
           degradeUntil: a.degradeUntil ?? 0,
           consecutiveFails: a.consecutiveFails ?? 0,
+          // changed: 本次调用造成的**显著**状态跃变，供上层写 sys 日志。
+          // 空数组 = 没有值得留痕的变化（常态，绝大多数失败上报都落这里）。
+          changed: describeStateChange(before, a, now),
         });
       }
 
@@ -1088,4 +1102,86 @@ export async function poolRPC(env: Env, path: string, method = "GET", body?: unk
     throw err;
   }
   return data;
+}
+
+// ---------------------------------------------------------------------------
+// 状态跃变的「显著变化」识别
+// ---------------------------------------------------------------------------
+
+/** NoteBefore 施加 note 之前的账号状态快照（/internal/note 内部用）。 */
+export interface NoteBefore {
+  status: string;
+  cooling: boolean;
+  coolingKind: string;
+  breaker: boolean;
+  degrade: boolean;
+  disabledReason: string;
+}
+
+/**
+ * describeStateChange 比较施加前后，返回**值得写进系统日志**的跃变描述。
+ *
+ * 为什么不能把每次 note 都记为系统事件：note 是热路径，一次 429、一次 5xx 都会走
+ * 这里；全记会把「系统」频道刷成一片冷却噪音，真出事时反而找不到，还白烧 D1 额度
+ * （免费额度按扫描行数计费）。所以只挑真正的**状态跃变**：
+ *
+ *   - 进入熔断（breaker 由 0 变有）：该账号连续 5xx 被出池，是池容量缩水的信号
+ *   - 进入降权（degrade 由 0 变有）：连败被临时出池（issue #114）
+ *   - 被禁用（status 变 disabled）：凭证失效/账号封禁，需人工介入重登 —— 最严重
+ *   - 冷却类别变化（如 soft → hard_credit）：说明失败原因换了性质
+ *   - 从冷却中恢复（cooling/breaker/degrade 由有变无）：账号重新可用
+ *
+ * 返回空数组表示「没有值得留痕的变化」——这是绝大多数调用的情况，属正常。
+ */
+export function describeStateChange(before: NoteBefore, a: AccountState, now: number): string[] {
+  const out: string[] = [];
+  const wasDisabled = before.status === "disabled";
+  const nowDisabled = a.status === "disabled";
+
+  // 1) 被禁用：最高优先级，必须留痕。带出 disabledReason 便于定位（12153 / 11140）。
+  if (!wasDisabled && nowDisabled) {
+    out.push(`账号被禁用${a.disabledReason ? `（${a.disabledReason}）` : ""}`);
+  } else if (wasDisabled && !nowDisabled) {
+    out.push("账号已解禁");
+  }
+
+  // 2) 熔断：连续 5xx 达阈被出池（带指数退避时长）。
+  const breakerNow = (a.breakerUntil ?? 0) > now;
+  if (!before.breaker && breakerNow) {
+    out.push(`进入熔断至 ${fmtUntil(a.breakerUntil ?? 0, now)}`);
+  } else if (before.breaker && !breakerNow) {
+    out.push("熔断已解除");
+  }
+
+  // 3) 降权：连败达阈临时出池。
+  const degradeNow = (a.degradeUntil ?? 0) > now;
+  if (!before.degrade && degradeNow) {
+    out.push(`进入连败降权至 ${fmtUntil(a.degradeUntil ?? 0, now)}`);
+  } else if (before.degrade && !degradeNow) {
+    out.push("降权已解除");
+  }
+
+  // 4) 冷却类别切换（如 soft → hard_credit 余额耗尽）。同类别内时长变化不记——
+  //    有界退避每次失败都会延长，记它等于记每一次失败。
+  const coolNow = (a.cooldownUntil ?? 0) > now;
+  const kindNow = String(a.cooldownKind ?? "");
+  if (!before.cooling && coolNow) {
+    out.push(`进入冷却（${kindNow || "unknown"}）至 ${fmtUntil(a.cooldownUntil ?? 0, now)}`);
+  } else if (before.cooling && coolNow && before.coolingKind && before.coolingKind !== kindNow) {
+    out.push(`冷却类别由 ${before.coolingKind} 变为 ${kindNow || "unknown"}`);
+  } else if (before.cooling && !coolNow) {
+    out.push("冷却已解除");
+  }
+
+  return out;
+}
+
+/** fmtUntil 把到期时间戳压成「还有 N 分钟」这种运维一眼能读的形式。 */
+function fmtUntil(until: number, now: number): string {
+  const ms = Math.max(0, until - now);
+  const min = Math.round(ms / 60_000);
+  if (min < 1) return "少于 1 分钟";
+  if (min < 60) return `${min} 分钟后`;
+  const h = (min / 60).toFixed(1);
+  return `${h} 小时后`;
 }

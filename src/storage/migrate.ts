@@ -1,4 +1,5 @@
 import type { Env } from "../../worker-configuration.d.ts";
+import { logMigrated, logMigrateFailed } from "./syslog";
 
 // D1 自动迁移：Worker 启动时自检建表，部署后无需手工跑 db-init。
 //
@@ -174,12 +175,32 @@ let bypassGate = false;
 /** 幂等：重复调用返回同一个结果，不会重复跑 DDL。 */
 export function ensureSchema(env: Env): Promise<MigrateState> {
   if (inflight) return inflight;
-  inflight = guarded(env).catch((e): MigrateState => ({
-    status: "error",
-    error: String(e?.message ?? e),
-    created: [],
-    added_cols: [],
-  }));
+  inflight = guarded(env)
+    .then((st) => {
+      // 把迁移结果落进「系统」日志频道（channel="sys"）。
+      // 此前迁移的结果只进 console——线上出了问题根本看不到，而这恰恰是最该留痕的
+      // 一类事件（建了什么表、加了什么列、为什么失败）。
+      //
+      // 只记「真的变了」和「真的失败了」：命中版本门跳过（version_gate）是每秒都在
+      // 发生的最优路径，写它等于污染日志并烧 D1 额度。
+      //
+      // **不 await**：D1 慢时不该拖长冷启动，且这段时间还会阻塞首 Token。
+      // 失败也已被 logSystem 内部吞掉，不会变成未处理的 rejection。
+      if (st.status === "ok" && st.via === "ddl" && (st.created.length || st.added_cols.length)) {
+        void logMigrated(env, st.created, st.added_cols);
+      } else if (st.status === "error") {
+        void logMigrateFailed(env, st.error);
+      }
+      return st;
+    })
+    .catch((e): MigrateState => {
+      // guarded 自己抛异常（而不是返回 status:"error"）时的兜底。这条路径同样要
+      // 进系统日志——它和上面 then 里的 error 分支是同一类故障，漏一处就等于
+      // 「迁移炸了但系统频道没记录」，正是本模块要消灭的那种沉默失败。
+      const err = String(e?.message ?? e);
+      void logMigrateFailed(env, err);
+      return { status: "error", error: err, created: [], added_cols: [] };
+    });
   return inflight;
 }
 

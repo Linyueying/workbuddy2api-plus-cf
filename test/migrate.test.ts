@@ -422,3 +422,73 @@ describe("冷启动优化②：batch 压缩往返", () => {
     expect(reqCols.size).toBe(4);
   });
 });
+
+describe("迁移结果落「系统」日志频道（channel=sys）", () => {
+  beforeEach(() => {
+    resetSchemaCache();
+  });
+
+  /** 在能跑通迁移的 D1 之上，额外捕获 request_logs 的 INSERT 行。 */
+  function d1WithLogCapture() {
+    const base = makeD1({ cols: [], reqCols: [] });
+    const logs: any[] = [];
+    const d1: any = {
+      prepare(sql: string) {
+        const stmt = base.d1.prepare(sql) as any;
+        // insertRequestLog 走的是 prepare().bind().run()——给链上加 bind
+        if (/INSERT INTO request_logs/i.test(sql)) {
+          return {
+            bind(...params: any[]) {
+              return {
+                async run() {
+                  logs.push({ channel: params[1], outcome: params[7], msg: params[10] });
+                  return { meta: { last_row_id: logs.length } };
+                },
+              };
+            },
+          };
+        }
+        return stmt;
+      },
+      batch: (base.d1 as any).batch?.bind(base.d1),
+    };
+    return { d1, logs };
+  }
+
+  it("真跑了 DDL（有建表/加列）时写一条 sys 日志", async () => {
+    const { d1, logs } = d1WithLogCapture();
+    // 空库 → 会建表并加列，属「真的变了」
+    const env: any = { WB2A_DB: d1 };
+    await ensureSchema(env);
+    // logSystem 是 fire-and-forget（void），给它一个微任务周期落地
+    await new Promise((r) => setTimeout(r, 0));
+    expect(logs.length, "迁移有变更却没写系统日志").toBeGreaterThan(0);
+    expect(logs[0].channel).toBe("sys");
+    expect(logs[0].msg).toContain("[migrate]");
+    expect(logs[0].msg).toContain("schema 已更新");
+  });
+
+  it("迁移失败时写一条 error 级 sys 日志", async () => {
+    // 建表就炸 → guarded 里 migrate 抛错 → 走 catch 分支
+    const base = makeD1({ failOn: /CREATE TABLE/i });
+    const logs: any[] = [];
+    const d1: any = {
+      prepare(sql: string) {
+        if (/INSERT INTO request_logs/i.test(sql)) {
+          return {
+            bind(...params: any[]) {
+              return { async run() { logs.push({ channel: params[1], outcome: params[7], msg: params[10] }); return {}; } };
+            },
+          };
+        }
+        return base.d1.prepare(sql);
+      },
+    };
+    await ensureSchema({ WB2A_DB: d1 } as any);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(logs.length, "迁移失败没写系统日志").toBeGreaterThan(0);
+    expect(logs[0].channel).toBe("sys");
+    expect(logs[0].outcome).toBe("error");
+    expect(logs[0].msg).toContain("自动迁移失败");
+  });
+});

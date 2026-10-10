@@ -10,6 +10,7 @@ import { realModelExists, stripRealm } from "./resolveModel";
 import { applyPromptPolicy, DEGRADED, rewriteSystemPrompt, triggerDegrade } from "./prompt";
 import { consumeKey, verifyKeyRequest, type KeyError } from "./apikeys";
 import { insertRequestLog } from "../storage/d1";
+import { logAccountEvent } from "../storage/syslog";
 import { newTimeline, markSince, addElapsed, withTiming, headersWithTiming, now, type Timeline } from "./timing";
 import type { CacheProbe } from "./boot";
 import type { Usage } from "./sse";
@@ -467,7 +468,10 @@ export async function proxyChat(
       });
     } catch (e: any) {
       // 传输层失败：不知道原因的失败 → 喂连败计数（降权兜底），并按 5xx 记熔断。
-      await poolRPC(env, "/internal/note", "POST", { uid, kind: "failures" }).catch(() => {});
+      // 这里同样读回 changed：连败达阈会把账号降权出池，属于「池容量缩水」的系统事件。
+      const nr: any = await poolRPC(env, "/internal/note", "POST", { uid, kind: "failures" }).catch(() => null);
+      const nchanged: string[] = Array.isArray(nr?.changed) ? nr.changed : [];
+      if (nchanged.length) void logAccountEvent(env, "warn", uid, nchanged.join("；"));
       await poolRPC(env, "/internal/release", "POST", { uid }).catch(() => {});
       lastErr = {
         kind: "ErrServer",
@@ -501,7 +505,19 @@ async function note(env: Env, uid: string, c: Classified, model: string, bodyTex
     const resetAt = parseRateReset(bodyText);
     if (resetAt) base.resetAt = resetAt;
   }
-  await poolRPC(env, "/internal/note", "POST", base).catch(() => {});
+  // DO 在 /internal/note 的响应里回传 changed[]：本次施加造成的**显著**状态跃变
+  // （进入熔断/降权/被禁用、冷却类别切换、从冷却恢复）。把它们写进「系统」日志频道。
+  //
+  // 为什么由 proxy 写而不是 DO 自己写：DO 有严格并发约束，在选号热路径上插一次
+  // D1 往返会拖慢每一个请求。proxy 侧写则落在已有的收尾流程里，且 DO 已经把
+  // 「值不值得记」的判断做完了（changed 为空就是常态，不写）。
+  const r: any = await poolRPC(env, "/internal/note", "POST", base).catch(() => null);
+  const changed: string[] = Array.isArray(r?.changed) ? r.changed : [];
+  if (changed.length) {
+    // 被禁用属于 error 级；其余（熔断/降权/冷却/恢复）是 warn 级的状态变更。
+    const severe = changed.some((m) => m.includes("禁用"));
+    void logAccountEvent(env, severe ? "error" : "warn", uid, changed.join("；"));
+  }
 }
 
 /**

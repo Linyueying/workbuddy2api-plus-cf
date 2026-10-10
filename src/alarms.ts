@@ -4,6 +4,7 @@ import type { PoolDO } from "./durable/account-pool";
 import {
   runCheckin, runBalanceLogged, runTravel, runActivityLogged, runKeepaliveLogged, runNightOwl, runGrowth,
 } from "./services/tasks";
+import { logSchedulerEvent } from "./storage/syslog";
 
 // DO alarm 调度（替代 internal/scheduler.Run）。单实例顺序执行，复用与面板 *_all 同一套逻辑。
 // 推荐：外部 cron 每整点 POST /panel/api/checkin_all 等；此处为可选项（部署后 POST /panel/api/scheduler/arm 启动）。
@@ -47,7 +48,11 @@ export async function runScheduledJobs(env: Env, cfg: Config): Promise<string[]>
       await fn();
       ran.push(name);
     } catch (e) {
-      console.error(`[alarm] ${name} 失败:`, String(e));
+      const msg = String(e);
+      console.error(`[alarm] ${name} 失败:`, msg);
+      // 作业抛错必须进「系统」频道：这是"调度器还在跑、但某个作业挂了"的信号，
+      // 只在 console 里等于没有——线上看板看不到。
+      void logSchedulerEvent(env, "error", `${name} 作业失败`, { error: msg.slice(0, 160) });
     }
   }
 
@@ -57,7 +62,9 @@ export async function runScheduledJobs(env: Env, cfg: Config): Promise<string[]>
       await runBalanceLogged(env);
       ran.push("balance");
     } catch (e) {
-      console.error("[alarm] balance 失败:", String(e));
+      const msg = String(e);
+      console.error("[alarm] balance 失败:", msg);
+      void logSchedulerEvent(env, "error", "balance 作业失败", { error: msg.slice(0, 160) });
     }
   }
   return ran;
@@ -69,7 +76,12 @@ export async function onAlarm(env: Env, _pool: PoolDO, cfg: Config): Promise<voi
   // 自调度到下一个整点。Cron Triggers 路径不需要这步——平台会按时触发。
   try {
     await _pool.scheduleNextAlarm();
-  } catch {
+  } catch (e) {
+    // 自调度失败**不阻断**本次 alarm（作业已经跑完了），但值得留痕：
+    // 反复失败意味着 DO 的定时触发会断档，只有下一个请求能把它重新 arm 起来。
+    void logSchedulerEvent(env, "warn", "自调度下一个 alarm 失败", {
+      error: String((e as any)?.message ?? e).slice(0, 160),
+    });
     /* DO 回收后会由下次请求重新 arm */
   }
 }
@@ -92,6 +104,9 @@ export async function runScheduledTask(env: Env, _pool: PoolDO, task: string, _b
     case "balance":
       return { task, results: await runBalanceLogged(env) };
     default:
+      // 未知任务名进系统日志：通常是调用方拼错了 step 名，静默返回 {} 会让
+      // 外部 cron 以为"跑过了"，而实际什么都没执行。
+      void logSchedulerEvent(env, "warn", `未知调度任务：${String(task).slice(0, 40)}`);
       return { task, error: "unknown" };
   }
 }
