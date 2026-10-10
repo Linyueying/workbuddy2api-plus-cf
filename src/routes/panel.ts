@@ -30,7 +30,7 @@ import { getUsage } from "../storage/usage";
 // ——其中轮换尤其严重：旧明文在缓存有效期内仍能通过鉴权，等于轮换没有立即生效。
 import { invalidateKeyCache, PREFIX } from "../services/apikeys";
 import { kvGetJSON, CACHE_KEY_OUTPUT_PROBES, cacheKV } from "../storage/kv";
-import { forEachAccount, runCreditReport, runTrialBatch, prettyReport } from "../services/tasks";
+import { forEachAccount, runCreditReport, runTrialBatch, prettyReport, reportTask } from "../services/tasks";
 import { creditPackages, getCredits } from "../services/upstream";
 import {
   signinOne,
@@ -749,6 +749,18 @@ export function registerPanel(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     };
     await Promise.all(Array.from({ length: Math.min(3, list.length) }, worker));
     const filled = rows.filter(Boolean);
+    // 批量签到同样落任务日志：CLI 拿的是逐账号表格，但面板「任务」频道也该看得到
+    // 这一轮签到跑了什么——与 cron 自动签到、checkin_all 三入口口径一致。
+    await reportTask(c.env, "签到", filled.map((r) => ({
+      uid: r.uid, realm: r.realm, ok: r.status === "OK" || r.status === "ALREADY",
+      error: r.status === "FAIL" || r.status === "AUTH_INVALID" ? r.detail : undefined,
+      data: { status: r.status, remain: r.remain, creditsTotal: r.creditsTotal },
+    })), (o) => {
+      if (!o.ok) return `失败：${o.error ?? "未知错误"}`;
+      const st = o.data?.status;
+      const cred = o.data?.remain == null ? "" : `，积分 ${o.data.remain}${o.data.creditsTotal > 0 ? "/" + o.data.creditsTotal : ""}`;
+      return (st === "ALREADY" ? "今日已签" : "签到成功") + cred;
+    });
     return c.json({ ok: true, summary: summarizeSignin(filled), accounts: filled, table: renderSigninTable(filled) });
   });
 }

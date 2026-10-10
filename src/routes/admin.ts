@@ -4,11 +4,11 @@ import { poolRPC } from "../durable/account-pool";
 import { dailyCheckin, creditPackages, type CreditPackage } from "../services/upstream";
 import {
   runCheckin,
-  runBalance,
+  runBalanceLogged,
   refreshCredits,
   runTravel,
-  runActivity,
-  runKeepalive,
+  runActivityLogged,
+  runKeepaliveLogged,
   runNightOwl,
   runGrowth,
   accountTasks,
@@ -18,6 +18,7 @@ import {
   accountTaskAutoAll,
   autoTasks,
   forEachAccount,
+  reportTaskOne,
 } from "../services/tasks";
 import type { Auth, CtxVars } from "../types";
 import type { Credits } from "../services/upstream";
@@ -76,11 +77,19 @@ export function registerAdmin(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     const uid = c.req.param("uid");
     const a = await poolRPC(c.env, "/internal/auth/" + encodeURIComponent(uid)).catch(() => null);
     if (!a?.accessToken) return c.json({ ok: false, error: "no account" }, 404);
+    const t0 = Date.now();
     const ci: any = await dailyCheckin(c.env, a).catch(() => ({ done: false, already: false, message: "checkin failed" }));
     // 签到后查余额并回写池（对齐 Go panel.accountCheckin：先签到再 SetCreditsDetailed）。
     // 失败原因要原样带出去：面板只显示一句 "user resource failed" 的话，
     // 用户没法区分是 401（token/请求头）还是 5xx（上游抽风）。
     const { cr, why } = await creditsOrReason(c.env, a);
+    // 手动签到同样落任务日志：面板「日志」的「任务」频道要能回答
+    // 「我刚才点的那个签到到底成没成」，不能只靠页面上的一个 toast。
+    const detail = ci.done
+      ? (ci.already ? "今日已签" : "签到成功") +
+        (cr ? `，积分 ${cr.credits}${cr.creditsTotal > 0 ? "/" + cr.creditsTotal : ""}` : "")
+      : `失败：${ci.message || "未知错误"}`;
+    await reportTaskOne(c.env, "签到", uid, a.realm ?? "cn", !!ci.done, detail, Date.now() - t0);
     if (!cr) return c.json({ ok: ci.done, checkin_done: ci.done, checkin_message: ci.message, balance_error: why });
     return c.json({
       ok: true,
@@ -152,15 +161,15 @@ export function registerAdmin(app: Hono<{ Bindings: Env; Variables: CtxVars }>) 
     return c.json({ ok: true, started: true });
   });
   app.post("/panel/api/activity_all", async (c) => {
-    wait(c, Promise.resolve(runActivity(c.env)));
+    wait(c, Promise.resolve(runActivityLogged(c.env)));
     return c.json({ ok: true, started: true });
   });
   app.post("/panel/api/keepalive_all", async (c) => {
-    wait(c, Promise.resolve(runKeepalive(c.env)));
+    wait(c, Promise.resolve(runKeepaliveLogged(c.env)));
     return c.json({ ok: true, started: true });
   });
   app.post("/panel/api/balance_all", async (c) => {
-    const out = await runBalance(c.env).catch(() => []);
+    const out = await runBalanceLogged(c.env).catch(() => []);
     return c.json({ ok: true, accounts: out });
   });
 

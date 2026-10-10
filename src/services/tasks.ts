@@ -1,6 +1,7 @@
 import type { Env } from "../../worker-configuration.d.ts";
 import type { Auth } from "../types";
 import { poolRPC } from "../durable/account-pool";
+import { insertRequestLog } from "../storage/d1";
 import { basesFor, chatStream, dailyCheckin, getCreditsDetailed, type Credits } from "./upstream";
 import { dailyCheckinRetry } from "./checkin";
 import { claimTrialFor, type TrialOutcome, type TrialSummary, summarizeTrial } from "./trial";
@@ -44,6 +45,8 @@ export interface TaskOutcome {
   ok: boolean;
   error?: string;
   data?: any;
+  /** 单账号耗时（ms）。日志写入用它填 request_logs.ms；旧调用方忽略即可。 */
+  ms?: number;
 }
 
 /** 遍历全部账号（或指定 realm）执行 fn。 */
@@ -52,11 +55,12 @@ export async function forEachAccount(env: Env, fn: (auth: Auth) => Promise<any>,
   const out: TaskOutcome[] = [];
   for (const a of list) {
     if (realm && a.realm !== realm) continue;
+    const t0 = Date.now();
     try {
       const data = await fn(a.auth as Auth);
-      out.push({ uid: a.uid, realm: a.realm, ok: true, data });
+      out.push({ uid: a.uid, realm: a.realm, ok: true, data, ms: Date.now() - t0 });
     } catch (e: any) {
-      out.push({ uid: a.uid, realm: a.realm, ok: false, error: String(e?.message ?? e) });
+      out.push({ uid: a.uid, realm: a.realm, ok: false, error: String(e?.message ?? e), ms: Date.now() - t0 });
     }
   }
   return out;
@@ -64,6 +68,74 @@ export async function forEachAccount(env: Env, fn: (auth: Auth) => Promise<any>,
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** reportTaskOne 单账号任务日志（面板手动点「签到」「余额」等动作时用）。 */
+export async function reportTaskOne(
+  env: Env,
+  label: string,
+  uid: string,
+  realm: string,
+  ok: boolean,
+  msg: string,
+  ms = 0,
+): Promise<void> {
+  await insertRequestLog(env, {
+    ts: Date.now(),
+    channel: "task",
+    uid,
+    realm: realm as any,
+    outcome: ok ? "ok" : "error",
+    status: ok ? 200 : 0,
+    ms: Number(ms || 0) || 0,
+    msg: `${label}：${msg}`.slice(0, 400),
+  }).catch((e: any) => {
+    console.error(`[tasklog] ${label} 日志写入失败（不影响任务本身）:`, String(e?.message ?? e));
+    return 0;
+  });
+}
+
+/**
+ * reportTask 把一次批量任务的结果逐账号写进 request_logs（channel="task"）。
+ *
+ * **为什么需要它**：日志视图（面板「日志」页）有 全部/任务/对话/系统 四个频道，
+ * 分别对应 channel 的 task/chat/sys。但整个代码库原先只有 proxy.ts 写日志，
+ * 且硬编码 channel="chat" —— 于是「任务」频道永远是空的：自动签到、保活、
+ * 旅行巡检这些**真正在后台干活的东西**一条记录都不留，运维只能靠猜。
+ *
+ * 一处一行（不是一次批量一行）：日志视图是逐行渲染的，逐账号才能回答
+ * 「哪个号签上了、哪个号 AUTH_INVALID」，而 requestLogLine 会把 uid 带出来。
+ *
+ * label 是任务的中文名（签到/保活/…），进 msg 首字段，便于在混合日志里辨认。
+ * detail 由各任务自行给出更有信息量的描述（如签到成功并刷出的积分）。
+ *
+ * **失败一律吞掉**：日志是观测设施，写不进不能让签到本身失败。但不是无声失败——
+ * console.error 留痕，否则「日志里什么都没有」会被误判成「任务没跑」。
+ */
+export async function reportTask(
+  env: Env,
+  label: string,
+  rows: TaskOutcome[],
+  detail?: (r: TaskOutcome) => string,
+): Promise<void> {
+  await Promise.all(rows.map(async (r) => {
+    const d = detail?.(r);
+    const msg = d ? `${label}：${d}` : `${label}：${r.ok ? "完成" : "失败"}`;
+    await insertRequestLog(env, {
+      ts: Date.now(),
+      channel: "task",
+      uid: r.uid,
+      realm: r.realm as any,
+      outcome: r.ok ? "ok" : "error",
+      // 任务没有 HTTP 语义，用 200/0 把成败摊平成 status 列（日志行据此不显示 HTTP）。
+      status: r.ok ? 200 : 0,
+      ms: Number(r.ms ?? 0) || 0,
+      msg: msg.slice(0, 400),
+    }).catch((e: any) => {
+      console.error(`[tasklog] ${label} 日志写入失败（不影响任务本身）:`, String(e?.message ?? e));
+      return 0;
+    });
+  }));
 }
 
 /** 取单账号 auth（uid → Auth），失败返回 null。 */
@@ -782,8 +854,8 @@ export async function autoTasks(env: Env, uid: string): Promise<any> {
 // ---------------------------------------------------------------------------
 // 定时任务（scheduler 的 Run*，由 alarms / *_all 触发）
 // ---------------------------------------------------------------------------
-export function runCheckin(env: Env): Promise<TaskOutcome[]> {
-  return forEachAccount(env, async (auth) => {
+export async function runCheckin(env: Env): Promise<TaskOutcome[]> {
+  const rows = await forEachAccount(env, async (auth) => {
     // 走 checkin.dailyCheckinRetry（带瞬时错误有界重试，对齐 Go retryBillingTransient）：
     // upstream.dailyCheckin 是裸调用，签到后偶发 500 会让该账号整天漏签。
     const ci = await dailyCheckinRetry(env, auth);
@@ -792,6 +864,15 @@ export function runCheckin(env: Env): Promise<TaskOutcome[]> {
     const cr = await refreshCredits(env, auth);
     return { ...ci, credits: cr.credits, creditsTotal: cr.creditsTotal };
   });
+  // 逐账号写任务日志（channel="task"）：面板「日志」页的「任务」频道即由此而来。
+  // 注意区分三种语义——成功签到、今日已签（幂等成功）、真失败，别把 ALREADY 写成失败。
+  await reportTask(env, "签到", rows, (r) => {
+    if (!r.ok) return `失败：${r.error ?? "未知错误"}`;
+    const d = r.data ?? {};
+    const cred = d.credits == null ? "" : `，积分 ${d.credits}${d.creditsTotal > 0 ? "/" + d.creditsTotal : ""}`;
+    return d.already ? `今日已签${cred}` : `签到成功${cred}`;
+  });
+  return rows;
 }
 export function runBalance(env: Env): Promise<TaskOutcome[]> {
   return forEachAccount(env, async (auth) => {
@@ -800,7 +881,7 @@ export function runBalance(env: Env): Promise<TaskOutcome[]> {
   });
 }
 export async function runTravel(env: Env): Promise<TaskOutcome[]> {
-  return forEachAccount(env, async (auth) => {
+  const rows = await forEachAccount(env, async (auth) => {
     const st = await TravelStatus(auth, env);
     if (st.state === "arrived" && st.record_id) {
       const credit = await TravelClaim(auth, env, st.record_id);
@@ -812,6 +893,16 @@ export async function runTravel(env: Env): Promise<TaskOutcome[]> {
     }
     return { action: "skip", state: st.state };
   });
+  // 只记有实际动作的账号：depart/claim 是「动了」的，skip 是空跑。
+  // 每账号都写会把日志刷成一片 skip 噪音，反而看不清谁真领到了积分。
+  await reportTask(env, "旅行巡检", rows.filter((r) => !r.ok || (r.data?.action && r.data.action !== "skip")), (r) => {
+    if (!r.ok) return `失败：${r.error ?? "未知错误"}`;
+    const d = r.data ?? {};
+    if (d.action === "claim") return `领取旅行积分 ${d.credit ?? 0}`;
+    if (d.action === "depart") return "出发旅行";
+    return d.action ?? "完成";
+  });
+  return rows;
 }
 export function runActivity(env: Env): Promise<TaskOutcome[]> {
   return forEachAccount(env, (auth) => ReportChatActivity(auth, env, `wb2api-activity-${Date.now()}`, ""));
@@ -838,6 +929,32 @@ export function runNightOwl(env: Env): Promise<TaskOutcome[]> {
 export function runGrowth(env: Env): Promise<TaskOutcome[]> {
   // 成长任务队列：逐项执行 mp + PC 可自动化任务（夜间队列驱动）。
   return forEachAccount(env, (auth) => runAutoAll(env, auth));
+}
+
+/**
+ * runKeepaliveLogged / runActivityLogged / runBalanceLogged
+ *
+ * 这几个是**例行探活/纯读**任务：成功时没有任何信息量（就是「还活着」），
+ * 逐账号全写会把日志刷屏，真出事时反而找不到。所以只把**失败**落进任务日志
+ * ——「保活挂了」正是运维需要被主动告知的事，这才是日志该留下的东西。
+ */
+export async function runKeepaliveLogged(env: Env): Promise<TaskOutcome[]> {
+  const rows = await runKeepalive(env);
+  await reportTask(env, "保活", rows.filter((r) => !r.ok || (r.data?.status ?? 200) >= 400), (r) => {
+    if (!r.ok) return `失败：${r.error ?? "未知错误"}`;
+    return `失败：HTTP ${r.data?.status}`;
+  });
+  return rows;
+}
+export async function runActivityLogged(env: Env): Promise<TaskOutcome[]> {
+  const rows = await runActivity(env);
+  await reportTask(env, "活跃上报", rows.filter((r) => !r.ok), (r) => `失败：${r.error ?? "未知错误"}`);
+  return rows;
+}
+export async function runBalanceLogged(env: Env): Promise<TaskOutcome[]> {
+  const rows = await runBalance(env);
+  await reportTask(env, "余额刷新", rows.filter((r) => !r.ok), (r) => `失败：${r.error ?? "未知错误"}`);
+  return rows;
 }
 
 // ---------------------------------------------------------------------------

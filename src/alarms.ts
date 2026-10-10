@@ -1,7 +1,9 @@
 import type { Env } from "../worker-configuration.d.ts";
 import type { Config } from "./config";
 import type { PoolDO } from "./durable/account-pool";
-import { runCheckin, runBalance, runTravel, runActivity, runKeepalive, runNightOwl, runGrowth } from "./services/tasks";
+import {
+  runCheckin, runBalanceLogged, runTravel, runActivityLogged, runKeepaliveLogged, runNightOwl, runGrowth,
+} from "./services/tasks";
 
 // DO alarm 调度（替代 internal/scheduler.Run）。单实例顺序执行，复用与面板 *_all 同一套逻辑。
 // 推荐：外部 cron 每整点 POST /panel/api/checkin_all 等；此处为可选项（部署后 POST /panel/api/scheduler/arm 启动）。
@@ -33,8 +35,9 @@ export async function runScheduledJobs(env: Env, cfg: Config): Promise<string[]>
   const jobs: [string, boolean, () => Promise<unknown>][] = [
     ["checkin", s.checkin_enabled && s.checkin_hours.includes(h), () => runCheckin(env)],
     ["travel", s.travel_enabled && s.travel_hours.includes(h), () => runTravel(env)],
-    ["activity", s.activity_enabled && s.activity_hours.includes(h), () => runActivity(env)],
-    ["keepalive", s.keepalive_enabled && s.keepalive_hours.includes(h), () => runKeepalive(env)],
+    // 活跃/保活走 *Logged 版本：成功时无信息量不落日志，只在失败时留下记录。
+    ["activity", s.activity_enabled && s.activity_hours.includes(h), () => runActivityLogged(env)],
+    ["keepalive", s.keepalive_enabled && s.keepalive_hours.includes(h), () => runKeepaliveLogged(env)],
     ["nightowl", s.blackcat_enabled && s.blackcat_hours.includes(h), () => runNightOwl(env)],
     ["growth", s.growth_enabled && s.growth_hours.includes(h), () => runGrowth(env)],
   ];
@@ -51,7 +54,7 @@ export async function runScheduledJobs(env: Env, cfg: Config): Promise<string[]>
   // 余额刷新与整点解耦（配置单独开关）
   if (s.balance_refresh_enabled) {
     try {
-      await runBalance(env);
+      await runBalanceLogged(env);
       ran.push("balance");
     } catch (e) {
       console.error("[alarm] balance 失败:", String(e));
@@ -79,15 +82,15 @@ export async function runScheduledTask(env: Env, _pool: PoolDO, task: string, _b
     case "travel":
       return { task, results: await runTravel(env) };
     case "activity":
-      return { task, results: await runActivity(env) };
+      return { task, results: await runActivityLogged(env) };
     case "keepalive":
-      return { task, results: await runKeepalive(env) };
+      return { task, results: await runKeepaliveLogged(env) };
     case "nightowl":
       return { task, results: await runNightOwl(env) };
     case "growth":
       return { task, results: await runGrowth(env) };
     case "balance":
-      return { task, results: await runBalance(env) };
+      return { task, results: await runBalanceLogged(env) };
     default:
       return { task, error: "unknown" };
   }
